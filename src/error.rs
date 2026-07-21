@@ -17,6 +17,8 @@ pub enum Error {
     ModuleNotFound(String),
     /// A signature string could not be parsed into a byte pattern.
     BadSignature(String),
+    /// A profile JSON document could not be parsed or serialized.
+    BadProfile(String),
 }
 
 impl fmt::Display for Error {
@@ -28,6 +30,7 @@ impl fmt::Display for Error {
             }
             Error::ModuleNotFound(name) => write!(f, "module not mapped: {name}"),
             Error::BadSignature(s) => write!(f, "bad signature: {s}"),
+            Error::BadProfile(s) => write!(f, "bad profile: {s}"),
         }
     }
 }

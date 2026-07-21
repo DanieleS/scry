@@ -14,9 +14,12 @@ mod error;
 
 pub mod aob;
 pub mod backend;
+pub mod profile;
+pub mod resolver;
 
 pub use backend::MemoryBackend;
 pub use error::{Error, Result};
+pub use profile::{Match, Profile, ValueType, Watch};
 
 #[cfg(target_os = "linux")]
 pub use backend::linux::LinuxBackend;
