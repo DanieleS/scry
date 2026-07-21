@@ -31,6 +31,25 @@ static SIG: [u8; 16] = [
     0x53, 0x43, 0x52, 0x59, 0x5A, 0xA5, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xAB,
 ];
 
+/// The profile's **probe** signature: the run of bytes a resolver scans for to
+/// decide this profile fits the process. Distinct from `SIG` (which the Tier-2
+/// anchor tests use) so the resolver's identity test is exercised on its own
+/// dedicated marker. A profile aimed at a different game/build carries a
+/// different probe and simply will not resolve here.
+#[used]
+static PROBE: [u8; 16] = [
+    0x50, 0x52, 0x4F, 0x42, 0x45, 0x5F, 0xA5, 0x5A, 0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF,
+];
+
+/// A build/version marker: a distinct run standing in for the versioned bytes a
+/// real profile keys its build discriminant on (a Linux process has no PE
+/// version metadata, so the discriminant is expressed in memory instead). The
+/// trailing `01 00 02 00 03 00` reads as "v1.2.3".
+#[used]
+static BUILD: [u8; 12] = [
+    0x42, 0x55, 0x49, 0x4C, 0x44, 0x5F, 0x01, 0x00, 0x02, 0x00, 0x03, 0x00,
+];
+
 const EXPECTED_HP: i32 = 1337;
 
 fn main() {
@@ -58,10 +77,13 @@ fn main() {
 
     let player_addr = &PLAYER as *const AtomicU64 as u64;
     let sig_addr = SIG.as_ptr() as u64;
+    let probe_addr = PROBE.as_ptr() as u64;
+    let build_addr = BUILD.as_ptr() as u64;
 
     // Machine-readable line the test parses.
     println!(
-        "READY pid={pid} exe={exe_name} base=0x{base:x} player=0x{player_addr:x} sig=0x{sig_addr:x} hp={EXPECTED_HP}"
+        "READY pid={pid} exe={exe_name} base=0x{base:x} player=0x{player_addr:x} \
+         sig=0x{sig_addr:x} probe=0x{probe_addr:x} build=0x{build_addr:x} hp={EXPECTED_HP}"
     );
     use std::io::Write;
     std::io::stdout().flush().ok();

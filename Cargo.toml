@@ -5,8 +5,15 @@ edition = "2021"
 description = "Profile-driven, read-only game-memory telemetry engine"
 license = "MIT OR Apache-2.0"
 
-# No external dependencies: the OS read primitives are declared as extern "C"
-# against the system libc, so `cargo test` runs fully offline.
+# The OS read primitives are declared as extern "C" against the system libc, so
+# the engine core needs no native dependencies. The only crates pulled in are
+# serde/serde_json, used solely to (de)serialize the JSON profile format —
+# community-authored, i.e. untrusted, input we deliberately hand to a
+# battle-tested parser rather than a hand-rolled one. Once fetched, the build is
+# fully offline.
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 
 [[bin]]
 name = "cavia"

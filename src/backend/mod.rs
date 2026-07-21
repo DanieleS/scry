@@ -10,6 +10,10 @@
 
 #[cfg(target_os = "linux")]
 pub mod linux;
+#[cfg(target_os = "windows")]
+pub mod windows;
+
+pub mod pe;
 
 use crate::error::{Error, Result};
 
@@ -32,6 +36,18 @@ pub trait MemoryBackend {
     /// The target's readable memory regions, in ascending address order — the
     /// haystack an AOB scan searches.
     fn readable_regions(&self) -> Result<Vec<Region>>;
+
+    /// Best-effort build/version identifier for module `name` (e.g. a PE
+    /// version string), used by the resolver to cheaply narrow same-executable
+    /// candidates before the authoritative probe test.
+    ///
+    /// Returns `None` when the platform can't supply one — the default, and the
+    /// honest answer on Linux, where there is no PE metadata. A `None` here
+    /// never causes a wrong match: the resolver simply skips version filtering
+    /// and lets the probe decide.
+    fn module_version(&self, _name: &str) -> Result<Option<String>> {
+        Ok(None)
+    }
 
     /// Pointer width of the target, in bytes. 64-bit unless a backend says
     /// otherwise.
