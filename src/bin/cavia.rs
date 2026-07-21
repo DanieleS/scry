@@ -9,7 +9,7 @@
 //! It prints the facts a test needs to derive the path, then parks so the test
 //! can read its memory from the outside.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 
 use scry::{LinuxBackend, MemoryBackend};
 
@@ -17,6 +17,11 @@ use scry::{LinuxBackend, MemoryBackend};
 struct Stats {
     hp: i32,
     hp_max: i32,
+    /// A value that changes over the process's life — the cavia bumps it on a
+    /// timer, standing in for a live game stat. It gives the polling loop a real
+    /// diff to observe. `repr(C)` fixes it at offset 8; `AtomicI32` shares i32's
+    /// layout, so an outside reader sees a plain 4-byte int there.
+    frame: AtomicI32,
 }
 
 /// Static slot in the module's data segment. Holds a pointer to `Stats`.
@@ -56,11 +61,12 @@ fn main() {
     // The "game" allocates its player stats on the heap and records the pointer
     // in the static slot. Leaked so the address stays valid for the process's
     // life (a real game keeps these alive the same way).
-    let stats: &'static mut Stats = Box::leak(Box::new(Stats {
+    let stats: &'static Stats = Box::leak(Box::new(Stats {
         hp: EXPECTED_HP,
         hp_max: 2000,
+        frame: AtomicI32::new(0),
     }));
-    PLAYER.store(stats as *mut Stats as u64, Ordering::SeqCst);
+    PLAYER.store(stats as *const Stats as u64, Ordering::SeqCst);
 
     let pid = std::process::id();
     let exe = std::env::current_exe().expect("current_exe");
@@ -88,8 +94,11 @@ fn main() {
     use std::io::Write;
     std::io::stdout().flush().ok();
 
-    // Park; the test reads our memory and then kills us.
+    // Park, but keep a value moving: a poller attached from the outside must be
+    // able to watch `frame` change between reads. The test reads our memory and
+    // then kills us.
     loop {
-        std::thread::sleep(std::time::Duration::from_secs(3600));
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        stats.frame.fetch_add(1, Ordering::SeqCst);
     }
 }

@@ -56,7 +56,10 @@ pub struct Match {
 
 /// One value the engine reads. The two tiers differ only in how the *anchor*
 /// address is found; both then walk `offsets` and read a typed value.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// `Eq` is intentionally *not* derived: `rate_hz` is a float, and the polling
+/// loop only ever needs `PartialEq` (for the schedule) — never total equality.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "tier", rename_all = "lowercase")]
 pub enum Watch {
     /// Tier-1: a static pointer path. The anchor is `module` base; `offsets`
@@ -73,6 +76,12 @@ pub enum Watch {
         /// How to interpret the bytes at the resolved address.
         #[serde(rename = "type")]
         ty: ValueType,
+        /// How often the polling loop should sample this value, in hertz. A
+        /// per-watch knob so fast-moving state (HP) can poll briskly while slow
+        /// state (zone, party) sips. Absent means "every base tick"; the loop
+        /// never samples faster than its own tick regardless.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rate_hz: Option<f64>,
     },
     /// Tier-2: the anchor is found by scanning for an AOB signature, then the
     /// pointer chain is walked from that address exactly as in Tier-1.
@@ -86,11 +95,17 @@ pub enum Watch {
         /// How to interpret the bytes at the resolved address.
         #[serde(rename = "type")]
         ty: ValueType,
+        /// Per-watch sample rate in hertz; see [`Watch::Tier1::rate_hz`].
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rate_hz: Option<f64>,
     },
 }
 
 /// A complete per-game profile: identity plus the values to read.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// Not `Eq` because a [`Watch`] carries a float `rate_hz`; `PartialEq` is all
+/// the round-trip tests need.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Profile {
     /// Human-readable label. Purely informational — identity is the `match`
     /// block, never this. Optional so a minimal profile stays terse.
@@ -138,12 +153,16 @@ mod tests {
                     module: "game.exe".to_string(),
                     offsets: vec![0x1234, 0x10, 0x0],
                     ty: ValueType::I32,
+                    rate_hz: Some(10.0),
                 },
                 Watch::Tier2 {
                     name: "score".to_string(),
                     anchor: "53 43 52 59 ?? ?? 11 22".to_string(),
                     offsets: vec![0x8],
                     ty: ValueType::U32,
+                    // Left unset: exercises the "every base tick" default and its
+                    // omission from the serialized form.
+                    rate_hz: None,
                 },
             ],
         }
@@ -171,13 +190,26 @@ mod tests {
           },
           "watches": [
             { "tier": "tier1", "name": "hp", "module": "game.exe",
-              "offsets": [4660, 16, 0], "type": "i32" },
+              "offsets": [4660, 16, 0], "type": "i32", "rate_hz": 10.0 },
             { "tier": "tier2", "name": "score",
               "anchor": "53 43 52 59 ?? ?? 11 22", "offsets": [8], "type": "u32" }
           ]
         }
         "#;
         assert_eq!(Profile::from_json(json).expect("parse"), sample());
+    }
+
+    #[test]
+    fn rate_hz_is_optional_and_omitted_when_absent() {
+        // The Tier-2 watch in `sample()` pins no rate, so the field must not
+        // appear for it; the Tier-1 watch does, so it must.
+        let json = sample().to_json().unwrap();
+        assert!(
+            json.contains("\"rate_hz\": 10.0"),
+            "expected the pinned rate"
+        );
+        // Exactly one occurrence — the version-less watch stayed terse.
+        assert_eq!(json.matches("rate_hz").count(), 1);
     }
 
     #[test]

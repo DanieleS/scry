@@ -14,10 +14,12 @@ mod error;
 
 pub mod aob;
 pub mod backend;
+pub mod engine;
 pub mod profile;
 pub mod resolver;
 
 pub use backend::MemoryBackend;
+pub use engine::{Config, Engine, Handle, Session, Snapshot, Value};
 pub use error::{Error, Result};
 pub use profile::{Match, Profile, ValueType, Watch};
 
