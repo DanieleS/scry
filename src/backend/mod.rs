@@ -13,6 +13,13 @@ pub mod linux;
 
 use crate::error::{Error, Result};
 
+/// A contiguous span of the target's address space.
+#[derive(Debug, Clone, Copy)]
+pub struct Region {
+    pub start: u64,
+    pub len: u64,
+}
+
 pub trait MemoryBackend {
     /// Fill `buf` with bytes read from `addr` in the target. Must fail (rather
     /// than partially fill) if the full range cannot be read.
@@ -21,6 +28,10 @@ pub trait MemoryBackend {
     /// Load base of the mapped module `name` (e.g. `"game.exe"`), by which
     /// static, module-relative addresses are anchored.
     fn module_base(&self, name: &str) -> Result<u64>;
+
+    /// The target's readable memory regions, in ascending address order — the
+    /// haystack an AOB scan searches.
+    fn readable_regions(&self) -> Result<Vec<Region>>;
 
     /// Pointer width of the target, in bytes. 64-bit unless a backend says
     /// otherwise.

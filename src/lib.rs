@@ -12,6 +12,7 @@
 
 mod error;
 
+pub mod aob;
 pub mod backend;
 
 pub use backend::MemoryBackend;

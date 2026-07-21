@@ -8,6 +8,7 @@
 use std::io::{BufRead, BufReader};
 use std::process::{Child, Command, Stdio};
 
+use scry::aob;
 use scry::{LinuxBackend, MemoryBackend};
 
 struct Cavia {
@@ -26,6 +27,7 @@ struct Ready {
     exe: String,
     base: u64,
     player: u64,
+    sig: u64,
     hp: i32,
 }
 
@@ -35,6 +37,7 @@ fn parse_ready(line: &str) -> Ready {
         exe: String::new(),
         base: 0,
         player: 0,
+        sig: 0,
         hp: 0,
     };
     for tok in line.split_whitespace() {
@@ -48,6 +51,7 @@ fn parse_ready(line: &str) -> Ready {
             "exe" => r.exe = v.to_string(),
             "base" => r.base = hex(v),
             "player" => r.player = hex(v),
+            "sig" => r.sig = hex(v),
             "hp" => r.hp = v.parse().unwrap(),
             _ => {}
         }
@@ -98,6 +102,37 @@ fn resolves_module_relative_pointer_chain() {
 
     assert_eq!(hp, ready.hp, "resolved HP mismatch");
     assert_eq!(hp, 1337, "unexpected HP value");
+}
+
+#[test]
+fn aob_scan_finds_signature_in_process() {
+    let (_cavia, ready) = spawn_cavia();
+    let be = LinuxBackend::new(ready.pid);
+
+    // The exact bytes the cavia planted in SIG.
+    let pattern =
+        aob::parse_pattern("53 43 52 59 5A A5 11 22 33 44 55 66 77 88 99 AB").unwrap();
+    let found = aob::find_in_process(&be, &pattern)
+        .expect("scan ok")
+        .expect("signature found");
+
+    assert_eq!(found, ready.sig, "scan located the signature at the wrong address");
+}
+
+#[test]
+fn aob_scan_tolerates_wildcards() {
+    let (_cavia, ready) = spawn_cavia();
+    let be = LinuxBackend::new(ready.pid);
+
+    // Same signature, but with the volatile-looking middle bytes wildcarded —
+    // the shape a real profile uses to survive across builds.
+    let pattern =
+        aob::parse_pattern("53 43 52 59 ?? ?? 11 22 ?? ?? 55 66 77 88 99 AB").unwrap();
+    let found = aob::find_in_process(&be, &pattern)
+        .expect("scan ok")
+        .expect("signature found");
+
+    assert_eq!(found, ready.sig, "wildcard scan located the wrong address");
 }
 
 #[test]

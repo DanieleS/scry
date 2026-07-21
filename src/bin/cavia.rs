@@ -23,6 +23,14 @@ struct Stats {
 /// Its address is `module_base + <stable offset>`, the anchor a profile stores.
 static PLAYER: AtomicU64 = AtomicU64::new(0);
 
+/// A unique byte signature living in the module. Stands in for the recognizable
+/// run of bytes a Tier-2 profile scans for to anchor an address. `#[used]` keeps
+/// the optimizer from dropping it since nothing reads it.
+#[used]
+static SIG: [u8; 16] = [
+    0x53, 0x43, 0x52, 0x59, 0x5A, 0xA5, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xAB,
+];
+
 const EXPECTED_HP: i32 = 1337;
 
 fn main() {
@@ -49,10 +57,11 @@ fn main() {
         .expect("own module base");
 
     let player_addr = &PLAYER as *const AtomicU64 as u64;
+    let sig_addr = SIG.as_ptr() as u64;
 
     // Machine-readable line the test parses.
     println!(
-        "READY pid={pid} exe={exe_name} base=0x{base:x} player=0x{player_addr:x} hp={EXPECTED_HP}"
+        "READY pid={pid} exe={exe_name} base=0x{base:x} player=0x{player_addr:x} sig=0x{sig_addr:x} hp={EXPECTED_HP}"
     );
     use std::io::Write;
     std::io::stdout().flush().ok();

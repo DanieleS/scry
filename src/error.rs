@@ -15,6 +15,8 @@ pub enum Error {
     ShortRead { expected: usize, got: usize },
     /// A module named in a profile was not mapped in the target process.
     ModuleNotFound(String),
+    /// A signature string could not be parsed into a byte pattern.
+    BadSignature(String),
 }
 
 impl fmt::Display for Error {
@@ -25,6 +27,7 @@ impl fmt::Display for Error {
                 write!(f, "short read: wanted {expected} bytes, got {got}")
             }
             Error::ModuleNotFound(name) => write!(f, "module not mapped: {name}"),
+            Error::BadSignature(s) => write!(f, "bad signature: {s}"),
         }
     }
 }

@@ -10,7 +10,7 @@ use std::fs;
 use std::io;
 use std::os::raw::{c_int, c_ulong, c_void};
 
-use crate::backend::MemoryBackend;
+use crate::backend::{MemoryBackend, Region};
 use crate::error::{Error, Result};
 
 // Declared directly against the system libc so the crate needs no dependencies.
@@ -99,5 +99,40 @@ impl MemoryBackend for LinuxBackend {
             }
         }
         base.ok_or_else(|| Error::ModuleNotFound(name.to_string()))
+    }
+
+    fn readable_regions(&self) -> Result<Vec<Region>> {
+        let maps = fs::read_to_string(format!("/proc/{}/maps", self.pid))?;
+        let mut regions = Vec::new();
+        for line in maps.lines() {
+            let mut cols = line.split_whitespace();
+            let range = match cols.next() {
+                Some(r) => r,
+                None => continue,
+            };
+            let perms = match cols.next() {
+                Some(p) => p,
+                None => continue,
+            };
+            if !perms.contains('r') {
+                continue;
+            }
+            let (start_hex, end_hex) = match range.split_once('-') {
+                Some(pair) => pair,
+                None => continue,
+            };
+            if let (Ok(start), Ok(end)) = (
+                u64::from_str_radix(start_hex, 16),
+                u64::from_str_radix(end_hex, 16),
+            ) {
+                if end > start {
+                    regions.push(Region {
+                        start,
+                        len: end - start,
+                    });
+                }
+            }
+        }
+        Ok(regions)
     }
 }
