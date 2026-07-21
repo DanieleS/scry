@@ -1,0 +1,17 @@
+[package]
+name = "scry"
+version = "0.0.0"
+edition = "2021"
+description = "Profile-driven, read-only game-memory telemetry engine"
+license = "MIT OR Apache-2.0"
+
+# No external dependencies: the OS read primitives are declared as extern "C"
+# against the system libc, so `cargo test` runs fully offline.
+
+[[bin]]
+name = "cavia"
+path = "src/bin/cavia.rs"
+
+[lib]
+name = "scry"
+path = "src/lib.rs"
