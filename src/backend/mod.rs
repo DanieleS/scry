@@ -10,6 +10,10 @@
 
 #[cfg(target_os = "linux")]
 pub mod linux;
+#[cfg(target_os = "windows")]
+pub mod windows;
+
+pub mod pe;
 
 use crate::error::{Error, Result};
 

@@ -23,3 +23,6 @@ pub use profile::{Match, Profile, ValueType, Watch};
 
 #[cfg(target_os = "linux")]
 pub use backend::linux::LinuxBackend;
+
+#[cfg(target_os = "windows")]
+pub use backend::windows::WindowsBackend;
