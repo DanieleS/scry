@@ -19,6 +19,12 @@ serde_json = "1"
 name = "cavia"
 path = "src/bin/cavia.rs"
 
+# The host CLI: attach to a running game and stream its telemetry. Built for
+# every platform that has a backend; on others it compiles to a stub that says so.
+[[bin]]
+name = "scry"
+path = "src/bin/scry.rs"
+
 [lib]
 name = "scry"
 path = "src/lib.rs"

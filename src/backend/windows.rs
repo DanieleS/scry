@@ -118,6 +118,14 @@ pub struct WindowsBackend {
     ptr_size: usize,
 }
 
+// SAFETY: the only non-`Send` field is `handle`, a raw process handle. A Windows
+// HANDLE is a process-wide kernel object, not thread-affine: `ReadProcessMemory`
+// and `VirtualQueryEx` may be called on it from any thread, and this backend only
+// ever *reads* through it. Moving the backend to another thread — exactly what
+// `Session::run` does to drive the polling loop in the background — is therefore
+// sound. (No `Sync`: the backend is never shared across threads, only moved.)
+unsafe impl Send for WindowsBackend {}
+
 impl WindowsBackend {
     /// Open `pid` for reading only. Fails if the process cannot be opened —
     /// already gone, or the caller lacks the rights.

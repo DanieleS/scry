@@ -10,7 +10,7 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use scry::profile::{Match, Profile, ValueType, Watch};
-use scry::{Config, LinuxBackend, Session, Value};
+use scry::{open_host, Config, Session, Value};
 
 mod common;
 use common::spawn_cavia;
@@ -64,7 +64,7 @@ fn as_i32(v: Option<&Value>) -> Option<i32> {
 #[test]
 fn diff_reports_a_changed_value_and_stays_silent_on_an_unchanged_one() {
     let (_cavia, ready) = spawn_cavia();
-    let be = LinuxBackend::new(ready.pid);
+    let be = open_host(ready.pid as u32).expect("open target");
     let player_offset = (ready.player - ready.base) as i64;
     let profile = cavia_profile(&ready.exe, player_offset);
 
@@ -95,7 +95,7 @@ fn diff_reports_a_changed_value_and_stays_silent_on_an_unchanged_one() {
 #[test]
 fn run_delivers_diffs_over_a_channel_until_stopped() {
     let (_cavia, ready) = spawn_cavia();
-    let be = LinuxBackend::new(ready.pid);
+    let be = open_host(ready.pid as u32).expect("open target");
     let player_offset = (ready.player - ready.base) as i64;
     let profile = cavia_profile(&ready.exe, player_offset);
 

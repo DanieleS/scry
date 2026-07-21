@@ -111,8 +111,50 @@ match resolver::select(&backend, "game.exe", &profiles)? {
 }
 ```
 
-On Windows, swap in `WindowsBackend::open(pid)?`. Everything above the backend
-seam is identical.
+On Windows, swap in `WindowsBackend::open(pid)?` — or let `scry::open_host(pid)`
+pick the platform backend for you. Everything above the backend seam is
+identical.
+
+---
+
+## Command-line
+
+The `scry` binary is a thin host over the library: point it at a **running
+game**, give it a profile (or a folder of them), and it streams the live values.
+It is the way to exercise the engine against a real target — above all on
+Windows — without writing a host.
+
+```sh
+# Attach by name, let the resolver's probe test pick the fitting profile:
+scry watch --process game.exe --profiles ./profiles/
+
+# Attach by pid, one profile, stream for 10s:
+scry watch --pid 12345 --profile game.json --for 10
+
+# One snapshot of everything, then exit:
+scry watch --process game.exe --profile game.json --once
+```
+
+Output is one line per changed value, `+<ms>  name = value`; an unchanged value
+stays silent, and a value that can't be read surfaces as `unavailable` — never a
+guess. If no profile's probe resolves in the target, nothing is read (the
+fail-safe), and `scry` says so.
+
+Two more commands help author and verify:
+
+```sh
+# Find an AOB signature in a live process (for writing a profile's probe/anchor):
+scry scan --process game.exe --signature "48 8B 05 ?? ?? ?? ?? 48 8B 88"
+
+# Prove the backend works on this machine — no game needed. Spawns the bundled
+# cavia and checks the full read path (module base, pointer chain, AOB, build id):
+scry selftest
+```
+
+**Testing on Windows without building.** Every CI run publishes `scry.exe` and
+`cavia.exe` (32- and 64-bit) as downloadable artifacts. Grab them, drop them on
+a Windows box, and run `scry selftest` or `scry watch …` against a game — no Rust
+toolchain, no build pipeline.
 
 ---
 
@@ -128,6 +170,10 @@ Early — version `0.0.0`, API not yet stable. What works today:
 - Tier-2 AOB signature scanning with wildcards
 - Data-driven JSON profile format (serde, round-trip tested)
 - Probe-based resolver with the fail-safe property
+- `scry` host CLI — attach to a running game and stream telemetry (`watch`),
+  find signatures (`scan`), and prove the backend end-to-end (`selftest`)
+- CI on Linux **and** Windows: the Windows job runs the integration suite
+  against a real process (32- and 64-bit), and ships prebuilt CLI artifacts
 - 28 tests, zero external dependencies beyond serde, offline build
 
 ---

@@ -6,7 +6,7 @@
 //! offset, resolves `[base + player_offset] -> deref -> hp` and asserts.
 
 use scry::aob;
-use scry::{LinuxBackend, MemoryBackend};
+use scry::{open_host, MemoryBackend};
 
 mod common;
 use common::spawn_cavia;
@@ -14,7 +14,7 @@ use common::spawn_cavia;
 #[test]
 fn resolves_module_relative_pointer_chain() {
     let (_cavia, ready) = spawn_cavia();
-    let be = LinuxBackend::new(ready.pid);
+    let be = open_host(ready.pid as u32).expect("open target");
 
     // 1. The engine finds the same module base the target reported.
     let base = be.module_base(&ready.exe).expect("module base");
@@ -40,7 +40,7 @@ fn resolves_module_relative_pointer_chain() {
 #[test]
 fn aob_scan_finds_signature_in_process() {
     let (_cavia, ready) = spawn_cavia();
-    let be = LinuxBackend::new(ready.pid);
+    let be = open_host(ready.pid as u32).expect("open target");
 
     // The exact bytes the cavia planted in SIG.
     let pattern = aob::parse_pattern("53 43 52 59 5A A5 11 22 33 44 55 66 77 88 99 AB").unwrap();
@@ -57,7 +57,7 @@ fn aob_scan_finds_signature_in_process() {
 #[test]
 fn aob_scan_tolerates_wildcards() {
     let (_cavia, ready) = spawn_cavia();
-    let be = LinuxBackend::new(ready.pid);
+    let be = open_host(ready.pid as u32).expect("open target");
 
     // Same signature, but with the volatile-looking middle bytes wildcarded —
     // the shape a real profile uses to survive across builds.
@@ -72,7 +72,7 @@ fn aob_scan_tolerates_wildcards() {
 #[test]
 fn broken_chain_errors_rather_than_lying() {
     let (_cavia, ready) = spawn_cavia();
-    let be = LinuxBackend::new(ready.pid);
+    let be = open_host(ready.pid as u32).expect("open target");
 
     // A deliberately bogus first hop: dereferencing an unmapped address must
     // surface as an error, never a garbage value passed off as real.
