@@ -12,11 +12,11 @@ Everything here is **read-only** and runs as your normal user — no admin.
 ## 0. Prerequisites
 
 - **Sea of Stars** installed (Steam). It's a 64-bit Unity **IL2CPP** build.
-- **scry.exe** — either build it (`cargo build --release --bins`, needs Rust) or
-  download the `scry-x86_64-pc-windows-msvc` artifact from any green CI run
-  (ships `scry.exe` + `cavia.exe`, no toolchain needed).
-- **il2cpp2scry.exe** — the converter. It's behind a feature, so build it:
-  `cargo build --release --features authoring --bin il2cpp2scry`.
+- **scry.exe**, **cavia.exe**, **il2cpp2scry.exe** — all three ship as one
+  artifact. Download `scry-x86_64-pc-windows-msvc` from any green CI run and
+  unzip; **no Rust toolchain needed**. (`scry.exe` is the host, `cavia.exe` the
+  selftest target, `il2cpp2scry.exe` the IL2CPP→profile converter.) To build
+  instead: `cargo build --release --bins --features authoring`.
 - **[Il2CppDumper]** — download the latest release zip, extract.
 - **[Cheat Engine] 7.5** — for the one-time reverse engineering.
 

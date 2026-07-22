@@ -168,10 +168,11 @@ scry scan --process game.exe --signature "48 8B 05 ?? ?? ?? ?? 48 8B 88"
 scry selftest
 ```
 
-**Testing on Windows without building.** Every CI run publishes `scry.exe` and
-`cavia.exe` (32- and 64-bit) as downloadable artifacts. Grab them, drop them on
-a Windows box, and run `scry selftest` or `scry watch …` against a game — no Rust
-toolchain, no build pipeline.
+**Testing on Windows without building.** Every CI run publishes `scry.exe`,
+`cavia.exe`, and the `il2cpp2scry.exe` converter (32- and 64-bit) as downloadable
+artifacts. Grab them, drop them on a Windows box, and run `scry selftest` or
+`scry watch …` against a game, and author an IL2CPP profile — no Rust toolchain,
+no build pipeline.
 
 ---
 

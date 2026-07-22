@@ -91,8 +91,11 @@ jobs:
           rustup default stable
           rustup target add ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
+      # `--features authoring` so the gated `il2cpp2scry` converter is built too:
+      # a no-toolchain author downloads all three (host, selftest cavia, and the
+      # IL2CPP→profile converter) and never needs Rust.
       - name: Build release binaries
-        run: cargo build --release --bins --target ${{ matrix.target }}
+        run: cargo build --release --bins --features authoring --target ${{ matrix.target }}
       - name: Upload CLI artifact
         uses: actions/upload-artifact@v4
         with:
@@ -100,4 +103,5 @@ jobs:
           path: |
             target/${{ matrix.target }}/release/scry.exe
             target/${{ matrix.target }}/release/cavia.exe
+            target/${{ matrix.target }}/release/il2cpp2scry.exe
           if-no-files-found: error
