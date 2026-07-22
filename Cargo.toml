@@ -15,9 +15,25 @@ license = "MIT OR Apache-2.0"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
+[features]
+# Off by default, on purpose. The authoring tools (IL2CPP → profile converter)
+# are an *offline* aid for profile authors; they are not part of the read-only
+# telemetry runtime a host ships. Gating them keeps the library that players run
+# tiny and engine-agnostic — the IL2CPP smarts compile only when someone asks
+# for the converter. See `src/authoring/` and `docs/authoring-profiles.md`.
+authoring = []
+
 [[bin]]
 name = "cavia"
 path = "src/bin/cavia.rs"
+
+# The IL2CPP authoring converter: Il2CppDumper output + a name map -> a scry
+# profile with resolved offsets. Built only under the `authoring` feature so it
+# never lands in a runtime build.
+[[bin]]
+name = "il2cpp2scry"
+path = "src/bin/il2cpp2scry.rs"
+required-features = ["authoring"]
 
 # The host CLI: attach to a running game and stream its telemetry. Built for
 # every platform that has a backend; on others it compiles to a stub that says so.

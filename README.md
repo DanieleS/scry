@@ -175,6 +175,33 @@ toolchain, no build pipeline.
 
 ---
 
+## Authoring profiles for IL2CPP games
+
+For Unity **IL2CPP** games there's an offline converter that pins values by
+**name** and derives the fragile offsets for you. A game ships its own reflection
+(`global-metadata.dat` + `GameAssembly.dll`); [Il2CppDumper] parses those files —
+read-only, no injection — into `class::field → offset`. Feed that dump plus a
+small name map to `il2cpp2scry` and it emits a normal scry profile with the
+offsets filled in:
+
+```sh
+# Built behind a non-default feature so the runtime never carries it:
+cargo run --features authoring --bin il2cpp2scry -- \
+    --dump dump.cs --map mygame.map.json --out mygame.json
+```
+
+The names are what you maintain; the offsets are regenerated. On a game patch you
+re-run the dumper and the converter with the **same** map — no re-doing RE by
+hand. All the IL2CPP knowledge lives in this offline tool, never in the read-only
+telemetry runtime. See [`docs/authoring-il2cpp.md`](docs/authoring-il2cpp.md) for
+the full workflow and [`examples/seaofstars/`](examples/seaofstars/) for a worked
+template — and [`docs/authoring-profiles.md`](docs/authoring-profiles.md) for the
+manual (Cheat Engine) route the converter builds on.
+
+[Il2CppDumper]: https://github.com/Perfare/Il2CppDumper
+
+---
+
 ## Status
 
 Early — version `0.0.0`, API not yet stable. What works today:
@@ -190,17 +217,22 @@ Early — version `0.0.0`, API not yet stable. What works today:
 - Probe-based resolver with the fail-safe property
 - `scry` host CLI — attach to a running game and stream telemetry (`watch`),
   find signatures (`scan`), and prove the backend end-to-end (`selftest`)
+- IL2CPP profile authoring: offline `il2cpp2scry` converter (Il2CppDumper
+  `dump.cs` + a name map → a profile with resolved offsets), behind a non-default
+  `authoring` feature so the runtime stays engine-agnostic
 - CI on Linux **and** Windows: the Windows job runs the integration suite
   against a real process (32- and 64-bit), and ships prebuilt CLI artifacts
-- 42 tests, zero external dependencies beyond serde, offline build
+- 42 tests, plus the authoring converter's own suite; zero external dependencies
+  beyond serde, offline build
 
 ---
 
 ## Development
 
 ```sh
-cargo test --lib   # unit tests: portable, run anywhere
-cargo test         # + integration tests: needs Linux or Windows
+cargo test --lib                    # unit tests: portable, run anywhere
+cargo test                          # + integration tests: needs Linux or Windows
+cargo test --features authoring     # + the offline IL2CPP authoring converter
 ```
 
 The integration tests spawn **cavia** ("guinea pig"), a stand-in game process in

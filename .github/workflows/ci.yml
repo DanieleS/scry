@@ -42,13 +42,18 @@ jobs:
         run: cargo fmt --all --check
 
       - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --all-targets --all-features -- -D warnings
 
       - name: Test
         run: cargo test --all-targets
 
+      # The offline authoring tools (IL2CPP -> profile converter) live behind a
+      # non-default feature so the runtime stays tiny; test that path explicitly.
+      - name: Test (authoring tools)
+        run: cargo test --all-targets --features authoring
+
       - name: Doc tests
-        run: cargo test --doc
+        run: cargo test --doc --all-features
 
   # Prove the 32-bit (WOW64) read path at runtime, not just at compile time:
   # build and run the whole integration suite as a 32-bit process reading a
