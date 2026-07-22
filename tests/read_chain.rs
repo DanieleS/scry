@@ -5,8 +5,11 @@
 //! the outside, exactly as the host would against a game — derives the static
 //! offset, resolves `[base + player_offset] -> deref -> hp` and asserts.
 
-use scry::aob;
+use scry::engine::Value;
+use scry::profile::{Match, Profile, Rip, ValueType, Watch};
+use scry::{aob, Config, Session};
 use scry::{open_host, MemoryBackend};
+use std::time::Duration;
 
 mod common;
 use common::spawn_cavia;
@@ -67,6 +70,59 @@ fn aob_scan_tolerates_wildcards() {
         .expect("signature found");
 
     assert_eq!(found, ready.sig, "wildcard scan located the wrong address");
+}
+
+#[test]
+fn rip_relative_decode_recovers_the_static_slot() {
+    let (_cavia, ready) = spawn_cavia();
+    let be = open_host(ready.pid as u32).expect("open target");
+
+    // The cavia planted a real `mov rax, [rip+disp32]` at `ready.rip` whose
+    // operand is the PLAYER slot. Decoding it (anchor + 7 + disp32) must land
+    // back on the exact address the cavia reported for PLAYER — proving the x64
+    // displacement math against a genuine instruction, not a mock.
+    let decoded = be.resolve_rip(ready.rip, 3, 7).expect("decode rip");
+    assert_eq!(
+        decoded, ready.player,
+        "RIP-relative decode did not recover the PLAYER slot"
+    );
+}
+
+#[test]
+fn tier2_rip_relative_watch_reads_hp_end_to_end() {
+    let (_cavia, ready) = spawn_cavia();
+    let be = open_host(ready.pid as u32).expect("open target");
+
+    // A full Tier-2 profile the way an author would write one for an x64 game:
+    // AOB-scan the accessor, decode its RIP-relative displacement to the static
+    // slot, then walk [deref PLAYER -> Stats, +0 -> hp]. No offset is known ahead
+    // of time — the engine recovers the static base purely from the instruction.
+    let profile = Profile {
+        label: Some("cavia (rip)".to_string()),
+        match_: Match {
+            process: ready.exe.clone(),
+            module: ready.exe.clone(),
+            version: None,
+            probe: "50 52 4F 42 45 5F A5 5A".to_string(), // the cavia's PROBE run
+        },
+        watches: vec![Watch::Tier2 {
+            name: "hp".to_string(),
+            anchor: "48 8B 05 ?? ?? ?? ?? C3 90 5A A5 5A A5".to_string(),
+            rip: Some(Rip { disp: 3, len: 7 }),
+            offsets: vec![0, 0],
+            ty: ValueType::I32,
+            rate_hz: None,
+        }],
+    };
+
+    let mut session = Session::attach(be, &profile, Config::default());
+    let snap = session.poll(Duration::ZERO);
+    assert_eq!(
+        snap.get("hp"),
+        Some(&Value::I32(ready.hp)),
+        "RIP-relative Tier-2 watch must read the live hp through the decoded base"
+    );
+    assert_eq!(ready.hp, 1337, "unexpected cavia hp");
 }
 
 #[test]

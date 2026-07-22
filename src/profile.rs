@@ -29,6 +29,36 @@ pub enum ValueType {
     U64,
 }
 
+/// A RIP-relative displacement decode, applied to a Tier-2 anchor *before* its
+/// pointer chain is walked.
+///
+/// On x64 a static global is almost never named by a fixed module offset; it is
+/// reached through an instruction like `48 8B 05 <disp32>` (`mov rax,
+/// [rip+disp32]`), whose operand address is *the address of the next instruction
+/// plus a signed 32-bit displacement*. An AOB scan lands on the instruction
+/// bytes; this block says how to turn that hit into the operand's address:
+///
+/// ```text
+/// operand = anchor + len + i32_at(anchor + disp)
+/// ```
+///
+/// That operand address (typically a static slot holding a pointer) is then the
+/// start of the watch's `offsets` chain. This is the missing glue that makes a
+/// Tier-2 signature actually reach a static base on modern 64-bit builds — and
+/// what lets a signature-anchored watch survive a patch, since the bytes are
+/// matched wherever the loader placed them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Rip {
+    /// Byte offset, from the anchor (the AOB match address), of the signed
+    /// 32-bit displacement field. For a plain `48 8B 05 <disp32>` matched from
+    /// its first byte, this is `3`.
+    pub disp: i64,
+    /// Length of the whole instruction in bytes — the distance from the anchor
+    /// to the *next* instruction, which RIP addressing is relative to. For
+    /// `48 8B 05 <disp32>` this is `7`.
+    pub len: i64,
+}
+
 /// The identity logic: how to recognise the target process. The filename is
 /// just a label — everything a resolver needs to *claim* a process lives here.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -90,6 +120,13 @@ pub enum Watch {
         name: String,
         /// AOB signature whose match address anchors the chain.
         anchor: String,
+        /// Optional RIP-relative decode applied to the match address before the
+        /// chain is walked. Absent means the AOB hit *is* the chain start (the
+        /// bytes themselves are the data, or a nearby pointer). Present means the
+        /// hit is a RIP-relative instruction whose operand address is the real
+        /// start — the common shape for a static base on x64. See [`Rip`].
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rip: Option<Rip>,
         /// Pointer chain from the anchor address to the value's address.
         offsets: Vec<i64>,
         /// How to interpret the bytes at the resolved address.
@@ -158,6 +195,9 @@ mod tests {
                 Watch::Tier2 {
                     name: "score".to_string(),
                     anchor: "53 43 52 59 ?? ?? 11 22".to_string(),
+                    // Left unset: this anchor's bytes are the chain start directly,
+                    // and its omission from the serialized form is asserted below.
+                    rip: None,
                     offsets: vec![0x8],
                     ty: ValueType::U32,
                     // Left unset: exercises the "every base tick" default and its
@@ -210,6 +250,44 @@ mod tests {
         );
         // Exactly one occurrence — the version-less watch stayed terse.
         assert_eq!(json.matches("rate_hz").count(), 1);
+    }
+
+    #[test]
+    fn rip_is_optional_and_round_trips_when_present() {
+        // The default path: no `rip` block, and it must not appear in the output.
+        assert!(
+            !sample().to_json().unwrap().contains("rip"),
+            "a rip-less profile must not invent the field"
+        );
+
+        // A RIP-relative Tier-2 watch — the x64 static-base shape — round-trips
+        // and deserializes from the exact JSON an author would hand-write.
+        let json = r#"
+        {
+          "match": { "process": "g.exe", "module": "g.exe", "probe": "90 90" },
+          "watches": [
+            { "tier": "tier2", "name": "hp",
+              "anchor": "48 8B 05 ?? ?? ?? ?? 48 8B 88",
+              "rip": { "disp": 3, "len": 7 },
+              "offsets": [16, 0], "type": "i32" }
+          ]
+        }
+        "#;
+        let p = Profile::from_json(json).expect("parse");
+        assert_eq!(
+            p.watches[0],
+            Watch::Tier2 {
+                name: "hp".to_string(),
+                anchor: "48 8B 05 ?? ?? ?? ?? 48 8B 88".to_string(),
+                rip: Some(Rip { disp: 3, len: 7 }),
+                offsets: vec![16, 0],
+                ty: ValueType::I32,
+                rate_hz: None,
+            }
+        );
+        // …and it survives a serialize round-trip unchanged.
+        let back = Profile::from_json(&p.to_json().unwrap()).expect("re-parse");
+        assert_eq!(p, back, "rip watch changed across a JSON round-trip");
     }
 
     #[test]

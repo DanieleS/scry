@@ -29,7 +29,8 @@ authors ship profiles without touching the engine.
     { "tier": "tier1", "name": "hp", "module": "game.exe",
       "offsets": [4660, 16, 0], "type": "i32" },
     { "tier": "tier2", "name": "score",
-      "anchor": "53 43 52 59 ?? ?? 11 22", "offsets": [8], "type": "u32" }
+      "anchor": "48 8B 05 ?? ?? ?? ?? 48 8B 88", "rip": { "disp": 3, "len": 7 },
+      "offsets": [16, 0], "type": "u32" }
   ]
 }
 ```
@@ -49,6 +50,21 @@ Both tiers walk a pointer chain and read a typed value (`i32`, `u32`, `f32`,
 
 Tier-2 scanning happens **once at attach** and the result is cached — never per
 poll.
+
+On a 64-bit build a static base is rarely a fixed module offset; it is reached
+through an instruction like `48 8B 05 <disp32>` (`mov rax, [rip+disp32]`), whose
+operand address is *the next instruction plus a signed displacement*. A Tier-2
+watch scans for that instruction and adds an optional **`rip`** block —
+`{ "disp": 3, "len": 7 }` for a plain `mov` — telling the engine to decode the
+displacement into the operand's address before walking `offsets`:
+
+```text
+base = anchor + len + i32_at(anchor + disp)
+```
+
+That is the glue that lets a signature-anchored watch reach a real static base
+on x64 (and survive a patch, since the bytes are matched wherever the loader put
+them). Omit `rip` and the AOB hit *is* the chain start, as before.
 
 ### The resolver — the anti-collision core
 
@@ -147,7 +163,8 @@ Two more commands help author and verify:
 scry scan --process game.exe --signature "48 8B 05 ?? ?? ?? ?? 48 8B 88"
 
 # Prove the backend works on this machine — no game needed. Spawns the bundled
-# cavia and checks the full read path (module base, pointer chain, AOB, build id):
+# cavia and checks the full read path (module base, pointer chain, AOB,
+# RIP-relative decode, build id):
 scry selftest
 ```
 
@@ -167,14 +184,15 @@ Early — version `0.0.0`, API not yet stable. What works today:
 - Windows backend (`ReadProcessMemory`, module base, region enumeration, PE
   build id)
 - Tier-1 module-relative pointer chains
-- Tier-2 AOB signature scanning with wildcards
+- Tier-2 AOB signature scanning with wildcards, incl. RIP-relative (`[rip+disp32]`)
+  displacement decoding to reach a static base on x64
 - Data-driven JSON profile format (serde, round-trip tested)
 - Probe-based resolver with the fail-safe property
 - `scry` host CLI — attach to a running game and stream telemetry (`watch`),
   find signatures (`scan`), and prove the backend end-to-end (`selftest`)
 - CI on Linux **and** Windows: the Windows job runs the integration suite
   against a real process (32- and 64-bit), and ships prebuilt CLI artifacts
-- 28 tests, zero external dependencies beyond serde, offline build
+- 42 tests, zero external dependencies beyond serde, offline build
 
 ---
 
@@ -187,9 +205,10 @@ cargo test         # + integration tests: needs Linux or Windows
 
 The integration tests spawn **cavia** ("guinea pig"), a stand-in game process in
 `src/bin/cavia.rs`. It reproduces the shape a real game has — a static,
-module-relative slot holding a pointer to a heap struct — and plants marker byte
-runs for the AOB and probe tests, then parks so the tests can read its memory
-from the outside. The engine is dogfooded on the cavia itself to report its own
+module-relative slot holding a pointer to a heap struct — plants marker byte
+runs for the AOB and probe tests, and plants a real `mov rax, [rip+disp32]`
+accessor pointing at that slot for the RIP-relative decode test, then parks so
+the tests can read its memory from the outside. The engine is dogfooded on the cavia itself to report its own
 module base.
 
 Note that the integration tests are gated on having a backend for the host OS;

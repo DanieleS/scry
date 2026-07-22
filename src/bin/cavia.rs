@@ -6,6 +6,11 @@
 //! actual values live. Resolving `HP` therefore means: module base + static
 //! offset -> dereference -> field offset. Exactly the Tier-1 pointer path.
 //!
+//! It also plants a real x64 **RIP-relative accessor** — a `mov rax,
+//! [rip+disp32]` whose operand is that same `PLAYER` slot — so the Tier-2 path
+//! that decodes a displacement into a static base (the shape on a modern 64-bit
+//! build) can be proven against a genuine instruction, not a mock.
+//!
 //! It prints the facts a test needs to derive the path, then parks so the test
 //! can read its memory from the outside.
 
@@ -94,10 +99,32 @@ fn main() {
     let probe_addr = PROBE.as_ptr() as u64;
     let build_addr = BUILD.as_ptr() as u64;
 
+    // A real x64 RIP-relative accessor, the shape a static base takes on a modern
+    // 64-bit build: `mov rax, [rip+disp32]` (`48 8B 05 <disp32>`) whose operand is
+    // the PLAYER slot, followed by a unique tail so a scan pins it unambiguously
+    // (the opcode alone occurs all over real code). The displacement is computed
+    // at runtime from the two live addresses — exactly the value a compiler would
+    // have baked in — so an outside reader recovers PLAYER only by decoding it:
+    // `anchor + 7 + disp32`. Leaked so it stays mapped for the process's life.
+    let rip_addr = {
+        let stub: Vec<u8> = vec![
+            0x48, 0x8B, 0x05, 0, 0, 0, 0, // mov rax, [rip+disp32]
+            0xC3, 0x90, 0x5A, 0xA5, 0x5A, 0xA5, // ret; nop; unique marker tail
+        ];
+        // Leak first, then fill the displacement in place: `into_boxed_slice` may
+        // move the buffer, so the address must be read after it settles.
+        let leaked: &'static mut [u8] = Box::leak(stub.into_boxed_slice());
+        let addr = leaked.as_ptr() as u64;
+        let disp32 = (player_addr as i64 - (addr as i64 + 7)) as i32;
+        leaked[3..7].copy_from_slice(&disp32.to_le_bytes());
+        addr
+    };
+
     // Machine-readable line the test parses.
     println!(
         "READY pid={pid} exe={exe_name} base=0x{base:x} player=0x{player_addr:x} \
-         sig=0x{sig_addr:x} probe=0x{probe_addr:x} build=0x{build_addr:x} hp={EXPECTED_HP}"
+         sig=0x{sig_addr:x} probe=0x{probe_addr:x} build=0x{build_addr:x} \
+         rip=0x{rip_addr:x} hp={EXPECTED_HP}"
     );
     use std::io::Write;
     std::io::stdout().flush().ok();

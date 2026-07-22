@@ -87,6 +87,26 @@ pub trait MemoryBackend {
         }
     }
 
+    /// Decode a RIP-relative reference at `anchor` and return the operand's
+    /// effective address.
+    ///
+    /// Reads the signed 32-bit displacement at `anchor + disp` and returns
+    /// `anchor + len + displacement` — the address an x64 `[rip+disp32]` operand
+    /// actually points at, given that the anchor is the instruction's start and
+    /// RIP addressing is relative to the *next* instruction (`anchor + len`).
+    /// This is how a Tier-2 AOB hit on a `mov reg, [rip+disp32]` becomes the
+    /// static base its pointer chain walks from.
+    ///
+    /// The displacement read can fail (an anchor no longer mapped); that
+    /// propagates as an error, so a stale signature yields "unavailable" rather
+    /// than a bogus address treated as real.
+    fn resolve_rip(&self, anchor: u64, disp: i64, len: i64) -> Result<u64> {
+        let displacement = self.read_i32(anchor.wrapping_add(disp as u64))?;
+        Ok(anchor
+            .wrapping_add(len as u64)
+            .wrapping_add(displacement as i64 as u64))
+    }
+
     /// Walk a pointer chain and return the **address** the value lives at.
     ///
     /// Semantics (matching how Cheat Engine tables describe a path): starting
