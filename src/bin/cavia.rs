@@ -14,7 +14,7 @@
 //! It prints the facts a test needs to derive the path, then parks so the test
 //! can read its memory from the outside.
 
-use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU64, AtomicU8, Ordering};
 
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 use scry::MemoryBackend;
@@ -61,6 +61,32 @@ static BUILD: [u8; 12] = [
     0x42, 0x55, 0x49, 0x4C, 0x44, 0x5F, 0x01, 0x00, 0x02, 0x00, 0x03, 0x00,
 ];
 
+/// A real x64 RIP-relative accessor, planted in the module's own data — the
+/// shape a static base takes on a 64-bit build: `mov rax, [rip+disp32]`
+/// (`48 8B 05 <disp32>`) whose operand is the `PLAYER` slot, followed by a unique
+/// tail (`C3 90 5A A5 5A A5`) so a scan pins it unambiguously (the opcode alone
+/// occurs all over real code). It lives in the module, **not** the heap, so it is
+/// guaranteed within the ±2 GiB a signed `disp32` can encode of `PLAYER` — the
+/// invariant a real compiler always satisfies, and which a heap-leaked buffer can
+/// violate on a 64-bit target where the heap sits far from the image. The
+/// displacement is filled at runtime from the two live addresses; `AtomicU8`
+/// shares `u8`'s layout, so an outside reader sees plain bytes.
+static RIPSTUB: [AtomicU8; 13] = [
+    AtomicU8::new(0x48),
+    AtomicU8::new(0x8B),
+    AtomicU8::new(0x05),
+    AtomicU8::new(0),
+    AtomicU8::new(0),
+    AtomicU8::new(0),
+    AtomicU8::new(0),
+    AtomicU8::new(0xC3),
+    AtomicU8::new(0x90),
+    AtomicU8::new(0x5A),
+    AtomicU8::new(0xA5),
+    AtomicU8::new(0x5A),
+    AtomicU8::new(0xA5),
+];
+
 const EXPECTED_HP: i32 = 1337;
 
 fn main() {
@@ -99,24 +125,17 @@ fn main() {
     let probe_addr = PROBE.as_ptr() as u64;
     let build_addr = BUILD.as_ptr() as u64;
 
-    // A real x64 RIP-relative accessor, the shape a static base takes on a modern
-    // 64-bit build: `mov rax, [rip+disp32]` (`48 8B 05 <disp32>`) whose operand is
-    // the PLAYER slot, followed by a unique tail so a scan pins it unambiguously
-    // (the opcode alone occurs all over real code). The displacement is computed
-    // at runtime from the two live addresses — exactly the value a compiler would
-    // have baked in — so an outside reader recovers PLAYER only by decoding it:
-    // `anchor + 7 + disp32`. Leaked so it stays mapped for the process's life.
+    // Fill in the RIP displacement now that both addresses are live: the operand
+    // must resolve to PLAYER via `anchor + 7 + disp32`, exactly the value a
+    // compiler would have baked in. RIPSTUB and PLAYER both live in this module,
+    // so the delta always fits the signed 32-bit field.
     let rip_addr = {
-        let stub: Vec<u8> = vec![
-            0x48, 0x8B, 0x05, 0, 0, 0, 0, // mov rax, [rip+disp32]
-            0xC3, 0x90, 0x5A, 0xA5, 0x5A, 0xA5, // ret; nop; unique marker tail
-        ];
-        // Leak first, then fill the displacement in place: `into_boxed_slice` may
-        // move the buffer, so the address must be read after it settles.
-        let leaked: &'static mut [u8] = Box::leak(stub.into_boxed_slice());
-        let addr = leaked.as_ptr() as u64;
+        let addr = &RIPSTUB as *const _ as u64;
         let disp32 = (player_addr as i64 - (addr as i64 + 7)) as i32;
-        leaked[3..7].copy_from_slice(&disp32.to_le_bytes());
+        let disp = disp32.to_le_bytes();
+        for (slot, byte) in RIPSTUB[3..7].iter().zip(disp) {
+            slot.store(byte, Ordering::SeqCst);
+        }
         addr
     };
 
