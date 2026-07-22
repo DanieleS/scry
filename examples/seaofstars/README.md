@@ -11,6 +11,10 @@ fill in.
 intentionally invalid so a copy-paste run fails fast. Replace them against the
 game's own artefacts, then convert.
 
+> **On a Windows box with the game, follow
+> [`walkthrough.md`](walkthrough.md)** — a copy-paste checklist from a fresh
+> install to `scry watch` printing live HP and gold.
+
 ## What to replace
 
 The map is deliberately explicit about the things only the real game can provide:

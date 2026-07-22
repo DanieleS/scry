@@ -102,12 +102,12 @@ Every profile needs a `probe` — the AOB signature the [resolver] scans for to
 confirm this profile fits the running process. Two ways to supply it:
 
 - **From a metadata string** (easiest for IL2CPP): a game's `global-metadata.dat`
-  is mapped in the process, so a sufficiently unique type or literal name is a
-  stable, scannable identity marker. Give the string and the converter encodes it
-  to bytes:
+  is loaded into the process, so a sufficiently unique name in it is a stable,
+  scannable identity marker. Give the string and the converter encodes it to
+  bytes:
 
   ```json
-  "probe": { "string": "Combat.PartyMember" }
+  "probe": { "string": "CombatManager" }
   ```
 
 - **From a raw signature** you already found with `scry scan`:
@@ -116,8 +116,19 @@ confirm this profile fits the running process. Two ways to supply it:
   "probe": "48 8B 05 ?? ?? ?? ?? 48 8B 88"
   ```
 
-Pick a string distinctive enough that no unrelated process would contain it (a
-full, game-specific class name is usually ideal).
+> **Use a single contiguous token, not a dotted name.** IL2CPP stores a
+> namespace and a type name as *separate* entries in its string heap, so
+> `"Combat.PartyMember"` never appears as those bytes in a row and a probe for it
+> won't resolve. Probe for one identifier — a class name like `"CombatManager"`,
+> or better a distinctive **user string literal** the game ships (a scene or
+> asset name). Then confirm exactly one hit before trusting it:
+>
+> ```sh
+> scry scan --process SeaOfStars.exe --signature "<the converter's probe bytes>"
+> ```
+>
+> On a first run you can sidestep the probe entirely with `scry watch
+> --no-resolve` (see step 7) and pin the identity later.
 
 [resolver]: ../src/resolver.rs
 
@@ -206,11 +217,12 @@ a string:
 
 ```json
 "probe": "48 8B 05 ?? ?? ?? ??"
-"probe": { "string": "Combat.PartyMember" }
-"probe": { "string": "Combat.PartyMember", "encoding": "utf16le" }
+"probe": { "string": "CombatManager" }
+"probe": { "string": "CombatManager", "encoding": "utf16le" }
 ```
 
-`encoding` is `utf8` (default) or `utf16le`.
+`encoding` is `utf8` (default) or `utf16le`. The string must be a single
+contiguous token present in memory — see the note in step 4.
 
 **Each watch** is one of:
 
@@ -249,5 +261,6 @@ the result dereferenced, except after the last, where the value is read. See
 ## Worked example
 
 [`examples/seaofstars/`](../examples/seaofstars/) contains a template map for
-**Sea of Stars** (our confirmed IL2CPP target), reading HP and gold, with notes
-on filling in the anchors from real artefacts.
+**Sea of Stars** (our confirmed IL2CPP target), reading HP and gold, plus a
+copy-paste [Windows walkthrough](../examples/seaofstars/walkthrough.md) from a
+fresh install to live values.

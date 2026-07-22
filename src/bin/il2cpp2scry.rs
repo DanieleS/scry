@@ -100,6 +100,22 @@ fn main() -> ExitCode {
         Err(e) => return fail(&format!("{map_path}: {e}")),
     };
 
+    // A string-derived probe must be one contiguous token. A dotted form almost
+    // always means someone wrote `Namespace.Type`, which IL2CPP stores as two
+    // separate string-heap entries — so those bytes never appear in a row and the
+    // probe can't resolve. Warn, don't fail: a legitimate literal (a version, a
+    // path) may contain a dot, and `--no-resolve` sidesteps the probe anyway.
+    if let il2cpp::ProbeSpec::Derived { string, .. } = &spec.probe {
+        if string.contains('.') {
+            eprintln!(
+                "il2cpp2scry: warning: probe string {string:?} contains '.', which looks \
+                 like a dotted Namespace.Type — IL2CPP stores those as separate entries, so \
+                 it likely won't resolve. Prefer a single identifier or a unique string \
+                 literal, and confirm with `scry scan`."
+            );
+        }
+    }
+
     let profile = match il2cpp::convert(&spec, &symbols) {
         Ok(p) => p,
         Err(e) => return fail(&e.to_string()),

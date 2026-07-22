@@ -53,7 +53,7 @@
 //!   "label": "Example (IL2CPP)",
 //!   "process": "Game.exe",
 //!   "module": "GameAssembly.dll",
-//!   "probe": { "string": "Combat.PartyMember" },
+//!   "probe": { "string": "PartyMember" },
 //!   "watches": [
 //!     { "name": "hp", "tier": "tier1",
 //!       "chain": ["0x2C4E120", "PartyMember::currentHp"], "type": "i32" }
@@ -318,9 +318,12 @@ pub enum ProbeSpec {
     /// this when you already found a code signature with `scry scan`.
     Raw(String),
     /// A distinctive metadata string, encoded to a byte signature. A game's
-    /// `global-metadata.dat` is mapped in the process, so a sufficiently unique
-    /// type or literal name (e.g. a full class name) is a stable, scannable
-    /// identity marker — no disassembly required.
+    /// `global-metadata.dat` is loaded into the process, so a sufficiently unique
+    /// name in it is a stable, scannable identity marker — no disassembly
+    /// required. It must be a **single contiguous token** (one class or member
+    /// identifier, or a user string literal): IL2CPP stores a namespace and type
+    /// name separately, so a dotted `Namespace.Type` never appears as those bytes
+    /// in a row. The CLI warns when a probe string looks dotted.
     Derived {
         /// The string to encode.
         string: String,
