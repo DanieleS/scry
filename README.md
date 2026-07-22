@@ -216,6 +216,15 @@ there is no macOS backend, so `cargo test` on a Mac builds only `--lib`.
 
 ---
 
+## Direction & roadmap
+
+- **[`docs/DIRECTION.md`](docs/DIRECTION.md)** — the north star and decision log:
+  why read-only (not injection), what's been validated, the per-engine
+  reflection map, and where to start next.
+- **[`docs/authoring-profiles.md`](docs/authoring-profiles.md)** — how to author
+  a profile from a real game (Cheat Engine → Tier-1 / Tier-2+`rip`), non-admin.
+- Live work is tracked in the epic, [issue #8](https://github.com/DanieleS/scry/issues/8).
+
 ## License
 
 MIT OR Apache-2.0
