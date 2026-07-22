@@ -18,6 +18,58 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
 
+/// Accept an integer offset written either as a JSON number (decimal) or as a
+/// string — with an optional sign and a `0x`/`0X` prefix for hex, the notation a
+/// disassembler and every memory tool actually speak. Values are stored as
+/// `i64`; input is where the flexibility matters, so a profile authored from a
+/// Cheat Engine session can paste `"0x58"` verbatim instead of hand-converting
+/// it to `88`. (Serialization stays canonical decimal.)
+mod hexnum {
+    use serde::de::{self, Deserializer};
+    use serde::Deserialize;
+
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Repr {
+        Num(i64),
+        Text(String),
+    }
+
+    /// Parse a signed decimal or `0x`-prefixed hex integer. Returns `None` on
+    /// anything else, which the callers turn into a serde error.
+    fn parse(text: &str) -> Option<i64> {
+        let s = text.trim();
+        let (sign, body) = match s.strip_prefix('-') {
+            Some(rest) => (-1i64, rest.trim_start()),
+            None => (1, s.strip_prefix('+').map(str::trim_start).unwrap_or(s)),
+        };
+        let magnitude = match body.strip_prefix("0x").or_else(|| body.strip_prefix("0X")) {
+            Some(hex) => i64::from_str_radix(hex, 16).ok()?,
+            None => body.parse::<i64>().ok()?,
+        };
+        Some(sign * magnitude)
+    }
+
+    fn one<E: de::Error>(repr: Repr) -> Result<i64, E> {
+        match repr {
+            Repr::Num(n) => Ok(n),
+            Repr::Text(s) => parse(&s)
+                .ok_or_else(|| E::custom(format!("not a decimal or 0x-hex integer: {s:?}"))),
+        }
+    }
+
+    /// `deserialize_with` for a single `i64` field (e.g. a `rip` displacement).
+    pub fn de_i64<'de, D: Deserializer<'de>>(d: D) -> Result<i64, D::Error> {
+        one(Repr::deserialize(d)?)
+    }
+
+    /// `deserialize_with` for a `Vec<i64>` field (an offset chain), applying the
+    /// number-or-hex-string rule to each element independently.
+    pub fn de_vec_i64<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<i64>, D::Error> {
+        Vec::<Repr>::deserialize(d)?.into_iter().map(one).collect()
+    }
+}
+
 /// The type of a value read from memory. Each variant maps to one of the typed
 /// reads on [`MemoryBackend`](crate::MemoryBackend).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -52,10 +104,12 @@ pub struct Rip {
     /// Byte offset, from the anchor (the AOB match address), of the signed
     /// 32-bit displacement field. For a plain `48 8B 05 <disp32>` matched from
     /// its first byte, this is `3`.
+    #[serde(deserialize_with = "hexnum::de_i64")]
     pub disp: i64,
     /// Length of the whole instruction in bytes — the distance from the anchor
     /// to the *next* instruction, which RIP addressing is relative to. For
     /// `48 8B 05 <disp32>` this is `7`.
+    #[serde(deserialize_with = "hexnum::de_i64")]
     pub len: i64,
 }
 
@@ -102,6 +156,7 @@ pub enum Watch {
         /// Module whose load base anchors the chain.
         module: String,
         /// Pointer chain from the module base to the value's address.
+        #[serde(deserialize_with = "hexnum::de_vec_i64")]
         offsets: Vec<i64>,
         /// How to interpret the bytes at the resolved address.
         #[serde(rename = "type")]
@@ -128,6 +183,7 @@ pub enum Watch {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         rip: Option<Rip>,
         /// Pointer chain from the anchor address to the value's address.
+        #[serde(deserialize_with = "hexnum::de_vec_i64")]
         offsets: Vec<i64>,
         /// How to interpret the bytes at the resolved address.
         #[serde(rename = "type")]
@@ -303,6 +359,50 @@ mod tests {
         assert_eq!(p.label, None);
         // ...and a version-less profile round-trips without inventing the field.
         assert!(!p.to_json().unwrap().contains("version"));
+    }
+
+    #[test]
+    fn offsets_accept_hex_or_decimal_interchangeably() {
+        // The shape a profile pasted straight out of a disassembler takes: hex
+        // strings for the numbers that were hex on screen, plain numbers where
+        // decimal is natural, mixed freely — including a signed hex offset.
+        let json = r#"
+        {
+          "match": { "process": "g", "module": "g", "probe": "90" },
+          "watches": [
+            { "tier": "tier1", "name": "hp", "module": "g",
+              "offsets": ["0x58", 16, "0x0"], "type": "i32" },
+            { "tier": "tier2", "name": "score", "anchor": "48 8B 05 ?? ?? ?? ??",
+              "rip": { "disp": "0x3", "len": 7 }, "offsets": ["-0x10"], "type": "u32" }
+          ]
+        }
+        "#;
+        let p = Profile::from_json(json).expect("parse");
+        match &p.watches[0] {
+            Watch::Tier1 { offsets, .. } => assert_eq!(offsets, &[0x58, 16, 0x0]),
+            other => panic!("expected tier1, got {other:?}"),
+        }
+        match &p.watches[1] {
+            Watch::Tier2 { rip, offsets, .. } => {
+                assert_eq!(*rip, Some(Rip { disp: 3, len: 7 }));
+                assert_eq!(offsets, &[-0x10]);
+            }
+            other => panic!("expected tier2, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_an_unparseable_hex_offset() {
+        let json = r#"
+        {
+          "match": { "process": "g", "module": "g", "probe": "90" },
+          "watches": [
+            { "tier": "tier1", "name": "x", "module": "g",
+              "offsets": ["0xZZ"], "type": "i32" }
+          ]
+        }
+        "#;
+        assert!(Profile::from_json(json).is_err());
     }
 
     #[test]
