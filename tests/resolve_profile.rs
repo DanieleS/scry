@@ -7,7 +7,7 @@
 //! match.
 
 use scry::profile::{Match, Profile};
-use scry::{resolver, LinuxBackend};
+use scry::{open_host, resolver};
 
 mod common;
 use common::spawn_cavia;
@@ -41,7 +41,7 @@ fn label_of(picked: Option<&Profile>) -> Option<&str> {
 #[test]
 fn selects_the_profile_whose_probe_resolves() {
     let (_cavia, ready) = spawn_cavia();
-    let be = LinuxBackend::new(ready.pid);
+    let be = open_host(ready.pid as u32).expect("open target");
 
     let profiles = vec![
         // Same executable, but its probe is not in the target: a lookalike.
@@ -57,7 +57,7 @@ fn selects_the_profile_whose_probe_resolves() {
 #[test]
 fn no_fitting_profile_yields_no_match() {
     let (_cavia, ready) = spawn_cavia();
-    let be = LinuxBackend::new(ready.pid);
+    let be = open_host(ready.pid as u32).expect("open target");
 
     // Right executable name, but the probe is absent from the memory. The
     // fail-safe: no telemetry rather than a guessed match.
@@ -74,14 +74,20 @@ fn no_fitting_profile_yields_no_match() {
 #[test]
 fn same_engine_collision_is_resolved_by_the_build_marker() {
     let (_cavia, ready) = spawn_cavia();
-    let be = LinuxBackend::new(ready.pid);
+    let be = open_host(ready.pid as u32).expect("open target");
 
     // Two profiles claiming the same executable — the same-engine collision the
-    // probe test exists to break. Only one probes for a marker actually present
-    // in this build.
+    // probe test exists to break. Only one probes for the BUILD marker actually
+    // present in this build, and that probe (not the `version` field) is what
+    // resolves it.
+    //
+    // Neither profile pins a `version`: this test exercises the *probe*, and a
+    // real backend that can report a build id (the Windows PE reader) would
+    // rightly drop a profile pinned to a made-up version string — that path is
+    // covered by the resolver's own unit tests, against a controlled backend.
     let profiles = vec![
-        profile("other-build", &ready.exe, Some("9.9.9"), ABSENT_SIG),
-        profile("this-build", &ready.exe, Some("1.2.3"), BUILD_SIG),
+        profile("other-build", &ready.exe, None, ABSENT_SIG),
+        profile("this-build", &ready.exe, None, BUILD_SIG),
     ];
 
     let picked = resolver::select(&be, &ready.exe, &profiles).expect("select ok");
@@ -91,7 +97,7 @@ fn same_engine_collision_is_resolved_by_the_build_marker() {
 #[test]
 fn a_profile_for_another_process_is_never_chosen() {
     let (_cavia, ready) = spawn_cavia();
-    let be = LinuxBackend::new(ready.pid);
+    let be = open_host(ready.pid as u32).expect("open target");
 
     // Its probe would resolve against this memory, but the process bucket rules
     // it out first: identity starts with the executable name.
@@ -109,7 +115,7 @@ fn a_profile_for_another_process_is_never_chosen() {
 #[test]
 fn probe_resolves_through_wildcards() {
     let (_cavia, ready) = spawn_cavia();
-    let be = LinuxBackend::new(ready.pid);
+    let be = open_host(ready.pid as u32).expect("open target");
 
     // The wildcarded form a real profile uses to survive across builds: the
     // volatile middle bytes are `??`, the stable ends pin the location.

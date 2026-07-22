@@ -11,7 +11,8 @@
 
 use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 
-use scry::{LinuxBackend, MemoryBackend};
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+use scry::MemoryBackend;
 
 #[repr(C)]
 struct Stats {
@@ -76,10 +77,17 @@ fn main() {
         .expect("exe basename")
         .to_string();
 
-    // Dogfood the engine on ourselves to report our own module base.
-    let base = LinuxBackend::new(pid as i32)
+    // Dogfood the engine on ourselves to report our own module base, through
+    // whichever backend this OS was built with — the same read path a host takes
+    // against a game. On a platform with no backend there is nothing to dogfood
+    // (and no integration test runs there), so the base is reported as 0.
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    let base = scry::open_host(pid)
+        .expect("open self")
         .module_base(&exe_name)
         .expect("own module base");
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+    let base: u64 = 0;
 
     let player_addr = &PLAYER as *const AtomicU64 as u64;
     let sig_addr = SIG.as_ptr() as u64;

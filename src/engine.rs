@@ -28,9 +28,9 @@
 //! [`Config::base_tick`] and hands each non-empty diff to a callback:
 //!
 //! ```no_run
-//! # use scry::{Engine, LinuxBackend};
+//! # use scry::{Engine, MemoryBackend};
 //! # use scry::profile::Profile;
-//! # fn demo(backend: LinuxBackend, profile: &Profile) {
+//! # fn demo<B: MemoryBackend + Send + 'static>(backend: B, profile: &Profile) {
 //! use std::sync::mpsc;
 //!
 //! // A channel is just a callback that forwards — no separate API needed.
