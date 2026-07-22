@@ -77,11 +77,17 @@ fn same_engine_collision_is_resolved_by_the_build_marker() {
     let be = open_host(ready.pid as u32).expect("open target");
 
     // Two profiles claiming the same executable — the same-engine collision the
-    // probe test exists to break. Only one probes for a marker actually present
-    // in this build.
+    // probe test exists to break. Only one probes for the BUILD marker actually
+    // present in this build, and that probe (not the `version` field) is what
+    // resolves it.
+    //
+    // Neither profile pins a `version`: this test exercises the *probe*, and a
+    // real backend that can report a build id (the Windows PE reader) would
+    // rightly drop a profile pinned to a made-up version string — that path is
+    // covered by the resolver's own unit tests, against a controlled backend.
     let profiles = vec![
-        profile("other-build", &ready.exe, Some("9.9.9"), ABSENT_SIG),
-        profile("this-build", &ready.exe, Some("1.2.3"), BUILD_SIG),
+        profile("other-build", &ready.exe, None, ABSENT_SIG),
+        profile("this-build", &ready.exe, None, BUILD_SIG),
     ];
 
     let picked = resolver::select(&be, &ready.exe, &profiles).expect("select ok");
