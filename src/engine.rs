@@ -52,7 +52,7 @@ use std::time::{Duration, Instant};
 
 use crate::aob;
 use crate::backend::MemoryBackend;
-use crate::profile::{Profile, ValueType, Watch};
+use crate::profile::{Profile, Rip, ValueType, Watch};
 
 /// A single sampled value — or the honest absence of one.
 ///
@@ -103,8 +103,13 @@ impl Default for Config {
 enum AnchorKind {
     /// Tier-1: the anchor is the load base of this module.
     Module(String),
-    /// Tier-2: the anchor is the first hit of this pre-parsed signature.
-    Signature(Vec<aob::PatternByte>),
+    /// Tier-2: the anchor is the first hit of this pre-parsed signature. If
+    /// `rip` is set, the hit is a RIP-relative instruction and the real anchor is
+    /// its decoded operand address, not the match address itself.
+    Signature {
+        pattern: Vec<aob::PatternByte>,
+        rip: Option<Rip>,
+    },
     /// The watch's anchor spec was itself invalid (an unparseable Tier-2
     /// signature). Kept so the label still exists, but it can never resolve —
     /// it reports `Unavailable` for the session's life.
@@ -141,7 +146,15 @@ fn period_of(rate_hz: Option<f64>) -> Duration {
 fn resolve_anchor<B: MemoryBackend + ?Sized>(backend: &B, kind: &AnchorKind) -> Option<u64> {
     match kind {
         AnchorKind::Module(name) => backend.module_base(name).ok(),
-        AnchorKind::Signature(pattern) => aob::find_in_process(backend, pattern).ok().flatten(),
+        AnchorKind::Signature { pattern, rip } => {
+            let hit = aob::find_in_process(backend, pattern).ok().flatten()?;
+            // A plain signature anchors at its match address; a RIP-relative one
+            // decodes the instruction there into the operand address it names.
+            match rip {
+                Some(r) => backend.resolve_rip(hit, r.disp, r.len).ok(),
+                None => Some(hit),
+            }
+        }
         AnchorKind::Invalid => None,
     }
 }
@@ -206,6 +219,7 @@ impl<B: MemoryBackend> Session<B> {
                 Watch::Tier2 {
                     name,
                     anchor,
+                    rip,
                     offsets,
                     ty,
                     rate_hz,
@@ -213,7 +227,7 @@ impl<B: MemoryBackend> Session<B> {
                     // Parse the signature once. A malformed signature can never
                     // resolve, so record that rather than re-failing every tick.
                     let kind = match aob::parse_pattern(anchor) {
-                        Ok(pattern) => AnchorKind::Signature(pattern),
+                        Ok(pattern) => AnchorKind::Signature { pattern, rip: *rip },
                         Err(_) => AnchorKind::Invalid,
                     };
                     (name.clone(), kind, offsets.clone(), *ty, *rate_hz)
@@ -437,6 +451,14 @@ mod tests {
 
         fn write_i32(&self, off: usize, v: i32) {
             self.mem.borrow_mut()[off..off + 4].copy_from_slice(&v.to_le_bytes());
+        }
+
+        fn write_u64(&self, off: usize, v: u64) {
+            self.mem.borrow_mut()[off..off + 8].copy_from_slice(&v.to_le_bytes());
+        }
+
+        fn write_bytes(&self, off: usize, bytes: &[u8]) {
+            self.mem.borrow_mut()[off..off + bytes.len()].copy_from_slice(bytes);
         }
 
         fn reads_at(&self, addr: u64) -> u32 {
@@ -677,6 +699,86 @@ mod tests {
     }
 
     #[test]
+    fn tier2_rip_relative_resolves_static_pointer() {
+        // Reproduce the x64 static-base shape end-to-end through the engine:
+        //   a `mov rax, [rip+disp32]` instruction whose operand is a static slot
+        //   (PLAYER) holding a pointer to a struct (STATS) whose first field is hp.
+        // The Tier-2 watch AOB-scans the instruction, decodes the displacement to
+        // reach PLAYER, then walks [deref PLAYER -> STATS, +0 -> hp].
+        let fake = Rc::new(Fake::new(256));
+        let base = fake.base;
+
+        // Layout inside the fake's single region.
+        let stub_off = 0x10usize; // the `mov rax, [rip+disp32]` bytes
+        let player_off = 0x80usize; // static slot holding a pointer
+        let stats_off = 0xC0usize; // the "heap" struct; hp at its start
+
+        // PLAYER holds the absolute address of STATS; STATS.hp = 4242.
+        fake.write_u64(player_off, base + stats_off as u64);
+        fake.write_i32(stats_off, 4242);
+
+        // Build `48 8B 05 <disp32>` + a unique tail so the scan is unambiguous.
+        // disp32 is chosen so that anchor + 7 + disp32 == address of PLAYER.
+        let anchor = base + stub_off as u64;
+        let player_addr = base + player_off as u64;
+        let disp32 = (player_addr as i64 - (anchor as i64 + 7)) as i32;
+        let mut stub = vec![0x48u8, 0x8B, 0x05];
+        stub.extend_from_slice(&disp32.to_le_bytes());
+        stub.extend_from_slice(&[0xC3, 0x90, 0x5A, 0xA5]); // ret; nop; unique marker
+        fake.write_bytes(stub_off, &stub);
+
+        let profile = Profile {
+            label: None,
+            match_: ident(),
+            watches: vec![Watch::Tier2 {
+                name: "hp".to_string(),
+                anchor: "48 8B 05 ?? ?? ?? ?? C3 90 5A A5".to_string(),
+                rip: Some(Rip { disp: 3, len: 7 }),
+                offsets: vec![0, 0],
+                ty: ValueType::I32,
+                rate_hz: None,
+            }],
+        };
+        let mut s = Session::attach(Rc::clone(&fake), &profile, Config::default());
+
+        assert_eq!(
+            s.poll(Duration::ZERO).get("hp"),
+            Some(&Value::I32(4242)),
+            "RIP-relative Tier-2 watch must decode the displacement and read hp"
+        );
+    }
+
+    #[test]
+    fn tier2_without_rip_anchors_at_the_match() {
+        // The regression guard for the default path: a Tier-2 watch with no `rip`
+        // block still treats the AOB hit itself as the chain start. Here the
+        // signature bytes double as the value's storage (hp read straight from the
+        // matched region), so offsets is empty.
+        let fake = Rc::new(Fake::new(64));
+        // Plant a unique marker whose first 4 bytes also read as the i32 0x11223344.
+        fake.write_bytes(0x8, &[0x44, 0x33, 0x22, 0x11, 0x5A, 0xA5, 0x5A, 0xA5]);
+
+        let profile = Profile {
+            label: None,
+            match_: ident(),
+            watches: vec![Watch::Tier2 {
+                name: "marker".to_string(),
+                anchor: "44 33 22 11 5A A5 5A A5".to_string(),
+                rip: None,
+                offsets: vec![],
+                ty: ValueType::U32,
+                rate_hz: None,
+            }],
+        };
+        let mut s = Session::attach(Rc::clone(&fake), &profile, Config::default());
+        assert_eq!(
+            s.poll(Duration::ZERO).get("marker"),
+            Some(&Value::U32(0x1122_3344)),
+            "a rip-less Tier-2 watch must anchor at the match address"
+        );
+    }
+
+    #[test]
     fn malformed_signature_watch_is_permanently_unavailable() {
         let fake = Rc::new(Fake::new(64));
         let profile = Profile {
@@ -685,6 +787,7 @@ mod tests {
             watches: vec![Watch::Tier2 {
                 name: "bad".to_string(),
                 anchor: "not hex".to_string(),
+                rip: None,
                 offsets: vec![0],
                 ty: ValueType::I32,
                 rate_hz: None,

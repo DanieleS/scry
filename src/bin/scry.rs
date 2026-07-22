@@ -389,7 +389,8 @@ USAGE:
 
     Spawns `cavia` (shipped alongside this binary), attaches to it with the
     platform backend, and checks the full read path — module base, a
-    module-relative pointer chain, an AOB scan, and the build/version probe.
+    module-relative pointer chain, an AOB scan, a RIP-relative decode, and the
+    build/version probe.
     A pass means the memory backend works on this machine.
 ";
 
@@ -494,7 +495,19 @@ USAGE:
             Err(e) => check("aob scan", false, e.to_string()),
         }
 
-        // 4. Build/version probe: Some(..) on Windows (PE headers), None on Linux
+        // 4. RIP-relative decode: the cavia planted a real `mov rax, [rip+disp32]`
+        //    whose operand is the PLAYER slot. Decoding it must recover PLAYER's
+        //    address — the x64 static-base math a Tier-2 profile relies on.
+        match backend.resolve_rip(ready.rip, 3, 7) {
+            Ok(addr) => check(
+                "rip-relative decode",
+                addr == ready.player,
+                format!("decoded 0x{addr:x} (player 0x{:x})", ready.player),
+            ),
+            Err(e) => check("rip-relative decode", false, e.to_string()),
+        }
+
+        // 5. Build/version probe: Some(..) on Windows (PE headers), None on Linux
         //    (no PE metadata). Either is a pass; we only prove it doesn't error.
         match backend.module_version(&ready.exe) {
             Ok(v) => check(
@@ -549,6 +562,7 @@ USAGE:
         base: u64,
         player: u64,
         sig: u64,
+        rip: u64,
         hp: i32,
         guard: CaviaGuard,
     }
@@ -597,7 +611,7 @@ USAGE:
     fn parse_ready(line: &str, child: std::process::Child) -> Result<Ready, String> {
         let mut pid = 0u32;
         let mut exe = String::new();
-        let (mut base, mut player, mut sig, mut hp) = (0u64, 0u64, 0u64, 0i32);
+        let (mut base, mut player, mut sig, mut rip, mut hp) = (0u64, 0u64, 0u64, 0u64, 0i32);
         let hex = |s: &str| u64::from_str_radix(s.trim_start_matches("0x"), 16).ok();
         for tok in line.split_whitespace() {
             let (k, v) = match tok.split_once('=') {
@@ -610,6 +624,7 @@ USAGE:
                 "base" => base = hex(v).ok_or("bad base")?,
                 "player" => player = hex(v).ok_or("bad player")?,
                 "sig" => sig = hex(v).ok_or("bad sig")?,
+                "rip" => rip = hex(v).ok_or("bad rip")?,
                 "hp" => hp = v.parse().map_err(|_| "bad hp")?,
                 _ => {}
             }
@@ -620,6 +635,7 @@ USAGE:
             base,
             player,
             sig,
+            rip,
             hp,
             guard: CaviaGuard(child),
         })

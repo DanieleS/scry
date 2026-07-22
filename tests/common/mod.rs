@@ -30,6 +30,9 @@ pub struct Ready {
     pub sig: u64,
     pub probe: u64,
     pub build: u64,
+    /// Address of the planted `mov rax, [rip+disp32]` accessor whose operand is
+    /// the PLAYER slot — the anchor a RIP-relative Tier-2 watch decodes.
+    pub rip: u64,
     pub hp: i32,
 }
 
@@ -42,6 +45,7 @@ fn parse_ready(line: &str) -> Ready {
         sig: 0,
         probe: 0,
         build: 0,
+        rip: 0,
         hp: 0,
     };
     for tok in line.split_whitespace() {
@@ -58,6 +62,7 @@ fn parse_ready(line: &str) -> Ready {
             "sig" => r.sig = hex(v),
             "probe" => r.probe = hex(v),
             "build" => r.build = hex(v),
+            "rip" => r.rip = hex(v),
             "hp" => r.hp = v.parse().unwrap(),
             _ => {}
         }
