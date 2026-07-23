@@ -25,6 +25,10 @@ jobs:
       matrix:
         os: [ubuntu-latest, windows-latest]
     runs-on: ${{ matrix.os }}
+    # A normal run finishes in a couple of minutes; cap it so a stalled runner
+    # (a hung compile/link) fails fast instead of burning ~45 min, as one i686
+    # build once did, before anyone can react.
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
 
@@ -42,13 +46,18 @@ jobs:
         run: cargo fmt --all --check
 
       - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --all-targets --all-features -- -D warnings
 
       - name: Test
         run: cargo test --all-targets
 
+      # The offline authoring tools (IL2CPP -> profile converter) live behind a
+      # non-default feature so the runtime stays tiny; test that path explicitly.
+      - name: Test (authoring tools)
+        run: cargo test --all-targets --features authoring
+
       - name: Doc tests
-        run: cargo test --doc
+        run: cargo test --doc --all-features
 
   # Prove the 32-bit (WOW64) read path at runtime, not just at compile time:
   # build and run the whole integration suite as a 32-bit process reading a
@@ -56,6 +65,7 @@ jobs:
   windows-32bit:
     name: test (windows, 32-bit)
     runs-on: windows-latest
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust (i686)
@@ -73,6 +83,7 @@ jobs:
   windows-cli:
     name: cli (${{ matrix.target }})
     runs-on: windows-latest
+    timeout-minutes: 25
     needs: test
     strategy:
       fail-fast: false
@@ -86,8 +97,11 @@ jobs:
           rustup default stable
           rustup target add ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
+      # `--features authoring` so the gated `il2cpp2scry` converter is built too:
+      # a no-toolchain author downloads all three (host, selftest cavia, and the
+      # IL2CPP→profile converter) and never needs Rust.
       - name: Build release binaries
-        run: cargo build --release --bins --target ${{ matrix.target }}
+        run: cargo build --release --bins --features authoring --target ${{ matrix.target }}
       - name: Upload CLI artifact
         uses: actions/upload-artifact@v4
         with:
@@ -95,4 +109,5 @@ jobs:
           path: |
             target/${{ matrix.target }}/release/scry.exe
             target/${{ matrix.target }}/release/cavia.exe
+            target/${{ matrix.target }}/release/il2cpp2scry.exe
           if-no-files-found: error

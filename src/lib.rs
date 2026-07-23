@@ -18,6 +18,16 @@ pub mod engine;
 pub mod profile;
 pub mod resolver;
 
+/// Offline **profile-authoring** tools — present only under the `authoring`
+/// feature, and never part of the read-only telemetry runtime.
+///
+/// This is where engine-specific knowledge (today: Unity IL2CPP) is allowed to
+/// live, because it runs at *authoring time* on files, not against a live
+/// process on the hot path. A host that just reads a game ships without it; the
+/// runtime keeps reading plain offsets and signatures exactly as before.
+#[cfg(feature = "authoring")]
+pub mod authoring;
+
 pub use backend::MemoryBackend;
 pub use engine::{Config, Engine, Handle, Session, Snapshot, Value};
 pub use error::{Error, Result};

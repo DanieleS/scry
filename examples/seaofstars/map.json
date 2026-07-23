@@ -1,0 +1,24 @@
+{
+  "label": "Sea of Stars (Steam)",
+  "process": "SeaOfStars.exe",
+  "module": "GameAssembly.dll",
+  "probe": { "string": "SeaOfStars" },
+
+  "watches": [
+    {
+      "name": "hp",
+      "tier": "tier2",
+      "anchor": "48 8B 05 ?? ?? ?? ?? REPLACE_WITH_FOLLOWING_BYTES",
+      "rip": { "disp": 3, "len": 7 },
+      "chain": ["CombatManager::activeParty", "PartyMember::currentHp"],
+      "type": "i32",
+      "rate_hz": 10
+    },
+    {
+      "name": "gold",
+      "tier": "tier1",
+      "chain": ["0xREPLACE_STATIC_BASE", "InventoryManager::gold"],
+      "type": "u32"
+    }
+  ]
+}
