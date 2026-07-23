@@ -25,6 +25,10 @@ jobs:
       matrix:
         os: [ubuntu-latest, windows-latest]
     runs-on: ${{ matrix.os }}
+    # A normal run finishes in a couple of minutes; cap it so a stalled runner
+    # (a hung compile/link) fails fast instead of burning ~45 min, as one i686
+    # build once did, before anyone can react.
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
 
@@ -61,6 +65,7 @@ jobs:
   windows-32bit:
     name: test (windows, 32-bit)
     runs-on: windows-latest
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust (i686)
@@ -78,6 +83,7 @@ jobs:
   windows-cli:
     name: cli (${{ matrix.target }})
     runs-on: windows-latest
+    timeout-minutes: 25
     needs: test
     strategy:
       fail-fast: false
