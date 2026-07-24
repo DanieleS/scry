@@ -18,9 +18,13 @@ release is something somebody sat down and described.
 3. Commit both, tag, and push them together:
 
    ```sh
-   git tag v0.1.0
+   git tag -a v0.1.0 -m "scry 0.1.0"
    git push --follow-tags
    ```
+
+   The tag must be **annotated** (`-a`): `--follow-tags` pushes only those, and
+   a lightweight tag would silently stay on your machine while the commit went
+   out — leaving a push that looks fine and releases nothing.
 
 The tag must sit on the commit being pushed to `main`. CI notices it, checks
 that it is a version tag, that it is newer than what is already published in its
