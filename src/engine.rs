@@ -52,7 +52,7 @@ use std::time::{Duration, Instant};
 
 use crate::aob;
 use crate::backend::MemoryBackend;
-use crate::profile::{Base, Profile, Rip, StringEncoding, StringLayout, ValueType, Watch};
+use crate::profile::{Base, Field, Profile, Rip, StringEncoding, StringLayout, ValueType, Watch};
 
 /// A single sampled value — or the honest absence of one.
 ///
@@ -77,6 +77,14 @@ pub enum Value {
     /// nested [`Unavailable`](Value::Unavailable) without sinking the list, and
     /// the whole array diffs by equality like any scalar.
     List(Vec<Value>),
+    /// A [record](crate::profile::Watch::Record) — named fields read off a shared
+    /// base — or a record-valued [collection](crate::profile::Watch::Collection)
+    /// element. Keys are ordered (`BTreeMap`) for stable, testable output; each
+    /// field is itself a `Value`, so a broken field is a nested
+    /// [`Unavailable`](Value::Unavailable) without sinking the record. This is the
+    /// engine's *one* level of structure: the same `label → Value` shape as a
+    /// snapshot, nested once — no deeper entity modelling.
+    Map(BTreeMap<String, Value>),
     /// The watch's chain could not be resolved or read this tick. The fail-soft
     /// state — never a stale or garbage number passed off as a live reading.
     Unavailable,
@@ -128,10 +136,34 @@ enum AnchorKind {
     Invalid,
 }
 
-/// What a watch does once its anchor is resolved: read one typed value, or
-/// iterate a container into an array. The per-tier difference (how the anchor is
-/// *found*) lives in [`AnchorKind`]; this is the per-*kind* difference (what is
-/// read once we have it).
+/// A record's fields, flattened for the loop: `(name, offsets, ty)` per field,
+/// resolved relative to the record's shared base. A `Vec` (not a map) keeps the
+/// attach-time order; the emitted [`Value::Map`] re-keys by name for stable
+/// output. Built once from a profile's [`Field`] map.
+type RecordFields = Vec<(String, Vec<i64>, ValueType)>;
+
+/// Flatten a profile's `name → Field` map into the loop's [`RecordFields`].
+fn flatten_fields(fields: &std::collections::BTreeMap<String, Field>) -> RecordFields {
+    fields
+        .iter()
+        .map(|(name, f)| (name.clone(), f.offsets.clone(), f.ty))
+        .collect()
+}
+
+/// What a collection's element is: a single typed value, or a record of named
+/// fields read relative to the element's resolved address. Mirrors the
+/// scalar-XOR-record choice on [`Watch::Collection`].
+enum ElementReader {
+    /// A scalar element: read one `ty` value at the element address.
+    Scalar(ValueType),
+    /// A record element: read these fields relative to the element address.
+    Record(RecordFields),
+}
+
+/// What a watch does once its anchor is resolved: read one typed value, iterate
+/// a container into an array, or read named fields off a base. The per-tier
+/// difference (how the anchor is *found*) lives in [`AnchorKind`]; this is the
+/// per-*kind* difference (what is read once we have it).
 enum Reader {
     /// A scalar [`Watch::Tier1`]/[`Watch::Tier2`]: walk `offsets` from the anchor
     /// and read one `ty` value.
@@ -145,8 +177,14 @@ enum Reader {
         first: i64,
         stride: i64,
         element: Vec<i64>,
-        ty: ValueType,
+        content: ElementReader,
         max: usize,
+    },
+    /// A [`Watch::Record`]: walk `base` from the anchor to the record's base, then
+    /// read each field relative to it into a [`Value::Map`].
+    Record {
+        base: Vec<i64>,
+        fields: RecordFields,
     },
 }
 
@@ -171,6 +209,21 @@ fn signature_kind(anchor: &str, rip: Option<Rip>) -> AnchorKind {
     match aob::parse_pattern(anchor) {
         Ok(pattern) => AnchorKind::Signature { pattern, rip },
         Err(_) => AnchorKind::Invalid,
+    }
+}
+
+/// Split a collection/record [`Base`] into how its anchor is *found*
+/// ([`AnchorKind`]) and the offset chain from that anchor to the container or
+/// record base. Shared by the [`Watch::Collection`] and [`Watch::Record`] attach
+/// paths — a base is anchored exactly like a scalar watch.
+fn anchor_from_base(base: &Base) -> (AnchorKind, Vec<i64>) {
+    match base {
+        Base::Tier1 { module, offsets } => (AnchorKind::Module(module.clone()), offsets.clone()),
+        Base::Tier2 {
+            anchor,
+            rip,
+            offsets,
+        } => (signature_kind(anchor, *rip), offsets.clone()),
     }
 }
 
@@ -217,6 +270,23 @@ fn read_typed<B: MemoryBackend + ?Sized>(backend: &B, addr: u64, ty: ValueType) 
         ValueType::String(spec) => read_string(backend, addr, spec.layout()).map(Value::Str),
     };
     read.unwrap_or(Value::Unavailable)
+}
+
+/// Read a record: for each field, resolve its chain **relative to the same
+/// `base`** and read its value into an ordered [`Value::Map`]. Reading every
+/// field off one base in one call is what makes the record a coherent atomic
+/// sample. A field whose chain can't be resolved is a nested
+/// [`Unavailable`](Value::Unavailable) in place — the record still forms.
+fn read_record<B: MemoryBackend + ?Sized>(backend: &B, base: u64, fields: &RecordFields) -> Value {
+    let mut map = BTreeMap::new();
+    for (name, offsets, ty) in fields {
+        let value = match backend.resolve(base, offsets) {
+            Ok(addr) => read_typed(backend, addr, *ty),
+            Err(_) => Value::Unavailable,
+        };
+        map.insert(name.clone(), value);
+    }
+    Value::Map(map)
 }
 
 /// Decode a string at `addr` per an engine-agnostic [`StringLayout`]. The layout
@@ -333,6 +403,13 @@ fn sample_one<B: MemoryBackend + ?Sized>(backend: &B, w: &Scheduled) -> Value {
             Ok(addr) => read_typed(backend, addr, *ty),
             Err(_) => Value::Unavailable,
         },
+        Reader::Record { base, fields } => match backend.resolve(anchor, base) {
+            // Reach the record's base once, then read every field relative to it.
+            // A base that no longer resolves makes the whole record unavailable;
+            // a single broken field stays a nested Unavailable (in read_record).
+            Ok(base_addr) => read_record(backend, base_addr, fields),
+            Err(_) => Value::Unavailable,
+        },
         Reader::Collection {
             base,
             count,
@@ -340,7 +417,7 @@ fn sample_one<B: MemoryBackend + ?Sized>(backend: &B, w: &Scheduled) -> Value {
             first,
             stride,
             element,
-            ty,
+            content,
             max,
         } => {
             // Reach the container. A base that no longer resolves makes the whole
@@ -376,8 +453,13 @@ fn sample_one<B: MemoryBackend + ?Sized>(backend: &B, w: &Scheduled) -> Value {
                 let slot = region
                     .wrapping_add(*first as u64)
                     .wrapping_add((i as u64).wrapping_mul(*stride as u64));
+                // Resolve the element's address once (shared by every field of a
+                // record); a failure here fails the whole element, not one field.
                 let value = match backend.resolve(slot, element) {
-                    Ok(addr) => read_typed(backend, addr, *ty),
+                    Ok(addr) => match content {
+                        ElementReader::Scalar(ty) => read_typed(backend, addr, *ty),
+                        ElementReader::Record(fields) => read_record(backend, addr, fields),
+                    },
                     Err(_) => Value::Unavailable,
                 };
                 out.push(value);
@@ -452,21 +534,20 @@ impl<B: MemoryBackend> Session<B> {
                     stride,
                     element,
                     ty,
+                    fields,
                     max,
                     rate_hz,
                 } => {
                     // A collection's base is anchored exactly like a scalar
                     // watch; only its `offsets` reach the container rather than a
                     // value. Everything after the base is the iteration recipe.
-                    let (kind, base_offsets) = match base {
-                        Base::Tier1 { module, offsets } => {
-                            (AnchorKind::Module(module.clone()), offsets.clone())
-                        }
-                        Base::Tier2 {
-                            anchor,
-                            rip,
-                            offsets,
-                        } => (signature_kind(anchor, *rip), offsets.clone()),
+                    let (kind, base_offsets) = anchor_from_base(base);
+                    // Scalar-XOR-record element (validation guarantees exactly one
+                    // in a parsed profile; the scalar fallback is only reached by a
+                    // hand-built, unvalidated profile and never read wrongly).
+                    let content = match fields {
+                        Some(fields) => ElementReader::Record(flatten_fields(fields)),
+                        None => ElementReader::Scalar(ty.unwrap_or(ValueType::U64)),
                     };
                     (
                         name.clone(),
@@ -478,8 +559,27 @@ impl<B: MemoryBackend> Session<B> {
                             first: *first,
                             stride: *stride,
                             element: element.clone(),
-                            ty: *ty,
+                            content,
                             max: *max,
+                        },
+                        *rate_hz,
+                    )
+                }
+                Watch::Record {
+                    name,
+                    base,
+                    fields,
+                    rate_hz,
+                } => {
+                    // A record's base is anchored exactly like a collection's; the
+                    // fields are then read relative to the resolved base.
+                    let (kind, base_offsets) = anchor_from_base(base);
+                    (
+                        name.clone(),
+                        kind,
+                        Reader::Record {
+                            base: base_offsets,
+                            fields: flatten_fields(fields),
                         },
                         *rate_hz,
                     )
@@ -1063,7 +1163,8 @@ mod tests {
             first: 0x20,
             stride: 8,
             element: vec![0, 0], // slot -> deref -> element base
-            ty: ValueType::I32,
+            ty: Some(ValueType::I32),
+            fields: None,
             max,
             rate_hz: None,
         }
@@ -1162,6 +1263,172 @@ mod tests {
         let mut s = Session::attach(Rc::clone(&fake), &profile, Config::default());
         assert_eq!(
             s.poll(Duration::ZERO).get("enemy_hp"),
+            Some(&Value::Unavailable)
+        );
+    }
+
+    /// Assemble a `Value::Map` from `(name, value)` pairs — the expected shape for
+    /// a record, keyed and ordered like the engine emits.
+    fn map(pairs: &[(&str, Value)]) -> Value {
+        Value::Map(
+            pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.clone()))
+                .collect(),
+        )
+    }
+
+    /// A record's `fields`, built from `(name, offsets, ty)` triples.
+    fn fields(specs: &[(&str, Vec<i64>, ValueType)]) -> BTreeMap<String, Field> {
+        specs
+            .iter()
+            .map(|(name, offsets, ty)| {
+                (
+                    name.to_string(),
+                    Field {
+                        offsets: offsets.clone(),
+                        ty: *ty,
+                    },
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn record_watch_reads_a_map_off_a_shared_base() {
+        // A top-level record: resolve one base, read two fields relative to it.
+        // The fields land in the same tick off the same base — the atomic sample.
+        let fake = Rc::new(Fake::new(0x100));
+        fake.write_i32(0x40, 120); // hp
+        fake.write_i32(0x44, 30); // sp
+
+        let profile = Profile {
+            label: None,
+            match_: ident(),
+            watches: vec![Watch::Record {
+                name: "player".to_string(),
+                base: Base::Tier1 {
+                    module: "fake".to_string(),
+                    offsets: vec![0x40], // module base + 0x40 = the record base
+                },
+                fields: fields(&[
+                    ("hp", vec![0], ValueType::I32),
+                    ("sp", vec![4], ValueType::I32),
+                ]),
+                rate_hz: None,
+            }],
+        };
+        let mut s = Session::attach(Rc::clone(&fake), &profile, Config::default());
+        assert_eq!(
+            s.poll(Duration::ZERO).get("player"),
+            Some(&map(&[("hp", Value::I32(120)), ("sp", Value::I32(30))])),
+            "a record must emit a Value::Map of its named fields"
+        );
+    }
+
+    #[test]
+    fn collection_of_records_reads_a_map_per_element() {
+        // `party = [{hp, mp}, …]`: each element is a record read off the member
+        // object the slot points at. `element = [0, 0]` factors the shared deref;
+        // each field is a short chain relative to that member base.
+        let fake = Rc::new(Fake::new(0x400));
+        let base = fake.base;
+        fake.write_u64(0x100, base + 0x200); // items -> backing array
+        fake.write_i32(0x108, 2); // count
+        fake.write_u64(0x220, base + 0x300); // slot0 -> member0
+        fake.write_i32(0x300, 100); // member0.hp
+        fake.write_i32(0x304, 20); // member0.mp
+        fake.write_u64(0x228, base + 0x340); // slot1 -> member1
+        fake.write_i32(0x340, 80); // member1.hp
+        fake.write_i32(0x344, 55); // member1.mp
+
+        let profile = Profile {
+            label: None,
+            match_: ident(),
+            watches: vec![Watch::Collection {
+                name: "party".to_string(),
+                base: Base::Tier1 {
+                    module: "fake".to_string(),
+                    offsets: vec![0x100],
+                },
+                count: vec![0x8],
+                items: Some(vec![0x0]),
+                first: 0x20,
+                stride: 8,
+                element: vec![0, 0], // slot -> deref -> member base
+                ty: None,
+                fields: Some(fields(&[
+                    ("hp", vec![0], ValueType::I32),
+                    ("mp", vec![4], ValueType::I32),
+                ])),
+                max: 8,
+                rate_hz: None,
+            }],
+        };
+        let mut s = Session::attach(Rc::clone(&fake), &profile, Config::default());
+        assert_eq!(
+            s.poll(Duration::ZERO).get("party"),
+            Some(&Value::List(vec![
+                map(&[("hp", Value::I32(100)), ("mp", Value::I32(20))]),
+                map(&[("hp", Value::I32(80)), ("mp", Value::I32(55))]),
+            ])),
+            "a record collection must emit an ordered list of coherent maps"
+        );
+    }
+
+    #[test]
+    fn record_field_fails_soft_without_sinking_the_record() {
+        // One field walks a bad pointer; it must be a nested Unavailable in place
+        // while the healthy field stays live — the record still forms.
+        let fake = Rc::new(Fake::new(0x100));
+        fake.write_i32(0x40, 7); // hp (good)
+        fake.write_u64(0x48, 0xdead_0000); // a pointer into unmapped memory
+
+        let profile = Profile {
+            label: None,
+            match_: ident(),
+            watches: vec![Watch::Record {
+                name: "player".to_string(),
+                base: Base::Tier1 {
+                    module: "fake".to_string(),
+                    offsets: vec![0x40],
+                },
+                fields: fields(&[
+                    ("hp", vec![0], ValueType::I32),
+                    ("bad", vec![0x8, 0], ValueType::I32), // deref 0xdead_0000 -> fails
+                ]),
+                rate_hz: None,
+            }],
+        };
+        let mut s = Session::attach(Rc::clone(&fake), &profile, Config::default());
+        assert_eq!(
+            s.poll(Duration::ZERO).get("player"),
+            Some(&map(&[("bad", Value::Unavailable), ("hp", Value::I32(7)),])),
+            "a broken field is Unavailable in place, never sinking the record"
+        );
+    }
+
+    #[test]
+    fn record_base_unresolvable_is_wholly_unavailable() {
+        // If the record's base can't be reached there is nothing to read fields
+        // off — the whole record is Unavailable, not a map of Unavailables.
+        let fake = Rc::new(Fake::new(0x40));
+        let profile = Profile {
+            label: None,
+            match_: ident(),
+            watches: vec![Watch::Record {
+                name: "player".to_string(),
+                base: Base::Tier1 {
+                    module: "fake".to_string(),
+                    offsets: vec![0x100, 0], // deref past the mapped region -> fails
+                },
+                fields: fields(&[("hp", vec![0], ValueType::I32)]),
+                rate_hz: None,
+            }],
+        };
+        let mut s = Session::attach(Rc::clone(&fake), &profile, Config::default());
+        assert_eq!(
+            s.poll(Duration::ZERO).get("player"),
             Some(&Value::Unavailable)
         );
     }

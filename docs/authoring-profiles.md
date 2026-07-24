@@ -207,6 +207,55 @@ place without sinking the list. A base/count/items failure makes the whole watch
 `unavailable` — the list can't be sized or located, so there is nothing honest to
 emit.
 
+## Records (named fields off one base)
+
+When a value is a handful of **named fields**, not a scalar, use a `record`
+watch: resolve one `base`, then read each field as a chain **relative to that
+base**. The output is a map (`{ hp: 120, sp: 30 }`).
+
+```json
+{ "tier": "record", "name": "player",
+  "base": { "tier": "tier1", "module": "GameAssembly.dll", "offsets": ["0x2C4E120", 0] },
+  "fields": {
+    "hp":   { "offsets": ["0x18"], "type": "i32" },
+    "sp":   { "offsets": ["0x1c"], "type": "i32" },
+    "name": { "offsets": ["0x38"], "type": { "string": "il2cpp" } }
+  } }
+```
+
+A field is `{ "offsets": [...], "type": ... }` — the same "walk a chain, read a
+type" as a scalar watch, but starting from the record's resolved base. An empty
+`offsets` means the base address itself holds the value.
+
+The **same `fields` shape** turns a collection element into a record. Give the
+collection `fields` **instead of** `type`; `element` then reaches the element's
+base (for a `List<T>` of object pointers, `element: [0, 0]` derefs the slot to
+the object), and each field is relative to it:
+
+```json
+{ "tier": "collection", "name": "party",
+  "base": { "tier": "tier1", "module": "GameAssembly.dll", "offsets": ["0x38BB238", 0] },
+  "count": ["0x18"], "items": ["0x10"], "first": "0x20", "stride": 8,
+  "element": [0, 0],
+  "fields": {
+    "name": { "offsets": ["0x38"], "type": { "string": "il2cpp" } },
+    "hp":   { "offsets": ["0x18"], "type": "i32" },
+    "mp":   { "offsets": ["0x1c"], "type": "i32" }
+  }, "max": 8 }
+```
+
+Why author a record collection instead of parallel `party_name` / `party_hp`
+lists zipped by index? **Coherence** — every field is read off the same element
+base in the same tick, so a roster that changes between staggered samples can't
+tear (one member's HP under another's name). And **factoring** — the shared
+prefix (`element`) is resolved once; each field is a short relative chain.
+
+Rules: a collection sets **exactly one** of `type` (scalar element) or `fields`
+(record element) — the profile is rejected at load time otherwise. A broken field
+is `unavailable` in place; the record still forms. A base that won't resolve makes
+the whole record `unavailable`. Structure is **one level deep** — a field is a
+scalar or string, never another record; deeper trees stay the consumer's job.
+
 The IL2CPP converter (`docs/authoring-il2cpp.md`) speaks the same shape with
 `Class::field` names in every chain, so the fragile offsets are derived from a
 dump rather than hand-counted.

@@ -9,8 +9,9 @@
 //! build the watch that reads it, then assert the emitted array/value.
 
 use scry::engine::Value;
-use scry::profile::{Base, Match, Profile, StringPreset, StringSpec, ValueType, Watch};
+use scry::profile::{Base, Field, Match, Profile, StringPreset, StringSpec, ValueType, Watch};
 use scry::{open_host, Config, MemoryBackend, Session};
+use std::collections::BTreeMap;
 use std::time::Duration;
 
 /// The IL2CPP string type (a preset) — the shape the cavia fixtures plant.
@@ -56,7 +57,8 @@ fn collection_reads_an_enemy_hp_list_from_the_cavia() {
             first: 0x20,            // array header before element 0
             stride: 8,              // pointer array
             element: vec![0, 0],    // slot -> deref -> Stats -> +0 -> hp
-            ty: ValueType::I32,
+            ty: Some(ValueType::I32),
+            fields: None,
             max: 64,
             rate_hz: None,
         }],
@@ -72,6 +74,70 @@ fn collection_reads_an_enemy_hp_list_from_the_cavia() {
             Value::I32(33),
         ])),
         "collection watch must read the enemy HP list in order"
+    );
+}
+
+#[test]
+fn collection_reads_records_per_enemy_from_the_cavia() {
+    // The record form of a collection, end-to-end against the live cavia: each
+    // enemy element is `{hp, hp_max}` read off the same `Stats` object in one
+    // tick. The cavia plants `hp_max == hp` for every enemy, so the two fields
+    // pin each other — proof the record is coherent, not a stale/torn pairing.
+    let (_cavia, ready) = spawn_cavia();
+    let be = open_host(ready.pid as u32).expect("open target");
+    let base = be.module_base(&ready.exe).expect("module base");
+
+    let enemies_offset = (ready.enemies - base) as i64;
+
+    let mut fields = BTreeMap::new();
+    fields.insert(
+        "hp".to_string(),
+        Field {
+            offsets: vec![0x0],
+            ty: ValueType::I32,
+        },
+    );
+    fields.insert(
+        "hp_max".to_string(),
+        Field {
+            offsets: vec![0x4],
+            ty: ValueType::I32,
+        },
+    );
+
+    let profile = Profile {
+        label: Some("cavia (record collection)".to_string()),
+        match_: ident(&ready.exe),
+        watches: vec![Watch::Collection {
+            name: "enemies".to_string(),
+            base: Base::Tier1 {
+                module: ready.exe.clone(),
+                offsets: vec![enemies_offset, 0],
+            },
+            count: vec![0x8],
+            items: Some(vec![0x0]),
+            first: 0x20,
+            stride: 8,
+            element: vec![0, 0], // slot -> deref -> Stats base
+            ty: None,
+            fields: Some(fields),
+            max: 64,
+            rate_hz: None,
+        }],
+    };
+
+    let mut session = Session::attach(be, &profile, Config::default());
+    let snap = session.poll(Duration::ZERO);
+    let record = |hp: i32| {
+        Value::Map(BTreeMap::from([
+            ("hp".to_string(), Value::I32(hp)),
+            ("hp_max".to_string(), Value::I32(hp)),
+        ]))
+    };
+    assert_eq!(
+        snap.get("enemies"),
+        Some(&Value::List(vec![record(11), record(22), record(33)])),
+        "a record collection must emit a coherent {{hp, hp_max}} per enemy, in order"
     );
 }
 
@@ -98,7 +164,8 @@ fn collection_reads_the_ordered_party_roster_as_strings() {
             stride: 8,
             // The slot *is* the string reference; `read_string` derefs it.
             element: vec![],
-            ty: il2cpp_string(),
+            ty: Some(il2cpp_string()),
+            fields: None,
             max: 64,
             rate_hz: None,
         }],
