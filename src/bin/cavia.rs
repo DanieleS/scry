@@ -155,7 +155,42 @@ fn make_list(elements: &[u64]) -> u64 {
     Box::leak(list.into_boxed_slice()).as_ptr() as u64
 }
 
+/// Let *any* process on this machine read us, not just our own descendants.
+///
+/// Linux's Yama LSM defaults to `ptrace_scope=1`, under which
+/// `process_vm_readv` only works on a **descendant** of the caller. Every other
+/// integration test spawns this cavia as its own child and so never notices;
+/// but a test that spawns the `scry` CLI *alongside* the cavia makes the two
+/// siblings, and the reads fail — which is the shape a real host has, since a
+/// game is never a child of the telemetry process.
+///
+/// `PR_SET_PTRACER` is the kernel's own answer to that: a process declaring who
+/// may inspect it. This is a **test fixture opting in**, and it is the only
+/// honest place to put the opt-in — the alternative would be relaxing a
+/// machine-wide sysctl in CI, or quietly not testing the sibling case at all.
+/// Nothing here changes what `scry` may read: a real game grants no such thing,
+/// and on Linux a host may well need `CAP_SYS_PTRACE` or a relaxed
+/// `ptrace_scope`. No-op off Linux, where nothing like Yama gates the read.
+#[cfg(target_os = "linux")]
+fn consent_to_being_read() {
+    const PR_SET_PTRACER: i32 = 0x59616d61; // "Yama"
+    const PR_SET_PTRACER_ANY: u64 = u64::MAX;
+    extern "C" {
+        fn prctl(option: i32, arg2: u64, ...) -> i32;
+    }
+    // Best-effort: on a kernel without Yama this fails harmlessly, and the read
+    // was never gated there in the first place.
+    unsafe {
+        let _ = prctl(PR_SET_PTRACER, PR_SET_PTRACER_ANY);
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn consent_to_being_read() {}
+
 fn main() {
+    consent_to_being_read();
+
     // The "game" allocates its player stats on the heap and records the pointer
     // in the static slot. Leaked so the address stays valid for the process's
     // life (a real game keeps these alive the same way).
