@@ -9,9 +9,14 @@
 //! build the watch that reads it, then assert the emitted array/value.
 
 use scry::engine::Value;
-use scry::profile::{Base, Match, Profile, ValueType, Watch};
+use scry::profile::{Base, Match, Profile, StringPreset, StringSpec, ValueType, Watch};
 use scry::{open_host, Config, MemoryBackend, Session};
 use std::time::Duration;
+
+/// The IL2CPP string type (a preset) — the shape the cavia fixtures plant.
+fn il2cpp_string() -> ValueType {
+    ValueType::String(StringSpec::Preset(StringPreset::Il2cpp))
+}
 
 mod common;
 use common::spawn_cavia;
@@ -93,7 +98,7 @@ fn collection_reads_the_ordered_party_roster_as_strings() {
             stride: 8,
             // The slot *is* the string reference; `read_string` derefs it.
             element: vec![],
-            ty: ValueType::String,
+            ty: il2cpp_string(),
             max: 64,
             rate_hz: None,
         }],
@@ -128,7 +133,7 @@ fn scalar_string_watch_reads_a_character_identity() {
             module: ready.exe.clone(),
             // Resolve to the reference slot; the string type derefs from there.
             offsets: vec![name_offset],
-            ty: ValueType::String,
+            ty: il2cpp_string(),
             rate_hz: None,
         }],
     };

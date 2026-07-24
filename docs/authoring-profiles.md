@@ -120,20 +120,45 @@ scry watch --process SeaOfStars.exe --profile seaofstars.json --no-resolve # HP 
 
 ## Strings
 
-A `string` value type reads an IL2CPP `System.String`. C# strings are reference
-types, so the chain resolves to the **slot that holds the string reference** (the
-field itself) — the engine follows the pointer and decodes the object: a 32-bit
-length at `+0x10`, UTF-16 payload at `+0x14`, capped so a garbage length can't
-run away. A null reference reads as `""` (honest empty), not `unavailable`.
+A `string` value type reads text. How a string is laid out varies **by engine**
+(IL2CPP, Mono, native C, Unreal `FString`, …), so the layout is *data*, not baked
+into the runtime — you name a **preset** or give an explicit **layout**. No engine
+is the default; a bare `"string"` is rejected.
 
 ```json
 { "tier": "tier1", "name": "hero",
-  "offsets": ["0x1A2B3C", "0x38"], "type": "string" }
+  "offsets": ["0x1A2B3C", "0x38"], "type": { "string": "il2cpp" } }
 ```
 
-The last offset lands on the reference field (Sea of Stars: the character's
-`CharacterDefinitionId` string at `+0x38`); don't add a trailing deref for it —
-the `string` type does that itself.
+The chain's last offset lands on the field (Sea of Stars: the character's
+`CharacterDefinitionId` string at `+0x38`); the string type follows the reference
+itself, so don't add a trailing deref.
+
+**Presets** (validated engine layouts — peers, added as we confirm them):
+
+| preset | layout it stands for |
+|---|---|
+| `il2cpp` | reference → object; UTF-16, 32-bit length at `+0x10`, chars at `+0x14` |
+
+**Explicit layout** — the escape hatch for any engine without a preset:
+
+| field | meaning |
+|---|---|
+| `encoding` | `utf8` (1 byte/unit) or `utf16` (2 LE bytes/unit) — required |
+| `len_at` | offset to a 32-bit length prefix; **omit for NUL-terminated** (native/C strings) |
+| `chars_at` | offset to the first code unit; default `0` |
+| `deref` | `true` if the resolved address holds a *pointer* to the object (managed reference types); default `false` (an inline/native buffer) |
+
+```jsonc
+// what "il2cpp" expands to, written by hand
+"type": { "string": { "encoding": "utf16", "len_at": "0x10", "chars_at": "0x14", "deref": true } }
+
+// a native NUL-terminated UTF-8 C string, read in place
+"type": { "string": { "encoding": "utf8" } }
+```
+
+The read length is capped (1 KiB) so a garbage length or a missing terminator
+can't run away; a null reference reads as `""` (honest empty), not `unavailable`.
 
 ## Collections (lists & arrays)
 
@@ -152,7 +177,7 @@ Fields:
 | `first` | byte offset to element 0 within the element region (an array header); default `0` |
 | `stride` | bytes between consecutive elements (a pointer array → `8`) |
 | `element` | per-element chain from a slot to the value; empty means the slot *is* the value's address |
-| `type` | element type (`i32` … or `string`) |
+| `type` | element type (`i32` … or a `string` — see [Strings](#strings)) |
 | `max` | hard cap — a garbage count can neither allocate nor loop unboundedly |
 
 The C# `List<T>` shape (validated against Sea of Stars — `items` at `+0x10`,
@@ -164,7 +189,7 @@ roster as an ordered list of names:
   "base": { "tier": "tier1", "module": "GameAssembly.dll",
             "offsets": ["0x38BB238", 0] },
   "count": ["0x18"], "items": ["0x10"], "first": "0x20", "stride": 8,
-  "element": [], "type": "string", "max": 16 }
+  "element": [], "type": { "string": "il2cpp" }, "max": 16 }
 ```
 
 A bare pointer array (an "enemy HP list" of entity pointers), with the count read

@@ -114,9 +114,9 @@ const ROSTER_NAMES: [&str; 3] = ["VALERE", "ZALE", "GARL"];
 /// The lone character-identity string the scalar-string fixture plants.
 const NAME_VALUE: &str = "ZALE";
 
-/// Byte offset, within an IL2CPP `System.String`, of its 32-bit length. The
-/// engine's `read_string` assumes exactly this layout, so the fixture builds it
-/// to match — proving the constant against a real read, not a mock.
+/// Byte offset, within an IL2CPP `System.String`, of its 32-bit length. This is
+/// what the engine's `il2cpp` string preset expects, so the fixture builds it to
+/// match — proving the preset's layout against a real read, not a mock.
 const STRING_LEN_OFFSET: usize = 0x10;
 /// Byte offset, within an IL2CPP `System.String`, of its UTF-16 payload.
 const STRING_CHARS_OFFSET: usize = 0x14;

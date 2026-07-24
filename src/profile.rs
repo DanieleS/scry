@@ -82,11 +82,25 @@ mod hexnum {
                 .map(Some),
         }
     }
+
+    /// `deserialize_with` for an *optional* single `i64` (e.g. a string's
+    /// `len_at`), accepting the same number-or-hex-string forms.
+    pub fn de_opt_i64<'de, D: Deserializer<'de>>(d: D) -> Result<Option<i64>, D::Error> {
+        match Option::<Repr>::deserialize(d)? {
+            None => Ok(None),
+            Some(r) => one(r).map(Some),
+        }
+    }
 }
 
 /// `skip_serializing_if` helper: a zero offset is the default and stays implicit.
 fn is_zero(n: &i64) -> bool {
     *n == 0
+}
+
+/// `skip_serializing_if` helper: `false` is the default and stays implicit.
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 /// The type of a value read from memory. Each variant maps to one of the typed
@@ -98,14 +112,113 @@ pub enum ValueType {
     U32,
     F32,
     U64,
-    /// An IL2CPP `System.String` reached through a reference: the resolved
-    /// address holds a *pointer* to the string object, whose 32-bit length lives
-    /// at `+0x10` and whose UTF-16 payload starts at `+0x14`. Read length is hard
-    /// capped so a garbage length can't drive an unbounded read. This is the one
-    /// value type with an engine-shaped layout baked in — the layout IL2CPP has
-    /// used for years — because a string is the one field a plain offset can't
-    /// describe (its bytes live behind a pointer, at a length the object states).
-    String,
+    /// A text string. Unlike the numeric types, a string's bytes are not a fixed
+    /// field: its length, encoding, char offset, and whether it lives behind a
+    /// pointer all vary **by engine** (IL2CPP, Mono, native C, Unreal `FString`,
+    /// …). So the layout is *data*, carried in a [`StringSpec`] — a named preset
+    /// or an explicit descriptor — rather than baked into the runtime. No engine
+    /// is the default: `"i32"` stays a bare tag, but a string must name its shape
+    /// (`{"string": "il2cpp"}` or `{"string": { … }}`).
+    String(StringSpec),
+}
+
+impl ValueType {
+    /// The concrete [`StringLayout`] for a [`String`](ValueType::String) type
+    /// (expanding a preset), or `None` for the numeric types.
+    pub fn string_layout(self) -> Option<StringLayout> {
+        match self {
+            ValueType::String(spec) => Some(spec.layout()),
+            _ => None,
+        }
+    }
+}
+
+/// How to read a [string](ValueType::String): a named [preset](StringPreset) for
+/// a known engine's layout, or an explicit [layout](StringLayout). Serialized
+/// untagged, so `"il2cpp"` and `{ "encoding": …, … }` are both accepted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum StringSpec {
+    /// A named engine preset, expanded to a [`StringLayout`] at attach time.
+    Preset(StringPreset),
+    /// An explicit layout — the escape hatch for any engine without a preset.
+    Layout(StringLayout),
+}
+
+impl StringSpec {
+    /// Resolve to the concrete [`StringLayout`] the engine reads with, expanding
+    /// a preset to its known offsets.
+    pub fn layout(self) -> StringLayout {
+        match self {
+            StringSpec::Preset(p) => p.layout(),
+            StringSpec::Layout(l) => l,
+        }
+    }
+}
+
+/// A named string layout for an engine whose shape we've validated. IL2CPP is
+/// the first and (today) only one — a *peer* entry here, not a privileged
+/// default. New engines earn a preset once validated against a real target;
+/// until then they use an explicit [`StringLayout`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum StringPreset {
+    /// IL2CPP `System.String`: a reference to an object holding a 32-bit UTF-16
+    /// code-unit count at `+0x10` and the payload at `+0x14`.
+    Il2cpp,
+}
+
+impl StringPreset {
+    /// The concrete layout this preset stands for.
+    pub fn layout(self) -> StringLayout {
+        match self {
+            StringPreset::Il2cpp => StringLayout {
+                encoding: StringEncoding::Utf16,
+                len_at: Some(0x10),
+                chars_at: 0x14,
+                deref: true,
+            },
+        }
+    }
+}
+
+/// Text encoding of a string's payload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum StringEncoding {
+    /// One byte per code unit; a length prefix (if any) counts bytes.
+    Utf8,
+    /// Two little-endian bytes per code unit; a length prefix counts units.
+    Utf16,
+}
+
+/// An explicit, engine-agnostic string layout. Every axis a string
+/// representation actually varies on — nothing IL2CPP-specific baked in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StringLayout {
+    /// Payload encoding.
+    pub encoding: StringEncoding,
+    /// Byte offset, from the string object, of a 32-bit length prefix. Absent
+    /// means the string is **NUL-terminated** (a native/C string). Present is the
+    /// managed shape (IL2CPP/Mono/.NET store an explicit length).
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "hexnum::de_opt_i64"
+    )]
+    pub len_at: Option<i64>,
+    /// Byte offset, from the string object, of the first code unit.
+    #[serde(
+        default,
+        skip_serializing_if = "is_zero",
+        deserialize_with = "hexnum::de_i64"
+    )]
+    pub chars_at: i64,
+    /// Whether the resolved address holds a *pointer* to the string object that
+    /// must be dereferenced first (managed reference types) rather than being the
+    /// object itself (an inline/native buffer).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub deref: bool,
 }
 
 /// A RIP-relative displacement decode, applied to a Tier-2 anchor *before* its
@@ -539,7 +652,7 @@ mod tests {
             { "tier": "collection", "name": "party_roster",
               "base": { "tier": "tier1", "module": "GameAssembly.dll", "offsets": ["0x38BB238", 0] },
               "count": ["0x18"], "items": ["0x10"], "first": "0x20", "stride": 8,
-              "element": [0], "type": "string", "max": 16, "rate_hz": 4.0 }
+              "element": [0], "type": { "string": "il2cpp" }, "max": 16, "rate_hz": 4.0 }
           ]
         }
         "#;
@@ -557,7 +670,7 @@ mod tests {
                 first: 0x20,
                 stride: 8,
                 element: vec![0],
-                ty: ValueType::String,
+                ty: ValueType::String(StringSpec::Preset(StringPreset::Il2cpp)),
                 max: 16,
                 rate_hz: Some(4.0),
             }
@@ -565,6 +678,67 @@ mod tests {
         // Survives a serialize round-trip unchanged.
         let back = Profile::from_json(&p.to_json().unwrap()).expect("re-parse");
         assert_eq!(p, back, "collection watch changed across a JSON round-trip");
+    }
+
+    #[test]
+    fn string_type_accepts_preset_and_explicit_layout() {
+        // The de-biased `string`: a named preset (IL2CPP is a peer, not a
+        // default) and a fully explicit engine-agnostic layout (here a
+        // NUL-terminated native UTF-8 string — no IL2CPP anywhere).
+        let json = r#"
+        {
+          "match": { "process": "g", "module": "g", "probe": "90" },
+          "watches": [
+            { "tier": "tier1", "name": "hero", "module": "g",
+              "offsets": ["0x38"], "type": { "string": "il2cpp" } },
+            { "tier": "tier1", "name": "tag", "module": "g",
+              "offsets": ["0x8"],
+              "type": { "string": { "encoding": "utf8" } } }
+          ]
+        }
+        "#;
+        let p = Profile::from_json(json).expect("parse");
+        match &p.watches[0] {
+            Watch::Tier1 { ty, .. } => {
+                assert_eq!(
+                    *ty,
+                    ValueType::String(StringSpec::Preset(StringPreset::Il2cpp))
+                );
+                // The preset expands to IL2CPP's concrete offsets.
+                assert_eq!(
+                    ty.string_layout().unwrap(),
+                    StringLayout {
+                        encoding: StringEncoding::Utf16,
+                        len_at: Some(0x10),
+                        chars_at: 0x14,
+                        deref: true,
+                    }
+                );
+            }
+            other => panic!("expected tier1, got {other:?}"),
+        }
+        match &p.watches[1] {
+            Watch::Tier1 { ty, .. } => assert_eq!(
+                *ty,
+                ValueType::String(StringSpec::Layout(StringLayout {
+                    encoding: StringEncoding::Utf8,
+                    len_at: None, // NUL-terminated
+                    chars_at: 0,
+                    deref: false,
+                }))
+            ),
+            other => panic!("expected tier1, got {other:?}"),
+        }
+        // Round-trips (preset stays a preset, layout stays a layout).
+        assert_eq!(Profile::from_json(&p.to_json().unwrap()).unwrap(), p);
+        // A bare "string" is rejected — no engine is the implicit default.
+        let bare = r#"{ "match": { "process": "g", "module": "g", "probe": "90" },
+          "watches": [ { "tier": "tier1", "name": "x", "module": "g",
+                         "offsets": [0], "type": "string" } ] }"#;
+        assert!(
+            Profile::from_json(bare).is_err(),
+            "bare 'string' must not resolve to a default engine"
+        );
     }
 
     #[test]

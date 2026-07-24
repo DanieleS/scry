@@ -52,7 +52,7 @@ use std::time::{Duration, Instant};
 
 use crate::aob;
 use crate::backend::MemoryBackend;
-use crate::profile::{Base, Profile, Rip, ValueType, Watch};
+use crate::profile::{Base, Profile, Rip, StringEncoding, StringLayout, ValueType, Watch};
 
 /// A single sampled value — or the honest absence of one.
 ///
@@ -69,8 +69,8 @@ pub enum Value {
     U32(u32),
     F32(f32),
     U64(u64),
-    /// A decoded string (an IL2CPP `System.String`). A null reference reads as
-    /// the empty string, not `Unavailable`.
+    /// A decoded string (per the watch's [`StringLayout`]). A null reference
+    /// reads as the empty string, not `Unavailable`.
     Str(String),
     /// A [collection](crate::profile::Watch::Collection) sampled into an ordered
     /// array. Each element is itself a `Value`, so a broken element shows up as a
@@ -202,6 +202,10 @@ fn resolve_anchor<B: MemoryBackend + ?Sized>(backend: &B, kind: &AnchorKind) -> 
     }
 }
 
+/// Hard cap on the bytes read for one string — a garbage length or a missing
+/// terminator can't drive an unbounded read. 1 KiB is ample for any name/label.
+const STRING_MAX_BYTES: usize = 1024;
+
 /// Read one typed value at an already-resolved address. Every read failure
 /// becomes `Unavailable`, never a partial or guessed number.
 fn read_typed<B: MemoryBackend + ?Sized>(backend: &B, addr: u64, ty: ValueType) -> Value {
@@ -210,9 +214,110 @@ fn read_typed<B: MemoryBackend + ?Sized>(backend: &B, addr: u64, ty: ValueType) 
         ValueType::U32 => backend.read_u32(addr).map(Value::U32),
         ValueType::F32 => backend.read_f32(addr).map(Value::F32),
         ValueType::U64 => backend.read_u64(addr).map(Value::U64),
-        ValueType::String => backend.read_string(addr).map(Value::Str),
+        ValueType::String(spec) => read_string(backend, addr, spec.layout()).map(Value::Str),
     };
     read.unwrap_or(Value::Unavailable)
+}
+
+/// Decode a string at `addr` per an engine-agnostic [`StringLayout`]. The layout
+/// says everything: whether to dereference a reference first, where the length
+/// (or a NUL terminator) is, the char offset, and the encoding. Nothing about
+/// any one engine is hard-coded here — the profile carries the shape.
+///
+/// A null reference reads as `""` (honest empty, not a failure); a hard read
+/// failure propagates so the watch surfaces `Unavailable` rather than a guess;
+/// invalid code units decode lossily to U+FFFD.
+fn read_string<B: MemoryBackend + ?Sized>(
+    backend: &B,
+    addr: u64,
+    layout: StringLayout,
+) -> crate::Result<String> {
+    let object = if layout.deref {
+        backend.read_ptr(addr)?
+    } else {
+        addr
+    };
+    if object == 0 {
+        return Ok(String::new());
+    }
+    let unit = match layout.encoding {
+        StringEncoding::Utf8 => 1usize,
+        StringEncoding::Utf16 => 2usize,
+    };
+    let start = object.wrapping_add(layout.chars_at as u64);
+
+    let bytes = match layout.len_at {
+        // Length-prefixed (managed): a 32-bit count of code units at `len_at`.
+        Some(off) => {
+            let len = backend.read_i32(object.wrapping_add(off as u64))?;
+            let want = (len.max(0) as usize)
+                .saturating_mul(unit)
+                .min(STRING_MAX_BYTES);
+            if want == 0 {
+                return Ok(String::new());
+            }
+            let mut buf = vec![0u8; want];
+            backend.read_bytes(start, &mut buf)?;
+            buf
+        }
+        // NUL-terminated (native/C): scan bounded blocks for an all-zero unit.
+        None => read_until_nul(backend, start, unit)?,
+    };
+
+    Ok(match layout.encoding {
+        StringEncoding::Utf8 => String::from_utf8_lossy(&bytes).into_owned(),
+        StringEncoding::Utf16 => {
+            let wide: Vec<u16> = bytes
+                .chunks_exact(2)
+                .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                .collect();
+            String::from_utf16_lossy(&wide)
+        }
+    })
+}
+
+/// Read a NUL-terminated payload from `start` in bounded blocks, stopping at the
+/// first all-zero code `unit` or at [`STRING_MAX_BYTES`]. A read failure on the
+/// *first* block propagates (the string is unreadable); a later partial read
+/// ends the scan and returns what was collected — fail-soft, page-boundary safe.
+fn read_until_nul<B: MemoryBackend + ?Sized>(
+    backend: &B,
+    start: u64,
+    unit: usize,
+) -> crate::Result<Vec<u8>> {
+    const BLOCK: usize = 64;
+    let mut out: Vec<u8> = Vec::new();
+    while out.len() < STRING_MAX_BYTES {
+        let take = BLOCK.min(STRING_MAX_BYTES - out.len());
+        let mut buf = vec![0u8; take];
+        if let Err(e) = backend.read_bytes(start + out.len() as u64, &mut buf) {
+            if out.is_empty() {
+                return Err(e);
+            }
+            break;
+        }
+        // Scan for an aligned terminator (a whole code unit of zero bytes).
+        let mut cut = None;
+        let mut i = 0;
+        while i + unit <= buf.len() {
+            if buf[i..i + unit].iter().all(|&b| b == 0) {
+                cut = Some(i);
+                break;
+            }
+            i += unit;
+        }
+        match cut {
+            Some(c) => {
+                out.extend_from_slice(&buf[..c]);
+                break;
+            }
+            None => out.extend_from_slice(&buf),
+        }
+    }
+    // Keep only whole code units.
+    let keep = out.len() - (out.len() % unit);
+    out.truncate(keep);
+    Ok(out)
 }
 
 /// Sample one watch from its cached anchor. A scalar walks its chain and reads
@@ -563,10 +668,15 @@ mod tests {
     use super::*;
     use crate::backend::Region;
     use crate::error::{Error, Result};
-    use crate::profile::Match;
+    use crate::profile::{Match, StringPreset, StringSpec};
     use std::cell::{Cell, RefCell};
     use std::collections::HashMap;
     use std::rc::Rc;
+
+    /// The IL2CPP string type, as a preset — the shape the fixtures plant.
+    fn il2cpp_string() -> ValueType {
+        ValueType::String(StringSpec::Preset(StringPreset::Il2cpp))
+    }
 
     /// A deterministic in-memory backend with interior mutability, so a test can
     /// mutate the "game's" memory between polls, toggle a total read failure, and
@@ -1074,7 +1184,7 @@ mod tests {
                 name: "name".to_string(),
                 module: "fake".to_string(),
                 offsets: vec![0x10], // resolve to the reference slot; read_string derefs
-                ty: ValueType::String,
+                ty: il2cpp_string(),
                 rate_hz: None,
             }],
         };
@@ -1083,6 +1193,39 @@ mod tests {
             s.poll(Duration::ZERO).get("name"),
             Some(&Value::Str("ZALE".to_string())),
             "a string watch must decode the referenced System.String"
+        );
+    }
+
+    #[test]
+    fn reads_a_native_nul_terminated_utf8_string() {
+        // Not IL2CPP: an inline (no deref) NUL-terminated UTF-8 C string — the
+        // de-biased path. Proves the runtime reads a layout from the profile, not
+        // a baked-in engine shape.
+        let fake = Rc::new(Fake::new(0x100));
+        fake.write_bytes(0x20, b"GARL\0extra"); // terminator ends it at "GARL"
+
+        let layout = StringLayout {
+            encoding: StringEncoding::Utf8,
+            len_at: None, // NUL-terminated
+            chars_at: 0,
+            deref: false, // the address is the buffer itself
+        };
+        let profile = Profile {
+            label: None,
+            match_: ident(),
+            watches: vec![Watch::Tier1 {
+                name: "tag".to_string(),
+                module: "fake".to_string(),
+                offsets: vec![0x20], // resolve straight to the buffer
+                ty: ValueType::String(StringSpec::Layout(layout)),
+                rate_hz: None,
+            }],
+        };
+        let mut s = Session::attach(Rc::clone(&fake), &profile, Config::default());
+        assert_eq!(
+            s.poll(Duration::ZERO).get("tag"),
+            Some(&Value::Str("GARL".to_string())),
+            "a NUL-terminated UTF-8 layout must read a native string"
         );
     }
 
@@ -1097,7 +1240,7 @@ mod tests {
                 name: "name".to_string(),
                 module: "fake".to_string(),
                 offsets: vec![0x10],
-                ty: ValueType::String,
+                ty: il2cpp_string(),
                 rate_hz: None,
             }],
         };

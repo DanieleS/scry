@@ -41,7 +41,8 @@ above all in its `probe`.
 ### Two tiers of watch
 
 Both tiers walk a pointer chain and read a typed value (`i32`, `u32`, `f32`,
-`u64`, or a `string` — an IL2CPP `System.String`, decoded and length-capped).
+`u64`, or a `string` — whose engine-agnostic layout is data: a named preset like
+`il2cpp` or an explicit `{ encoding, len_at, chars_at, deref }`, length-capped).
 They differ only in how the *anchor* address is found:
 
 | | Anchor | Survives |

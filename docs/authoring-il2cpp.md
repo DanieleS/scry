@@ -239,13 +239,16 @@ contiguous token present in memory — see the note in step 4.
 - `rip` (Tier-2, optional) is a RIP-relative decode `{ "disp", "len" }` applied to
   the anchor before the chain is walked — the x64 static-base shape. Omit it and
   the AOB hit is the chain start. See [`Rip`](../src/profile.rs).
-- `type` is one of `i32`, `u32`, `f32`, `u64`, `string`.
+- `type` is `i32`, `u32`, `f32`, `u64`, or a `string`. For IL2CPP use the preset
+  `{ "string": "il2cpp" }`; other engines give an explicit layout — see
+  `docs/authoring-profiles.md` → *Strings*.
 - `rate_hz` (optional) is the per-watch sample rate; omit for "every base tick".
 
-A `string` reads an IL2CPP `System.String` referenced at the chain's end (the
-chain lands on the reference field; the engine follows the pointer and decodes
-length `+0x10` / UTF-16 `+0x14`, capped). A **`collection`** iterates a container
-into an ordered array — every chain is name-resolved just like a scalar `chain`:
+A `string` reads text whose layout is data (no engine baked into the runtime).
+For IL2CPP the `il2cpp` preset is the `System.String` shape: a reference at the
+chain's end (the chain lands on the reference field), UTF-16, length `+0x10` /
+chars `+0x14`, capped. A **`collection`** iterates a container into an ordered
+array — every chain is name-resolved just like a scalar `chain`:
 
 ```json
 { "name": "party_roster", "tier": "collection",
@@ -253,7 +256,7 @@ into an ordered array — every chain is name-resolved just like a scalar `chain
   "count": ["List`1::_size"], "items": ["List`1::_items"],
   "first": "0x20", "stride": 8,
   "element": ["CharacterDefinitionId::characterId"],
-  "type": "string", "max": 16 }
+  "type": { "string": "il2cpp" }, "max": 16 }
 ```
 
 - `base` is a nested `{ "tier": …, "chain": […] }` (Tier-1 or Tier-2, same rules
