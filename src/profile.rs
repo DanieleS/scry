@@ -517,6 +517,26 @@ pub struct Profile {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
 
+    /// The **contract**: an opaque version for the *shape* of what this profile
+    /// emits — the set of watch names and their types — as opposed to
+    /// [`Match::version`], which pins the game build the offsets were authored
+    /// against. The two are orthogonal, and deliberately so: offsets move every
+    /// patch, names outlive them. Several profiles, one per build, normally
+    /// share one contract; it changes only when the emitted surface does.
+    ///
+    /// **The engine never reads this.** It exists for whoever renders the
+    /// values, who needs to know which shape to expect and cannot infer it: the
+    /// profile that wins is chosen by the *target's memory* (the probe test),
+    /// not by the caller, so which contract came out is news only the engine can
+    /// report. Carried through untouched, never acted on — reading it would be
+    /// the engine forming an opinion about what a value *means*.
+    #[serde(
+        rename = "contractVersion",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub contract_version: Option<u32>,
+
     /// The identity logic. Renamed because `match` is a Rust keyword.
     #[serde(rename = "match")]
     pub match_: Match,
@@ -599,6 +619,7 @@ mod tests {
     fn sample() -> Profile {
         Profile {
             label: Some("Example Game (Steam)".to_string()),
+            contract_version: None,
             match_: Match {
                 process: "game.exe".to_string(),
                 module: "game.exe".to_string(),
@@ -724,6 +745,41 @@ mod tests {
         assert_eq!(p.label, None);
         // ...and a version-less profile round-trips without inventing the field.
         assert!(!p.to_json().unwrap().contains("version"));
+    }
+
+    #[test]
+    fn contract_version_is_carried_but_never_required() {
+        // Absent is the norm: a profile that says nothing about a contract is a
+        // valid profile, and round-trips without the field appearing.
+        let bare = r#"
+        {
+          "match": { "process": "g.exe", "module": "g.exe", "probe": "90 90" },
+          "watches": []
+        }
+        "#;
+        let p = Profile::from_json(bare).expect("parse");
+        assert_eq!(p.contract_version, None);
+        assert!(!p.to_json().unwrap().contains("contractVersion"));
+
+        // Present, it survives the round trip verbatim under its JSON name. This
+        // is the whole job: the engine has no opinion about the value, it only
+        // has to not lose it between the file and the host reading the stream.
+        let tagged = r#"
+        {
+          "label": "Example (Steam)",
+          "contractVersion": 2,
+          "match": { "process": "g.exe", "module": "g.exe", "version": "1.5.0", "probe": "90 90" },
+          "watches": []
+        }
+        "#;
+        let p = Profile::from_json(tagged).expect("parse");
+        assert_eq!(p.contract_version, Some(2));
+        // Orthogonal to the build discriminant: two profiles for two builds can
+        // — and normally do — carry the same contract.
+        assert_eq!(p.match_.version.as_deref(), Some("1.5.0"));
+        let json = p.to_json().expect("serialize");
+        assert!(json.contains("contractVersion"));
+        assert_eq!(Profile::from_json(&json).expect("re-parse"), p);
     }
 
     #[test]

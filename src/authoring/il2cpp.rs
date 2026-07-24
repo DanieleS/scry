@@ -288,6 +288,13 @@ pub struct ConvertSpec {
     /// Optional human-readable label, copied verbatim into the profile.
     #[serde(default)]
     pub label: Option<String>,
+    /// Optional contract version, copied verbatim into the profile's
+    /// `contractVersion`. This is the field an author bumps when a re-conversion
+    /// changes the *shape* of the output (a watch renamed, retyped, added, or
+    /// dropped) — not when a new game build merely moves the offsets, which is
+    /// the common case and the whole point of keeping the two apart.
+    #[serde(default, rename = "contractVersion")]
+    pub contract_version: Option<u32>,
     /// Executable name for the profile's `match.process`.
     pub process: String,
     /// Module that anchors the values — for IL2CPP, typically
@@ -603,6 +610,7 @@ pub fn convert(spec: &ConvertSpec, symbols: &Symbols) -> Result<Profile, Convert
 
     let profile = Profile {
         label: spec.label.clone(),
+        contract_version: spec.contract_version,
         match_: Match {
             process: spec.process.clone(),
             module: spec.module.clone(),

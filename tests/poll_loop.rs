@@ -29,6 +29,7 @@ const HP_FIELD: i64 = 0;
 fn cavia_profile(exe: &str, player_offset: i64) -> Profile {
     Profile {
         label: Some("cavia".to_string()),
+        contract_version: None,
         match_: Match {
             process: exe.to_string(),
             module: exe.to_string(),

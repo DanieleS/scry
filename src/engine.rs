@@ -990,6 +990,7 @@ mod tests {
         fake.write_i32(0, 100);
         let profile = Profile {
             label: None,
+            contract_version: None,
             match_: ident(),
             watches: vec![tier1("hp", 0, None)],
         };
@@ -1014,6 +1015,7 @@ mod tests {
         let fake = Rc::new(Fake::new(64));
         let profile = Profile {
             label: None,
+            contract_version: None,
             match_: ident(),
             watches: vec![
                 tier1("fast", 0, Some(20.0)), // 50 ms period -> every tick
@@ -1047,6 +1049,7 @@ mod tests {
         fake.write_i32(0, 7);
         let profile = Profile {
             label: None,
+            contract_version: None,
             match_: ident(),
             watches: vec![tier1("hp", 0, None)],
         };
@@ -1090,6 +1093,7 @@ mod tests {
         fake.write_i32(0, 1);
         let profile = Profile {
             label: None,
+            contract_version: None,
             match_: ident(),
             watches: vec![tier1("hp", 0, None)],
         };
@@ -1130,6 +1134,7 @@ mod tests {
         let fake = Rc::new(Fake::new(64));
         let profile = Profile {
             label: None,
+            contract_version: None,
             match_: ident(),
             watches: vec![tier1("slow", 0, Some(1.0))], // 1 s period
         };
@@ -1183,6 +1188,7 @@ mod tests {
 
         let profile = Profile {
             label: None,
+            contract_version: None,
             match_: ident(),
             watches: vec![Watch::Tier2 {
                 name: "hp".to_string(),
@@ -1214,6 +1220,7 @@ mod tests {
 
         let profile = Profile {
             label: None,
+            contract_version: None,
             match_: ident(),
             watches: vec![Watch::Tier2 {
                 name: "marker".to_string(),
@@ -1273,6 +1280,7 @@ mod tests {
         plant_collection(&fake, &[11, 22, 33]);
         let profile = Profile {
             label: None,
+            contract_version: None,
             match_: ident(),
             watches: vec![i32_collection_watch("enemy_hp", 64)],
         };
@@ -1312,6 +1320,7 @@ mod tests {
         plant_collection(&fake, &[11, 22, 33]);
         let profile = Profile {
             label: None,
+            contract_version: None,
             match_: ident(),
             watches: vec![i32_collection_watch("capped", 2)],
         };
@@ -1332,6 +1341,7 @@ mod tests {
         fake.write_u64(0x228, 0xdead_0000);
         let profile = Profile {
             label: None,
+            contract_version: None,
             match_: ident(),
             watches: vec![i32_collection_watch("enemy_hp", 64)],
         };
@@ -1354,6 +1364,7 @@ mod tests {
         let fake = Rc::new(Fake::new(0x10));
         let profile = Profile {
             label: None,
+            contract_version: None,
             match_: ident(),
             watches: vec![i32_collection_watch("enemy_hp", 64)],
         };
@@ -1401,6 +1412,7 @@ mod tests {
 
         let profile = Profile {
             label: None,
+            contract_version: None,
             match_: ident(),
             watches: vec![Watch::Record {
                 name: "player".to_string(),
@@ -1441,6 +1453,7 @@ mod tests {
 
         let profile = Profile {
             label: None,
+            contract_version: None,
             match_: ident(),
             watches: vec![Watch::Collection {
                 name: "party".to_string(),
@@ -1483,6 +1496,7 @@ mod tests {
 
         let profile = Profile {
             label: None,
+            contract_version: None,
             match_: ident(),
             watches: vec![Watch::Record {
                 name: "player".to_string(),
@@ -1512,6 +1526,7 @@ mod tests {
         let fake = Rc::new(Fake::new(0x40));
         let profile = Profile {
             label: None,
+            contract_version: None,
             match_: ident(),
             watches: vec![Watch::Record {
                 name: "player".to_string(),
@@ -1543,6 +1558,7 @@ mod tests {
 
         let profile = Profile {
             label: None,
+            contract_version: None,
             match_: ident(),
             watches: vec![Watch::Tier1 {
                 name: "name".to_string(),
@@ -1576,6 +1592,7 @@ mod tests {
         };
         let profile = Profile {
             label: None,
+            contract_version: None,
             match_: ident(),
             watches: vec![Watch::Tier1 {
                 name: "tag".to_string(),
@@ -1599,6 +1616,7 @@ mod tests {
         // Slot at 0x10 holds a null reference (zeroed memory).
         let profile = Profile {
             label: None,
+            contract_version: None,
             match_: ident(),
             watches: vec![Watch::Tier1 {
                 name: "name".to_string(),
@@ -1621,6 +1639,7 @@ mod tests {
         let fake = Rc::new(Fake::new(64));
         let profile = Profile {
             label: None,
+            contract_version: None,
             match_: ident(),
             watches: vec![Watch::Tier2 {
                 name: "bad".to_string(),

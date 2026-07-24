@@ -99,6 +99,7 @@ fn tier2_rip_relative_watch_reads_hp_end_to_end() {
     // of time — the engine recovers the static base purely from the instruction.
     let profile = Profile {
         label: Some("cavia (rip)".to_string()),
+        contract_version: None,
         match_: Match {
             process: ready.exe.clone(),
             module: ready.exe.clone(),
