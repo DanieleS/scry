@@ -14,6 +14,8 @@
 //! collisions self-resolving: a profile has to fit the memory, not merely share
 //! an executable name.
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
@@ -309,9 +311,39 @@ pub enum Base {
     },
 }
 
+/// One named field of a [record](Watch::Record) — the same shape a
+/// [record-valued collection element](Watch::Collection::fields) uses.
+///
+/// A field is resolved exactly like a scalar [`Watch`], but *relative to the
+/// record's shared base*: walk [`offsets`](Field::offsets) from that base and
+/// read one [`ty`](Field::ty) value. Reading every field of a record off the
+/// **same base in the same tick** is what makes the record a coherent, atomic
+/// sample — the one property a consumer zipping parallel collections by index
+/// cannot reconstruct once the roster mutates between staggered samples.
+///
+/// It is also the natural place to factor a shared pointer prefix (a "dissect
+/// structure" in Cheat-Engine terms): the base is resolved once and each field
+/// is a short chain relative to it, rather than every field re-walking the whole
+/// path from the anchor.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Field {
+    /// Pointer chain from the record's resolved base to this field's address.
+    /// Empty means the base address itself holds the value.
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "hexnum::de_vec_i64"
+    )]
+    pub offsets: Vec<i64>,
+    /// How to interpret the bytes at the resolved address.
+    #[serde(rename = "type")]
+    pub ty: ValueType,
+}
+
 /// One value the engine reads. The two scalar tiers differ only in how the
 /// *anchor* address is found; both then walk `offsets` and read a typed value. A
-/// [`Collection`](Watch::Collection) instead iterates a container into an array.
+/// [`Collection`](Watch::Collection) instead iterates a container into an array,
+/// and a [`Record`](Watch::Record) reads named fields off a shared base.
 ///
 /// `Eq` is intentionally *not* derived: `rate_hz` is a float, and the polling
 /// loop only ever needs `PartialEq` (for the schedule) — never total equality.
@@ -409,20 +441,65 @@ pub enum Watch {
         /// Bytes between consecutive elements (a pointer array → 8).
         #[serde(deserialize_with = "hexnum::de_i64")]
         stride: i64,
-        /// Per-element chain from an element slot to the value's address. Empty
-        /// means the slot *is* the value's address.
+        /// Per-element chain from an element slot to the element's address. Empty
+        /// means the slot *is* the element's address. For a scalar element that
+        /// address is read as [`ty`](Watch::Collection::ty); for a record element
+        /// it is the base its [`fields`](Watch::Collection::fields) are relative
+        /// to.
         #[serde(
             default,
             skip_serializing_if = "Vec::is_empty",
             deserialize_with = "hexnum::de_vec_i64"
         )]
         element: Vec<i64>,
-        /// How to interpret each element's bytes.
-        #[serde(rename = "type")]
-        ty: ValueType,
+        /// How to interpret each element's bytes, when the element is a **scalar**
+        /// (a homogeneous array of one type). Mutually exclusive with
+        /// [`fields`](Watch::Collection::fields): an element is either one typed
+        /// value or a record, never both. Exactly one must be set — enforced when
+        /// the profile is parsed (see [`Profile::from_json`]).
+        #[serde(rename = "type", default, skip_serializing_if = "Option::is_none")]
+        ty: Option<ValueType>,
+        /// When set, each element is a **record**: instead of one typed value,
+        /// read these named fields relative to the element's resolved address (the
+        /// same shape as [`Watch::Record`]). Mutually exclusive with
+        /// [`ty`](Watch::Collection::ty). This is the `party = [{name, hp, mp}, …]`
+        /// form; the join between fields is guaranteed coherent because they are
+        /// read off the same element base in the same tick.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        fields: Option<BTreeMap<String, Field>>,
         /// Hard cap on the element count — a garbage count can neither allocate
         /// nor loop unboundedly.
         max: usize,
+        /// Per-watch sample rate in hertz; see [`Watch::Tier1::rate_hz`].
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rate_hz: Option<f64>,
+    },
+    /// A **record**: resolve a single base, then read a handful of *named fields*
+    /// relative to it, emitting a [`Value::Map`](crate::engine::Value::Map). The
+    /// general one-level-of-structure primitive — `player = { hp, sp }` — and the
+    /// same [`fields`](Watch::Record::fields) shape a
+    /// [`Collection`](Watch::Collection) uses to make each element a record.
+    ///
+    /// The engine assigns no meaning to a field's name: a record is just "read
+    /// these offsets off this base and keep them together", structurally
+    /// identical to the top-level `label → Value` snapshot, nested once. Because
+    /// every field is read off the same base in the same tick, the record is a
+    /// coherent atomic sample; a broken field is
+    /// [`Unavailable`](crate::engine::Value::Unavailable) in place without sinking
+    /// the record, while a base that no longer resolves makes the whole record
+    /// unavailable.
+    Record {
+        /// Label for the value; the emitted snapshot value is a map of field name
+        /// to value.
+        name: String,
+        /// How to reach the record's base — the shared slot the fields are
+        /// relative to. Anchored exactly like a scalar watch or a collection. See
+        /// [`Base`].
+        base: Base,
+        /// The named fields, each resolved relative to `base`. Serialized as a
+        /// JSON object; keys are emitted in sorted order for stable, testable
+        /// output.
+        fields: BTreeMap<String, Field>,
         /// Per-watch sample rate in hertz; see [`Watch::Tier1::rate_hz`].
         #[serde(default, skip_serializing_if = "Option::is_none")]
         rate_hz: Option<f64>,
@@ -452,8 +529,61 @@ impl Profile {
     /// Parse a profile from its JSON document. Parse failures surface as
     /// [`Error::BadProfile`] rather than a panic — a malformed community profile
     /// is an expected condition, not a bug.
+    ///
+    /// After a successful deserialize the profile is [validated](Profile::validate)
+    /// for cross-field rules serde can't express on its own (a collection element
+    /// is a scalar *or* a record, not both; a record has at least one field).
     pub fn from_json(s: &str) -> Result<Self> {
-        serde_json::from_str(s).map_err(|e| Error::BadProfile(e.to_string()))
+        let profile: Profile =
+            serde_json::from_str(s).map_err(|e| Error::BadProfile(e.to_string()))?;
+        profile.validate()?;
+        Ok(profile)
+    }
+
+    /// Check cross-field invariants that the serde shape leaves open. Kept as a
+    /// runtime pass (rather than a stricter serde encoding) so the JSON stays
+    /// flat and readable and the error message can name the offending watch.
+    ///
+    /// - A [`Collection`](Watch::Collection) must set **exactly one** of `type`
+    ///   (scalar element) or `fields` (record element) — never both, never
+    ///   neither.
+    /// - A [`Record`](Watch::Record) — and a record-valued collection — must
+    ///   carry at least one field; an empty record reads nothing.
+    pub fn validate(&self) -> Result<()> {
+        for w in &self.watches {
+            match w {
+                Watch::Collection {
+                    name, ty, fields, ..
+                } => match (ty, fields) {
+                    (Some(_), Some(_)) => {
+                        return Err(Error::BadProfile(format!(
+                            "collection {name:?}: has both `type` and `fields`; an element is \
+                             either a scalar (`type`) or a record (`fields`), not both"
+                        )));
+                    }
+                    (None, None) => {
+                        return Err(Error::BadProfile(format!(
+                            "collection {name:?}: needs either a `type` (scalar element) or \
+                             `fields` (record element)"
+                        )));
+                    }
+                    (None, Some(fields)) if fields.is_empty() => {
+                        return Err(Error::BadProfile(format!(
+                            "collection {name:?}: `fields` is empty; a record element needs at \
+                             least one field"
+                        )));
+                    }
+                    _ => {}
+                },
+                Watch::Record { name, fields, .. } if fields.is_empty() => {
+                    return Err(Error::BadProfile(format!(
+                        "record {name:?}: needs at least one field"
+                    )));
+                }
+                _ => {}
+            }
+        }
+        Ok(())
     }
 
     /// Serialize this profile to a pretty-printed JSON document.
@@ -670,7 +800,8 @@ mod tests {
                 first: 0x20,
                 stride: 8,
                 element: vec![0],
-                ty: ValueType::String(StringSpec::Preset(StringPreset::Il2cpp)),
+                ty: Some(ValueType::String(StringSpec::Preset(StringPreset::Il2cpp))),
+                fields: None,
                 max: 16,
                 rate_hz: Some(4.0),
             }
@@ -790,5 +921,156 @@ mod tests {
         // Missing the required `probe` field.
         let missing_probe = r#"{ "match": { "process": "g", "module": "g" }, "watches": [] }"#;
         assert!(Profile::from_json(missing_probe).is_err());
+    }
+
+    #[test]
+    fn record_watch_deserializes_and_round_trips() {
+        // A top-level record: a Tier-1 base into a struct, then named fields read
+        // relative to it — `player = { hp, sp }`. The exact hand-written shape.
+        let json = r#"
+        {
+          "match": { "process": "g.exe", "module": "GameAssembly.dll", "probe": "90 90" },
+          "watches": [
+            { "tier": "record", "name": "player",
+              "base": { "tier": "tier1", "module": "GameAssembly.dll", "offsets": ["0x2C4E120", 0] },
+              "fields": {
+                "hp": { "offsets": ["0x18"], "type": "i32" },
+                "sp": { "offsets": ["0x1c"], "type": "i32" },
+                "name": { "offsets": ["0x38"], "type": { "string": "il2cpp" } }
+              },
+              "rate_hz": 8.0 }
+          ]
+        }
+        "#;
+        let p = Profile::from_json(json).expect("parse");
+        let mut fields = BTreeMap::new();
+        fields.insert(
+            "hp".to_string(),
+            Field {
+                offsets: vec![0x18],
+                ty: ValueType::I32,
+            },
+        );
+        fields.insert(
+            "sp".to_string(),
+            Field {
+                offsets: vec![0x1c],
+                ty: ValueType::I32,
+            },
+        );
+        fields.insert(
+            "name".to_string(),
+            Field {
+                offsets: vec![0x38],
+                ty: ValueType::String(StringSpec::Preset(StringPreset::Il2cpp)),
+            },
+        );
+        assert_eq!(
+            p.watches[0],
+            Watch::Record {
+                name: "player".to_string(),
+                base: Base::Tier1 {
+                    module: "GameAssembly.dll".to_string(),
+                    offsets: vec![0x2C4E120, 0],
+                },
+                fields,
+                rate_hz: Some(8.0),
+            }
+        );
+        // Survives a serialize round-trip unchanged.
+        let back = Profile::from_json(&p.to_json().unwrap()).expect("re-parse");
+        assert_eq!(p, back, "record watch changed across a JSON round-trip");
+    }
+
+    #[test]
+    fn collection_of_records_deserializes_and_round_trips() {
+        // `party = [{name, hp, mp}, …]`: the record form of a collection element.
+        // `element` factors the shared deref (slot → member object); each field
+        // is a short chain relative to that base.
+        let json = r#"
+        {
+          "match": { "process": "g.exe", "module": "GameAssembly.dll", "probe": "90 90" },
+          "watches": [
+            { "tier": "collection", "name": "party",
+              "base": { "tier": "tier1", "module": "GameAssembly.dll", "offsets": ["0x38BB238", 0] },
+              "count": ["0x18"], "items": ["0x10"], "first": "0x20", "stride": 8,
+              "element": [0, 0],
+              "fields": {
+                "name": { "offsets": ["0x38"], "type": { "string": "il2cpp" } },
+                "hp": { "offsets": ["0x18"], "type": "i32" },
+                "mp": { "offsets": ["0x1c"], "type": "i32" }
+              },
+              "max": 8 }
+          ]
+        }
+        "#;
+        let p = Profile::from_json(json).expect("parse");
+        match &p.watches[0] {
+            Watch::Collection { ty, fields, .. } => {
+                assert_eq!(*ty, None, "a record collection carries no scalar type");
+                let fields = fields.as_ref().expect("record fields");
+                assert_eq!(fields.len(), 3);
+                assert_eq!(fields["hp"].offsets, vec![0x18]);
+                assert_eq!(fields["hp"].ty, ValueType::I32);
+            }
+            other => panic!("expected a collection, got {other:?}"),
+        }
+        // Round-trips unchanged.
+        assert_eq!(Profile::from_json(&p.to_json().unwrap()).unwrap(), p);
+    }
+
+    #[test]
+    fn collection_rejects_both_type_and_fields() {
+        // The scalar-XOR-record rule: an element can't be both a typed value and
+        // a record. Caught by validation with the watch named.
+        let json = r#"
+        {
+          "match": { "process": "g", "module": "g", "probe": "90" },
+          "watches": [
+            { "tier": "collection", "name": "party",
+              "base": { "tier": "tier1", "module": "g", "offsets": [0] },
+              "count": [0], "stride": 8, "element": [0],
+              "type": "i32",
+              "fields": { "hp": { "offsets": [0], "type": "i32" } },
+              "max": 8 }
+          ]
+        }
+        "#;
+        let err = Profile::from_json(json).unwrap_err().to_string();
+        assert!(err.contains("party"), "error should name the watch: {err}");
+        assert!(
+            err.contains("both"),
+            "error should explain the conflict: {err}"
+        );
+    }
+
+    #[test]
+    fn collection_rejects_neither_type_nor_fields() {
+        let json = r#"
+        {
+          "match": { "process": "g", "module": "g", "probe": "90" },
+          "watches": [
+            { "tier": "collection", "name": "mystery",
+              "base": { "tier": "tier1", "module": "g", "offsets": [0] },
+              "count": [0], "stride": 8, "element": [0], "max": 8 }
+          ]
+        }
+        "#;
+        assert!(Profile::from_json(json).is_err());
+    }
+
+    #[test]
+    fn record_rejects_empty_fields() {
+        let json = r#"
+        {
+          "match": { "process": "g", "module": "g", "probe": "90" },
+          "watches": [
+            { "tier": "record", "name": "empty",
+              "base": { "tier": "tier1", "module": "g", "offsets": [0] },
+              "fields": {} }
+          ]
+        }
+        "#;
+        assert!(Profile::from_json(json).is_err());
     }
 }

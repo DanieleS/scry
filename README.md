@@ -81,6 +81,50 @@ and with `type: string` a single watch yields an ordered party roster like
 required `max` — and a broken element is `unavailable` in place without sinking
 the list. See [`docs/authoring-profiles.md`](docs/authoring-profiles.md).
 
+### Records — one shallow level of structure
+
+Sometimes a value is naturally a handful of **named fields**, not a scalar:
+`player = { hp, sp }`. A `record` watch resolves a single `base`, then reads each
+field as a short chain **relative to that base**, emitting a map:
+
+```json
+{ "tier": "record", "name": "player",
+  "base": { "tier": "tier1", "module": "GameAssembly.dll", "offsets": ["0x2C4E120", 0] },
+  "fields": {
+    "hp":   { "offsets": ["0x18"], "type": "i32" },
+    "sp":   { "offsets": ["0x1c"], "type": "i32" },
+    "name": { "offsets": ["0x38"], "type": { "string": "il2cpp" } }
+  } }
+```
+
+The same `fields` shape lets a **collection element** be a record instead of a
+scalar — `party = [ {name, hp, mp}, … ]` — by giving the collection `fields`
+where it would otherwise give `type`:
+
+```json
+{ "tier": "collection", "name": "party",
+  "base": { … }, "count": ["0x18"], "items": ["0x10"], "first": "0x20", "stride": 8,
+  "element": [0, 0],
+  "fields": {
+    "name": { "offsets": ["0x38"], "type": { "string": "il2cpp" } },
+    "hp":   { "offsets": ["0x18"], "type": "i32" },
+    "mp":   { "offsets": ["0x1c"], "type": "i32" }
+  }, "max": 8 }
+```
+
+This buys two things a consumer can't get from parallel scalar collections zipped
+by index. **Coherence:** every field is read off the same element base *in the
+same tick*, so a roster that mutates between staggered samples can never render
+one member's HP under another's name. **Factoring:** the base (and any shared
+deref, like `element: [0, 0]` reaching the member object) is resolved once and
+each field is a short relative chain — the "dissect structure" idea from Cheat
+Engine, expressed as data. A field is `type` **xor** `fields`, never both; a
+broken field is `unavailable` in place while the record still forms.
+
+Structure stops here — **exactly one level deep**. Deeper trees (member →
+inventory → items → …) stay the consumer's job to compose; recursion is where the
+engine would start modelling game entities, which it deliberately doesn't.
+
 ### The resolver — the anti-collision core
 
 Two games built on the same engine can share an executable name and a broad

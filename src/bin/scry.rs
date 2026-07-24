@@ -302,6 +302,15 @@ OPTIONS:
                 let parts: Vec<String> = items.iter().map(fmt_value).collect();
                 format!("[{}]", parts.join(", "))
             }
+            // Render a record as `{key: value, …}` — each field the same way, so a
+            // record nested in a list (a party roster) reads naturally.
+            Value::Map(fields) => {
+                let parts: Vec<String> = fields
+                    .iter()
+                    .map(|(k, v)| format!("{k}: {}", fmt_value(v)))
+                    .collect();
+                format!("{{{}}}", parts.join(", "))
+            }
             Value::Unavailable => "unavailable".to_string(),
         }
     }

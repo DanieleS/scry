@@ -411,18 +411,53 @@ pub enum WatchSpec {
         first: Option<ChainEntry>,
         /// Bytes between consecutive elements (a pointer array → `8`).
         stride: ChainEntry,
-        /// Per-element chain from a slot to the value's address.
+        /// Per-element chain from a slot to the element's address.
         #[serde(default)]
         element: Vec<ChainEntry>,
-        /// How to interpret each element's bytes.
-        #[serde(rename = "type")]
-        ty: ValueType,
+        /// How to interpret each element's bytes, for a **scalar** element.
+        /// Mutually exclusive with [`fields`](WatchSpec::Collection::fields).
+        #[serde(rename = "type", default)]
+        ty: Option<ValueType>,
+        /// Record fields, when each element is a **record** (`[{name, hp}, …]`).
+        /// Mutually exclusive with [`ty`](WatchSpec::Collection::ty); each field's
+        /// chain carries `Class::field` references like every other chain.
+        #[serde(default)]
+        fields: Option<BTreeMap<String, FieldSpec>>,
         /// Hard cap on the element count.
         max: usize,
         /// Optional per-watch sample rate in hertz.
         #[serde(default)]
         rate_hz: Option<f64>,
     },
+    /// A record: resolve a base, then read named fields relative to it. Mirrors
+    /// [`Watch::Record`]; each field's chain carries `Class::field` references so
+    /// the fragile numbers are derived from the dump.
+    Record {
+        /// Label for the value.
+        name: String,
+        /// How to anchor the record's base. See [`BaseSpec`].
+        base: BaseSpec,
+        /// The named fields, each resolved relative to the base.
+        fields: BTreeMap<String, FieldSpec>,
+        /// Optional per-watch sample rate in hertz.
+        #[serde(default)]
+        rate_hz: Option<f64>,
+    },
+}
+
+/// One named field of a [record](WatchSpec::Record) in the author map — a chain
+/// (name references or literals) plus a value type. Mirrors
+/// [`crate::profile::Field`], with `chain` entries the converter resolves against
+/// the dump.
+#[derive(Debug, Deserialize)]
+pub struct FieldSpec {
+    /// Chain from the record's base to this field's address; see [`ChainEntry`].
+    /// Empty means the base address itself holds the value.
+    #[serde(default)]
+    pub chain: Vec<ChainEntry>,
+    /// How to interpret the bytes at the resolved address.
+    #[serde(rename = "type")]
+    pub ty: ValueType,
 }
 
 /// How a [collection](WatchSpec::Collection)'s container is anchored in the
@@ -511,6 +546,10 @@ pub enum ConvertError {
     },
     /// The derived (or raw) probe is not a valid AOB signature.
     BadProbe(String),
+    /// The emitted profile violates a cross-field rule (e.g. a collection with
+    /// both a scalar `type` and record `fields`). Caught at authoring time rather
+    /// than shipped and discovered against a live game.
+    InvalidProfile(String),
 }
 
 impl fmt::Display for ConvertError {
@@ -538,6 +577,7 @@ impl fmt::Display for ConvertError {
                 write!(f, "watch {watch:?}: bad anchor signature: {reason}")
             }
             ConvertError::BadProbe(reason) => write!(f, "bad probe signature: {reason}"),
+            ConvertError::InvalidProfile(reason) => write!(f, "invalid profile: {reason}"),
         }
     }
 }
@@ -561,7 +601,7 @@ pub fn convert(spec: &ConvertSpec, symbols: &Symbols) -> Result<Profile, Convert
         watches.push(build_watch(w, symbols, &spec.module)?);
     }
 
-    Ok(Profile {
+    let profile = Profile {
         label: spec.label.clone(),
         match_: Match {
             process: spec.process.clone(),
@@ -570,7 +610,13 @@ pub fn convert(spec: &ConvertSpec, symbols: &Symbols) -> Result<Profile, Convert
             probe,
         },
         watches,
-    })
+    };
+    // Enforce the same cross-field rules the runtime parser does, so a malformed
+    // collection (both/neither of `type`/`fields`) fails here, not against a game.
+    profile
+        .validate()
+        .map_err(|e| ConvertError::InvalidProfile(e.to_string()))?;
+    Ok(profile)
 }
 
 /// Parse a `dump.cs` and an author-map JSON in one call.
@@ -629,6 +675,7 @@ fn build_watch(
             stride,
             element,
             ty,
+            fields,
             max,
             rate_hz,
         } => {
@@ -640,6 +687,10 @@ fn build_watch(
                 Some(entry) => resolve_entry(name, entry, symbols)?,
                 None => 0,
             };
+            let fields = match fields {
+                Some(fields) => Some(resolve_fields(name, fields, symbols)?),
+                None => None,
+            };
             Ok(Watch::Collection {
                 name: name.clone(),
                 base: build_base(name, base, symbols, default_module)?,
@@ -649,11 +700,43 @@ fn build_watch(
                 stride: resolve_entry(name, stride, symbols)?,
                 element: resolve_chain(name, element, symbols)?,
                 ty: *ty,
+                fields,
                 max: *max,
                 rate_hz: *rate_hz,
             })
         }
+        WatchSpec::Record {
+            name,
+            base,
+            fields,
+            rate_hz,
+        } => Ok(Watch::Record {
+            name: name.clone(),
+            base: build_base(name, base, symbols, default_module)?,
+            fields: resolve_fields(name, fields, symbols)?,
+            rate_hz: *rate_hz,
+        }),
     }
+}
+
+/// Resolve an author-map [`FieldSpec`] map into runtime [`crate::profile::Field`]s,
+/// each field's chain resolved against the dump exactly like any other chain.
+fn resolve_fields(
+    watch: &str,
+    fields: &BTreeMap<String, FieldSpec>,
+    symbols: &Symbols,
+) -> Result<BTreeMap<String, crate::profile::Field>, ConvertError> {
+    let mut out = BTreeMap::new();
+    for (name, spec) in fields {
+        out.insert(
+            name.clone(),
+            crate::profile::Field {
+                offsets: resolve_chain(watch, &spec.chain, symbols)?,
+                ty: spec.ty,
+            },
+        );
+    }
+    Ok(out)
 }
 
 /// Resolve a collection's [`BaseSpec`] into a runtime [`Base`], validating a
@@ -1102,10 +1185,12 @@ public class PartyMember
                 stride,
                 element,
                 ty,
+                fields,
                 max,
                 rate_hz,
             } => {
                 assert_eq!(name, "party_hp");
+                assert_eq!(*fields, None, "a scalar collection carries no fields");
                 assert_eq!(
                     *base,
                     Base::Tier1 {
@@ -1118,7 +1203,7 @@ public class PartyMember
                 assert_eq!(*first, 0x20);
                 assert_eq!(*stride, 8);
                 assert_eq!(element, &vec![0x18]); // resolved `currentHp`
-                assert_eq!(*ty, ValueType::I32);
+                assert_eq!(*ty, Some(ValueType::I32));
                 assert_eq!(*max, 16);
                 assert_eq!(*rate_hz, Some(8.0));
             }
@@ -1175,6 +1260,106 @@ public class PartyMember
         assert!(matches!(
             convert_files(DUMP, map),
             Err(ConvertError::BadAnchor { .. })
+        ));
+    }
+
+    #[test]
+    fn converts_a_record_watch_resolving_field_names() {
+        // A top-level record: a Tier-1 base into a struct, then named fields whose
+        // brittle offsets come from the dump. `player = { hp, gold }`.
+        let map = r#"{
+          "process": "g.exe", "module": "GameAssembly.dll",
+          "probe": "90 90",
+          "watches": [
+            { "name": "player", "tier": "record",
+              "base": { "tier": "tier1", "chain": ["0x2C4E120", "GameManager::leader"] },
+              "fields": {
+                "hp": { "chain": ["Combat.PartyMember::currentHp"], "type": "i32" },
+                "gold": { "chain": ["GameManager::gold"], "type": "u32" }
+              },
+              "rate_hz": 8.0 }
+          ]
+        }"#;
+        let profile = convert_files(DUMP, map).expect("convert");
+        match &profile.watches[0] {
+            Watch::Record {
+                name,
+                base,
+                fields,
+                rate_hz,
+            } => {
+                assert_eq!(name, "player");
+                assert_eq!(
+                    *base,
+                    Base::Tier1 {
+                        module: "GameAssembly.dll".to_string(),
+                        offsets: vec![0x2C4E120, 0x28], // literal + resolved `leader`
+                    }
+                );
+                assert_eq!(fields["hp"].offsets, vec![0x18]); // resolved `currentHp`
+                assert_eq!(fields["hp"].ty, ValueType::I32);
+                assert_eq!(fields["gold"].offsets, vec![0x20]); // resolved `gold`
+                assert_eq!(fields["gold"].ty, ValueType::U32);
+                assert_eq!(*rate_hz, Some(8.0));
+            }
+            other => panic!("expected a Record, got {other:?}"),
+        }
+        // What it emits must load back into the runtime unchanged.
+        let json = profile.to_json().expect("serialize");
+        assert_eq!(Profile::from_json(&json).expect("re-parse"), profile);
+    }
+
+    #[test]
+    fn converts_a_collection_of_records() {
+        // `party = [{name, hp, mp}, …]`: an element type of record, its fields
+        // resolved from the dump, the shared deref factored into `element`.
+        let map = r#"{
+          "process": "SeaOfStars.exe", "module": "GameAssembly.dll",
+          "probe": "90 90",
+          "watches": [
+            { "name": "party", "tier": "collection",
+              "base": { "tier": "tier1", "chain": ["0x38BB238", "GameManager::leader"] },
+              "count": ["0x18"], "items": ["0x10"], "first": "0x20", "stride": "0x8",
+              "element": [0, 0],
+              "fields": {
+                "hp": { "chain": ["Combat.PartyMember::currentHp"], "type": "i32" },
+                "mp": { "chain": ["Combat.PartyMember::maxHp"], "type": "i32" }
+              },
+              "max": 8 }
+          ]
+        }"#;
+        let profile = convert_files(DUMP, map).expect("convert");
+        match &profile.watches[0] {
+            Watch::Collection { ty, fields, .. } => {
+                assert_eq!(*ty, None, "a record collection carries no scalar type");
+                let fields = fields.as_ref().expect("record fields");
+                assert_eq!(fields["hp"].offsets, vec![0x18]);
+                assert_eq!(fields["mp"].offsets, vec![0x1C]);
+            }
+            other => panic!("expected a Collection, got {other:?}"),
+        }
+        let json = profile.to_json().expect("serialize");
+        assert_eq!(Profile::from_json(&json).expect("re-parse"), profile);
+    }
+
+    #[test]
+    fn a_collection_with_both_type_and_fields_is_rejected() {
+        // The scalar-XOR-record rule, enforced at conversion time.
+        let map = r#"{
+          "process": "g.exe", "module": "GameAssembly.dll",
+          "probe": "90 90",
+          "watches": [
+            { "name": "party", "tier": "collection",
+              "base": { "tier": "tier1", "chain": [0] },
+              "count": [0], "stride": 8, "element": [0],
+              "type": "i32",
+              "fields": { "hp": { "chain": [0], "type": "i32" } },
+              "max": 8 }
+          ]
+        }"#;
+        assert!(matches!(
+            convert_files(DUMP, map),
+            Err(ConvertError::InvalidProfile(_))
         ));
     }
 
