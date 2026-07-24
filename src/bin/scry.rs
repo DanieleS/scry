@@ -76,11 +76,28 @@ PROFILES (at least one source):
     and let the memory decide. If none fits, nothing is read (the fail-safe).
 
 OPTIONS:
+    --format <fmt>      `human` (default) for a readable stream, or `json` for
+                        JSON Lines — one self-describing event object per line,
+                        for a host program that consumes this as a subprocess.
     --once              Print one snapshot of all values, then exit.
     --for <secs>        Stop after this many seconds (default: run until killed).
     --tick <ms>         Base polling cadence in milliseconds (default: 50).
     --no-resolve        Skip the probe test and attach the single given profile
                         directly (only valid with exactly one profile).
+
+JSON OUTPUT:
+    Every line of stdout is one JSON object with an `event` field; diagnostics
+    stay on stderr, so stdout is safe to parse whole. A reader must ignore event
+    types it does not know — that is how this grows without breaking hosts.
+
+        {\"event\":\"attached\",\"pid\":1234,\"process\":\"game.exe\", ... }
+        {\"event\":\"values\",\"t_ms\":123,\"values\":{\"hp\":42}}
+        {\"event\":\"detached\",\"t_ms\":9000}
+
+    `values` carries only what *changed* this tick (the first one carries
+    everything readable). Readings are untagged — a number is a number, a list an
+    array, a record an object, and an unreadable watch is `null`; the consumer
+    already knows each watch's type from the profile.
 ";
 
     pub fn main() -> i32 {
@@ -115,6 +132,17 @@ OPTIONS:
 
     // ---- watch: the headline command ------------------------------------------
 
+    /// How the value stream is rendered on stdout.
+    ///
+    /// The distinction is who is reading: a person at a terminal, or a host
+    /// program driving `scry` as a subprocess. The second one is a contract —
+    /// see the JSON OUTPUT section of [`WATCH_USAGE`].
+    #[derive(Clone, Copy, PartialEq)]
+    enum Format {
+        Human,
+        Json,
+    }
+
     fn watch(args: &[String]) -> i32 {
         let mut process: Option<String> = None;
         let mut pid: Option<u32> = None;
@@ -124,6 +152,7 @@ OPTIONS:
         let mut for_secs: Option<f64> = None;
         let mut tick_ms: u64 = 50;
         let mut no_resolve = false;
+        let mut format = Format::Human;
 
         let mut it = args.iter();
         while let Some(a) = it.next() {
@@ -143,6 +172,17 @@ OPTIONS:
                 "--tick" => match it.next().and_then(|s| s.parse().ok()) {
                     Some(n) => tick_ms = n,
                     None => return usage_err(WATCH_USAGE, "--tick needs a millisecond count"),
+                },
+                "--format" => match it.next().map(String::as_str) {
+                    Some("human") => format = Format::Human,
+                    Some("json") => format = Format::Json,
+                    Some(other) => {
+                        return usage_err(
+                            WATCH_USAGE,
+                            &format!("unknown --format '{other}' (expected `human` or `json`)"),
+                        )
+                    }
+                    None => return usage_err(WATCH_USAGE, "--format needs `human` or `json`"),
                 },
                 "--no-resolve" => no_resolve = true,
                 "-h" | "--help" => {
@@ -244,12 +284,27 @@ OPTIONS:
         };
 
         let label = chosen.label.as_deref().unwrap_or("(unlabeled profile)");
+        let pointer_bits = backend.pointer_size() * 8;
         eprintln!("scry: attached to {name} (pid {pid}) with {label}");
         eprintln!(
-            "scry: {} watch(es); {}-bit target\n",
+            "scry: {} watch(es); {pointer_bits}-bit target\n",
             chosen.watches.len(),
-            backend.pointer_size() * 8
         );
+
+        // The identity of what we attached to, announced once. A host needs this
+        // to confirm it is reading the game it meant to — the profile is chosen
+        // by the target's *memory*, not by the caller, so which one won is news.
+        if format == Format::Json {
+            emit(&serde_json::json!({
+                "event": "attached",
+                "scry": env!("CARGO_PKG_VERSION"),
+                "pid": pid,
+                "process": name,
+                "profile": label,
+                "watches": chosen.watches.len(),
+                "pointer_bits": pointer_bits,
+            }));
+        }
 
         let config = Config {
             base_tick: Duration::from_millis(tick_ms.max(1)),
@@ -260,8 +315,9 @@ OPTIONS:
         let start = Instant::now();
 
         // First poll always reports every value it can read — the initial picture.
-        print_diff(session.poll(Duration::ZERO), start.elapsed());
+        print_diff(session.poll(Duration::ZERO), start.elapsed(), format);
         if once {
+            print_detached(start.elapsed(), format);
             return 0;
         }
 
@@ -269,23 +325,61 @@ OPTIONS:
         loop {
             if let Some(d) = deadline {
                 if Instant::now() >= d {
+                    print_detached(start.elapsed(), format);
                     return 0;
                 }
             }
             std::thread::sleep(config.base_tick);
-            print_diff(session.poll(start.elapsed()), start.elapsed());
+            print_diff(session.poll(start.elapsed()), start.elapsed(), format);
         }
     }
 
-    /// Print each changed label as `+<ms>ms  name = value`, one per line. An empty
-    /// diff prints nothing — silence *is* "nothing changed".
-    fn print_diff(diff: scry::Snapshot, at: Duration) {
-        let ms = at.as_millis();
-        for (name, value) in diff {
-            println!("+{ms:>7}ms  {name} = {}", fmt_value(&value));
-        }
+    /// Write one JSON event as a line on stdout, flushed.
+    ///
+    /// Flushing per line is the whole point: a host reading this as a subprocess
+    /// gets each tick when it happens, not whenever a block buffer fills.
+    fn emit(event: &serde_json::Value) {
         use std::io::Write;
+        println!("{event}");
         let _ = std::io::stdout().flush();
+    }
+
+    /// Close the stream deliberately, so a consumer can tell "the watch ended"
+    /// (`--once`/`--for` ran out) from "the process died under me".
+    ///
+    /// Note this is *our* end, not the game's: nothing here detects the target
+    /// exiting — a dead target shows up as watches going `null`.
+    fn print_detached(at: Duration, format: Format) {
+        if format == Format::Json {
+            emit(&serde_json::json!({ "event": "detached", "t_ms": at.as_millis() as u64 }));
+        }
+    }
+
+    /// Render one tick's diff.
+    ///
+    /// An empty diff prints nothing in either format — silence *is* "nothing
+    /// changed", and a JSON consumer is spared an event per quiet tick (at the
+    /// default 50 ms cadence, most of them).
+    fn print_diff(diff: scry::Snapshot, at: Duration, format: Format) {
+        if diff.is_empty() {
+            return;
+        }
+        match format {
+            // `+<ms>ms  name = value`, one line per changed label.
+            Format::Human => {
+                let ms = at.as_millis();
+                for (name, value) in diff {
+                    println!("+{ms:>7}ms  {name} = {}", fmt_value(&value));
+                }
+                use std::io::Write;
+                let _ = std::io::stdout().flush();
+            }
+            Format::Json => emit(&serde_json::json!({
+                "event": "values",
+                "t_ms": at.as_millis() as u64,
+                "values": diff,
+            })),
+        }
     }
 
     fn fmt_value(v: &Value) -> String {

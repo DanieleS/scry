@@ -90,6 +90,40 @@ pub enum Value {
     Unavailable,
 }
 
+/// The **wire form** of a value: the shape a host outside this process sees.
+///
+/// Deliberately *untagged* — a number serialises as a bare JSON number, a string
+/// as a string, a list as an array, a record as an object, and
+/// [`Unavailable`](Value::Unavailable) as `null`. The variant name is not on the
+/// wire because the consumer already knows it: the watch's `type` is declared in
+/// the profile it loaded. Tagging every reading (`{"I32": 42}`) would put that
+/// same fact on every line of a stream that emits one per tick.
+///
+/// This is a **compatibility surface**. Once a host parses it, the mapping below
+/// cannot change without breaking that host, so it is defined here — in the
+/// engine — rather than left to each host to invent.
+///
+/// One wrinkle worth knowing: a non-finite `f32` (a `NaN` read out of a game
+/// mid-write) has no JSON representation and serialises as `null`, i.e. it is
+/// indistinguishable from `Unavailable`. Both mean "no meaningful reading this
+/// tick", so the collapse is honest rather than lossy.
+impl serde::Serialize for Value {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Value::I32(n) => s.serialize_i32(*n),
+            Value::U32(n) => s.serialize_u32(*n),
+            Value::F32(x) => s.serialize_f32(*x),
+            Value::U64(n) => s.serialize_u64(*n),
+            Value::Str(v) => s.serialize_str(v),
+            // Both delegate: `Vec<Value>`/`BTreeMap<String, Value>` are already
+            // serialisable once `Value` is, so nesting comes out right for free.
+            Value::List(items) => items.serialize(s),
+            Value::Map(fields) => fields.serialize(s),
+            Value::Unavailable => s.serialize_none(),
+        }
+    }
+}
+
 /// A diff: the labels whose value changed since they were last sampled, mapped
 /// to their new values. `BTreeMap` keeps the order stable for testable,
 /// reproducible output.
@@ -776,6 +810,69 @@ mod tests {
     /// The IL2CPP string type, as a preset — the shape the fixtures plant.
     fn il2cpp_string() -> ValueType {
         ValueType::String(StringSpec::Preset(StringPreset::Il2cpp))
+    }
+
+    /// The wire form is a **compatibility surface**: a host that parses it is
+    /// entitled to this exact shape, so pin it. Untagged — the reading looks like
+    /// what it is, because the consumer already knows each watch's declared type.
+    #[test]
+    fn values_serialise_untagged() {
+        let cases = [
+            (Value::I32(-7), "-7"),
+            (Value::U32(7), "7"),
+            (Value::U64(u64::MAX), "18446744073709551615"),
+            (Value::F32(1.5), "1.5"),
+            (Value::Str("VALERE".into()), "\"VALERE\""),
+            // The fail-soft state is `null`, not a missing key and not a zero: a
+            // host must be able to tell "went dark" from "reads as 0".
+            (Value::Unavailable, "null"),
+        ];
+        for (value, expected) in cases {
+            assert_eq!(serde_json::to_string(&value).unwrap(), expected);
+        }
+    }
+
+    /// A `NaN` read mid-write has no JSON form and collapses to `null` — the same
+    /// as `Unavailable`. Both mean "no meaningful reading", so pin the collapse
+    /// deliberately rather than discover it in a host one day.
+    #[test]
+    fn non_finite_floats_serialise_as_null() {
+        assert_eq!(
+            serde_json::to_string(&Value::F32(f32::NAN)).unwrap(),
+            "null"
+        );
+        assert_eq!(
+            serde_json::to_string(&Value::F32(f32::INFINITY)).unwrap(),
+            "null"
+        );
+    }
+
+    /// The one level of structure survives the wire, nested and in order: a party
+    /// roster of records is an array of objects, with a broken element `null` in
+    /// place rather than sinking the list.
+    #[test]
+    fn structure_survives_serialisation() {
+        let party = Value::List(vec![
+            Value::Map(BTreeMap::from([
+                ("hp".to_string(), Value::I32(42)),
+                ("name".to_string(), Value::Str("ZALE".into())),
+            ])),
+            Value::Unavailable,
+        ]);
+        assert_eq!(
+            serde_json::to_string(&party).unwrap(),
+            r#"[{"hp":42,"name":"ZALE"},null]"#
+        );
+
+        // And a whole snapshot is just a label -> reading object, key-ordered.
+        let snapshot: Snapshot = BTreeMap::from([
+            ("hp".to_string(), Value::I32(9)),
+            ("party".to_string(), party),
+        ]);
+        assert_eq!(
+            serde_json::to_string(&snapshot).unwrap(),
+            r#"{"hp":9,"party":[{"hp":42,"name":"ZALE"},null]}"#
+        );
     }
 
     /// A deterministic in-memory backend with interior mutability, so a test can
