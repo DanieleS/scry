@@ -294,6 +294,14 @@ OPTIONS:
             Value::U32(n) => n.to_string(),
             Value::F32(x) => x.to_string(),
             Value::U64(n) => n.to_string(),
+            // Quote strings so an empty or space-bearing value is visible.
+            Value::Str(s) => format!("{s:?}"),
+            // Render a collection as its elements, comma-separated — each element
+            // formatted the same way, so a list of strings stays quoted.
+            Value::List(items) => {
+                let parts: Vec<String> = items.iter().map(fmt_value).collect();
+                format!("[{}]", parts.join(", "))
+            }
             Value::Unavailable => "unavailable".to_string(),
         }
     }

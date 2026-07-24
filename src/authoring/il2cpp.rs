@@ -70,7 +70,7 @@ use std::fmt;
 use serde::Deserialize;
 
 use crate::aob;
-use crate::profile::{Match, Profile, Rip, ValueType, Watch};
+use crate::profile::{Base, Match, Profile, Rip, ValueType, Watch};
 
 // ---- the dump.cs symbol table ---------------------------------------------
 
@@ -390,6 +390,65 @@ pub enum WatchSpec {
         #[serde(default)]
         rate_hz: Option<f64>,
     },
+    /// A collection: iterate a container into an array. Mirrors
+    /// [`Watch::Collection`], with every chain carrying `Class::field` references
+    /// in place of raw offsets so the fragile numbers are derived from the dump.
+    Collection {
+        /// Label for the value.
+        name: String,
+        /// How to anchor the container. See [`BaseSpec`].
+        base: BaseSpec,
+        /// Chain from the container to the element count.
+        count: Vec<ChainEntry>,
+        /// Optional chain to the backing-array pointer (the C# `List<T>` shape);
+        /// absent means the elements live at the container itself.
+        #[serde(default)]
+        items: Option<Vec<ChainEntry>>,
+        /// Offset from the element region to element 0 (an array header).
+        /// Defaults to 0. A single entry: a literal, or a `Class::field` if a
+        /// dump happens to name it.
+        #[serde(default)]
+        first: Option<ChainEntry>,
+        /// Bytes between consecutive elements (a pointer array → `8`).
+        stride: ChainEntry,
+        /// Per-element chain from a slot to the value's address.
+        #[serde(default)]
+        element: Vec<ChainEntry>,
+        /// How to interpret each element's bytes.
+        #[serde(rename = "type")]
+        ty: ValueType,
+        /// Hard cap on the element count.
+        max: usize,
+        /// Optional per-watch sample rate in hertz.
+        #[serde(default)]
+        rate_hz: Option<f64>,
+    },
+}
+
+/// How a [collection](WatchSpec::Collection)'s container is anchored in the
+/// author map — the base of a collection watch, mirroring [`Base`] but with
+/// `chain` entries (name references or literals) instead of resolved offsets.
+#[derive(Debug, Deserialize)]
+#[serde(tag = "tier", rename_all = "lowercase")]
+pub enum BaseSpec {
+    /// Tier-1 base anchored at a module's load base.
+    Tier1 {
+        /// Module whose base anchors the chain; defaults to the spec's `module`.
+        #[serde(default)]
+        module: Option<String>,
+        /// Chain from the module base to the container.
+        chain: Vec<ChainEntry>,
+    },
+    /// Tier-2 base anchored at an AOB signature (optionally RIP-decoded).
+    Tier2 {
+        /// AOB signature whose match address anchors the chain.
+        anchor: String,
+        /// Optional RIP-relative decode, carried through verbatim.
+        #[serde(default)]
+        rip: Option<Rip>,
+        /// Chain from the anchor to the container.
+        chain: Vec<ChainEntry>,
+    },
 }
 
 /// One step of a pointer chain in the author map.
@@ -559,6 +618,66 @@ fn build_watch(
                 offsets: resolve_chain(name, chain, symbols)?,
                 ty: *ty,
                 rate_hz: *rate_hz,
+            })
+        }
+        WatchSpec::Collection {
+            name,
+            base,
+            count,
+            items,
+            first,
+            stride,
+            element,
+            ty,
+            max,
+            rate_hz,
+        } => {
+            let items = match items {
+                Some(chain) => Some(resolve_chain(name, chain, symbols)?),
+                None => None,
+            };
+            let first = match first {
+                Some(entry) => resolve_entry(name, entry, symbols)?,
+                None => 0,
+            };
+            Ok(Watch::Collection {
+                name: name.clone(),
+                base: build_base(name, base, symbols, default_module)?,
+                count: resolve_chain(name, count, symbols)?,
+                items,
+                first,
+                stride: resolve_entry(name, stride, symbols)?,
+                element: resolve_chain(name, element, symbols)?,
+                ty: *ty,
+                max: *max,
+                rate_hz: *rate_hz,
+            })
+        }
+    }
+}
+
+/// Resolve a collection's [`BaseSpec`] into a runtime [`Base`], validating a
+/// Tier-2 anchor's signature the same way a scalar Tier-2 watch does.
+fn build_base(
+    watch: &str,
+    spec: &BaseSpec,
+    symbols: &Symbols,
+    default_module: &str,
+) -> Result<Base, ConvertError> {
+    match spec {
+        BaseSpec::Tier1 { module, chain } => Ok(Base::Tier1 {
+            module: module.clone().unwrap_or_else(|| default_module.to_string()),
+            offsets: resolve_chain(watch, chain, symbols)?,
+        }),
+        BaseSpec::Tier2 { anchor, rip, chain } => {
+            aob::parse_pattern(anchor).map_err(|e| ConvertError::BadAnchor {
+                watch: watch.to_string(),
+                reason: e.to_string(),
+            })?;
+            Ok(Base::Tier2 {
+                anchor: anchor.clone(),
+                rip: *rip,
+                offsets: resolve_chain(watch, chain, symbols)?,
             })
         }
     }
@@ -953,6 +1072,110 @@ public class PartyMember
             Watch::Tier1 { offsets, .. } => assert_eq!(offsets, &vec![16, 0x18, -4]),
             other => panic!("expected Tier1, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn converts_a_collection_watch_resolving_field_names() {
+        // A party-roster collection: a Tier-1 base whose chain mixes a literal
+        // static base with a named field, and an element type of `string`. The
+        // brittle numbers (`leader` offset) come from the dump; the shape is the
+        // author's.
+        let map = r#"{
+          "process": "SeaOfStars.exe", "module": "GameAssembly.dll",
+          "probe": "90 90",
+          "watches": [
+            { "name": "party_hp", "tier": "collection",
+              "base": { "tier": "tier1", "chain": ["0x38BB238", "GameManager::leader"] },
+              "count": ["0x18"], "items": ["0x10"], "first": "0x20", "stride": "0x8",
+              "element": ["Combat.PartyMember::currentHp"],
+              "type": "i32", "max": 16, "rate_hz": 8.0 }
+          ]
+        }"#;
+        let profile = convert_files(DUMP, map).expect("convert");
+        match &profile.watches[0] {
+            Watch::Collection {
+                name,
+                base,
+                count,
+                items,
+                first,
+                stride,
+                element,
+                ty,
+                max,
+                rate_hz,
+            } => {
+                assert_eq!(name, "party_hp");
+                assert_eq!(
+                    *base,
+                    Base::Tier1 {
+                        module: "GameAssembly.dll".to_string(), // defaulted from the spec
+                        offsets: vec![0x38BB238, 0x28],         // literal + resolved `leader`
+                    }
+                );
+                assert_eq!(count, &vec![0x18]);
+                assert_eq!(*items, Some(vec![0x10]));
+                assert_eq!(*first, 0x20);
+                assert_eq!(*stride, 8);
+                assert_eq!(element, &vec![0x18]); // resolved `currentHp`
+                assert_eq!(*ty, ValueType::I32);
+                assert_eq!(*max, 16);
+                assert_eq!(*rate_hz, Some(8.0));
+            }
+            other => panic!("expected a Collection, got {other:?}"),
+        }
+        // What it emits must load back into the runtime unchanged.
+        let json = profile.to_json().expect("serialize");
+        assert_eq!(Profile::from_json(&json).expect("re-parse"), profile);
+    }
+
+    #[test]
+    fn collection_with_a_tier2_base_validates_and_carries_the_anchor() {
+        let map = r#"{
+          "process": "g.exe", "module": "GameAssembly.dll",
+          "probe": "90 90",
+          "watches": [
+            { "name": "enemies", "tier": "collection",
+              "base": { "tier": "tier2", "anchor": "48 8B 05 ?? ?? ?? ?? 48 8B 88",
+                        "rip": { "disp": 3, "len": 7 }, "chain": ["0x0"] },
+              "count": [16], "stride": 8, "element": [0, 0], "type": "i32", "max": 64 }
+          ]
+        }"#;
+        let profile = convert_files(DUMP, map).expect("convert");
+        match &profile.watches[0] {
+            Watch::Collection {
+                base, items, first, ..
+            } => {
+                assert_eq!(
+                    *base,
+                    Base::Tier2 {
+                        anchor: "48 8B 05 ?? ?? ?? ?? 48 8B 88".to_string(),
+                        rip: Some(Rip { disp: 3, len: 7 }),
+                        offsets: vec![0x0],
+                    }
+                );
+                assert_eq!(*items, None); // absent -> elements live at the container
+                assert_eq!(*first, 0); // absent -> defaults to 0
+            }
+            other => panic!("expected a Collection, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_collections_bad_tier2_anchor_is_caught() {
+        let map = r#"{
+          "process": "g.exe", "module": "GameAssembly.dll",
+          "probe": "90 90",
+          "watches": [
+            { "name": "enemies", "tier": "collection",
+              "base": { "tier": "tier2", "anchor": "zz", "chain": [0] },
+              "count": [8], "stride": 8, "element": [0], "type": "i32", "max": 8 }
+          ]
+        }"#;
+        assert!(matches!(
+            convert_files(DUMP, map),
+            Err(ConvertError::BadAnchor { .. })
+        ));
     }
 
     #[test]

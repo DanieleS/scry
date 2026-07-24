@@ -34,6 +34,21 @@ struct Stats {
 /// Its address is `module_base + <stable offset>`, the anchor a profile stores.
 static PLAYER: AtomicU64 = AtomicU64::new(0);
 
+/// Static slot holding a pointer to an **enemy list** — the C#-`List<T>` shape a
+/// `collection` watch iterates: a list object whose `items` field points at a
+/// backing array of pointers to `Stats`, and whose `count` field says how many.
+/// Stands in for "the on-screen enemies" a party/enemy telemetry reads.
+static ENEMIES: AtomicU64 = AtomicU64::new(0);
+
+/// Static slot holding a pointer to a **party roster** — the same list shape, but
+/// its elements are `System.String` references, so a single `collection` watch of
+/// `type: string` emits the ordered names (the issue-#18 headline).
+static ROSTER: AtomicU64 = AtomicU64::new(0);
+
+/// Static slot holding a `System.String` reference on its own — the scalar
+/// `string` value type (a character-identity field), read without iteration.
+static NAME: AtomicU64 = AtomicU64::new(0);
+
 /// A unique byte signature living in the module. Stands in for the recognizable
 /// run of bytes a Tier-2 profile scans for to anchor an address. `#[used]` keeps
 /// the optimizer from dropping it since nothing reads it.
@@ -89,6 +104,57 @@ static RIPSTUB: [AtomicU8; 13] = [
 
 const EXPECTED_HP: i32 = 1337;
 
+/// The enemy HP values the collection fixture plants, in order. A test asserts
+/// the `collection` watch reads exactly these.
+const ENEMY_HPS: [i32; 3] = [11, 22, 33];
+
+/// The party roster the string-collection fixture plants, in lineup order.
+const ROSTER_NAMES: [&str; 3] = ["VALERE", "ZALE", "GARL"];
+
+/// The lone character-identity string the scalar-string fixture plants.
+const NAME_VALUE: &str = "ZALE";
+
+/// Byte offset, within an IL2CPP `System.String`, of its 32-bit length. This is
+/// what the engine's `il2cpp` string preset expects, so the fixture builds it to
+/// match — proving the preset's layout against a real read, not a mock.
+const STRING_LEN_OFFSET: usize = 0x10;
+/// Byte offset, within an IL2CPP `System.String`, of its UTF-16 payload.
+const STRING_CHARS_OFFSET: usize = 0x14;
+/// Bytes of array header before a backing array's first element slot — the
+/// `first` a `collection` watch skips (mirrors an IL2CPP array's `0x20`).
+const ARRAY_HEADER: usize = 0x20;
+
+/// Leak an IL2CPP-shaped `System.String` object and return its address: a
+/// 32-bit length at `+0x10` and the UTF-16 payload at `+0x14`.
+fn make_string(s: &str) -> u64 {
+    let units: Vec<u16> = s.encode_utf16().collect();
+    let mut buf = vec![0u8; STRING_CHARS_OFFSET + units.len() * 2];
+    buf[STRING_LEN_OFFSET..STRING_LEN_OFFSET + 4]
+        .copy_from_slice(&(units.len() as i32).to_le_bytes());
+    for (i, u) in units.iter().enumerate() {
+        let at = STRING_CHARS_OFFSET + i * 2;
+        buf[at..at + 2].copy_from_slice(&u.to_le_bytes());
+    }
+    Box::leak(buf.into_boxed_slice()).as_ptr() as u64
+}
+
+/// Leak a C#-`List<T>`-shaped container over `elements` (each already an address)
+/// and return the list object's address: `items` (a pointer to a backing array
+/// of the element addresses, past a `0x20` header) at `+0x0`, `count` at `+0x8`.
+fn make_list(elements: &[u64]) -> u64 {
+    let mut array = vec![0u8; ARRAY_HEADER + elements.len() * 8];
+    for (i, &e) in elements.iter().enumerate() {
+        let at = ARRAY_HEADER + i * 8;
+        array[at..at + 8].copy_from_slice(&e.to_le_bytes());
+    }
+    let array_ptr = Box::leak(array.into_boxed_slice()).as_ptr() as u64;
+
+    let mut list = vec![0u8; 0x10];
+    list[0x0..0x8].copy_from_slice(&array_ptr.to_le_bytes());
+    list[0x8..0xC].copy_from_slice(&(elements.len() as i32).to_le_bytes());
+    Box::leak(list.into_boxed_slice()).as_ptr() as u64
+}
+
 fn main() {
     // The "game" allocates its player stats on the heap and records the pointer
     // in the static slot. Leaked so the address stays valid for the process's
@@ -99,6 +165,29 @@ fn main() {
         frame: AtomicI32::new(0),
     }));
     PLAYER.store(stats as *const Stats as u64, Ordering::SeqCst);
+
+    // Enemy list: three heap `Stats`, an array of pointers to them, a `List`
+    // over that array. A `collection` watch iterates it into an HP array.
+    let enemy_ptrs: Vec<u64> = ENEMY_HPS
+        .iter()
+        .map(|&hp| {
+            let s: &'static Stats = Box::leak(Box::new(Stats {
+                hp,
+                hp_max: hp,
+                frame: AtomicI32::new(0),
+            }));
+            s as *const Stats as u64
+        })
+        .collect();
+    ENEMIES.store(make_list(&enemy_ptrs), Ordering::SeqCst);
+
+    // Party roster: a `List` whose elements are `System.String` references, in
+    // lineup order — a `collection` of `type: string`.
+    let roster_ptrs: Vec<u64> = ROSTER_NAMES.iter().map(|s| make_string(s)).collect();
+    ROSTER.store(make_list(&roster_ptrs), Ordering::SeqCst);
+
+    // A lone string reference for the scalar `string` value type.
+    NAME.store(make_string(NAME_VALUE), Ordering::SeqCst);
 
     let pid = std::process::id();
     let exe = std::env::current_exe().expect("current_exe");
@@ -121,6 +210,9 @@ fn main() {
     let base: u64 = 0;
 
     let player_addr = &PLAYER as *const AtomicU64 as u64;
+    let enemies_addr = &ENEMIES as *const AtomicU64 as u64;
+    let roster_addr = &ROSTER as *const AtomicU64 as u64;
+    let name_addr = &NAME as *const AtomicU64 as u64;
     let sig_addr = SIG.as_ptr() as u64;
     let probe_addr = PROBE.as_ptr() as u64;
     let build_addr = BUILD.as_ptr() as u64;
@@ -139,11 +231,14 @@ fn main() {
         addr
     };
 
-    // Machine-readable line the test parses.
+    // Machine-readable line the test parses. The `enemies`/`roster`/`name` slots
+    // are module-relative statics, exactly like `player`: a test derives each
+    // slot's offset from the base and builds a `collection` (or `string`) watch.
     println!(
         "READY pid={pid} exe={exe_name} base=0x{base:x} player=0x{player_addr:x} \
          sig=0x{sig_addr:x} probe=0x{probe_addr:x} build=0x{build_addr:x} \
-         rip=0x{rip_addr:x} hp={EXPECTED_HP}"
+         rip=0x{rip_addr:x} hp={EXPECTED_HP} enemies=0x{enemies_addr:x} \
+         roster=0x{roster_addr:x} name=0x{name_addr:x}"
     );
     use std::io::Write;
     std::io::stdout().flush().ok();

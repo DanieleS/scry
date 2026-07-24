@@ -34,6 +34,13 @@ pub struct Ready {
     /// the PLAYER slot — the anchor a RIP-relative Tier-2 watch decodes.
     pub rip: u64,
     pub hp: i32,
+    /// Static slot holding a pointer to the enemy `List` — a collection watch's
+    /// Tier-1 base derefs it to reach the container.
+    pub enemies: u64,
+    /// Static slot holding a pointer to the party-roster `List` of strings.
+    pub roster: u64,
+    /// Static slot holding a lone `System.String` reference.
+    pub name: u64,
 }
 
 fn parse_ready(line: &str) -> Ready {
@@ -47,6 +54,9 @@ fn parse_ready(line: &str) -> Ready {
         build: 0,
         rip: 0,
         hp: 0,
+        enemies: 0,
+        roster: 0,
+        name: 0,
     };
     for tok in line.split_whitespace() {
         let (k, v) = match tok.split_once('=') {
@@ -64,6 +74,9 @@ fn parse_ready(line: &str) -> Ready {
             "build" => r.build = hex(v),
             "rip" => r.rip = hex(v),
             "hp" => r.hp = v.parse().unwrap(),
+            "enemies" => r.enemies = hex(v),
+            "roster" => r.roster = hex(v),
+            "name" => r.name = hex(v),
             _ => {}
         }
     }

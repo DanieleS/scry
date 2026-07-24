@@ -118,8 +118,95 @@ scry watch --process SeaOfStars.exe --profile seaofstars.json --no-resolve # HP 
   single-player game you can also just **pin the game version** (disable
   auto-update) so nothing moves until you choose.
 
-## Beyond single values
+## Strings
 
-Party/enemy **lists** need iteration — expressed as a data-driven *collection*
-watch (base + count + stride + per-element chain), not a scripting engine. See
-[#15](https://github.com/DanieleS/scry/issues/15).
+A `string` value type reads text. How a string is laid out varies **by engine**
+(IL2CPP, Mono, native C, Unreal `FString`, …), so the layout is *data*, not baked
+into the runtime — you name a **preset** or give an explicit **layout**. No engine
+is the default; a bare `"string"` is rejected.
+
+```json
+{ "tier": "tier1", "name": "hero",
+  "offsets": ["0x1A2B3C", "0x38"], "type": { "string": "il2cpp" } }
+```
+
+The chain's last offset lands on the field (Sea of Stars: the character's
+`CharacterDefinitionId` string at `+0x38`); the string type follows the reference
+itself, so don't add a trailing deref.
+
+**Presets** (validated engine layouts — peers, added as we confirm them):
+
+| preset | layout it stands for |
+|---|---|
+| `il2cpp` | reference → object; UTF-16, 32-bit length at `+0x10`, chars at `+0x14` |
+
+**Explicit layout** — the escape hatch for any engine without a preset:
+
+| field | meaning |
+|---|---|
+| `encoding` | `utf8` (1 byte/unit) or `utf16` (2 LE bytes/unit) — required |
+| `len_at` | offset to a 32-bit length prefix; **omit for NUL-terminated** (native/C strings) |
+| `chars_at` | offset to the first code unit; default `0` |
+| `deref` | `true` if the resolved address holds a *pointer* to the object (managed reference types); default `false` (an inline/native buffer) |
+
+```jsonc
+// what "il2cpp" expands to, written by hand
+"type": { "string": { "encoding": "utf16", "len_at": "0x10", "chars_at": "0x14", "deref": true } }
+
+// a native NUL-terminated UTF-8 C string, read in place
+"type": { "string": { "encoding": "utf8" } }
+```
+
+The read length is capped (1 KiB) so a garbage length or a missing terminator
+can't run away; a null reference reads as `""` (honest empty), not `unavailable`.
+
+## Collections (lists & arrays)
+
+Party/enemy **lists** need iteration. Rather than a scripting engine, a
+`collection` watch expresses it as **data** — a base chain to the container, a
+`count`, a `stride`, and a per-element chain — and emits an ordered array that
+diffs like any other value. It stays structurally read-only and zero-dependency.
+
+Fields:
+
+| field | meaning |
+|---|---|
+| `base` | how to reach the container — a nested `{ "tier": "tier1"/"tier2", … }`, same shapes as a scalar watch, whose `offsets` end at the list object / array |
+| `count` | chain from the container to the 32-bit element count (clamped to `max`) |
+| `items` | *optional* chain to the backing-array **pointer** (dereferenced); omit it when the elements live at the container itself (a bare pointer array) |
+| `first` | byte offset to element 0 within the element region (an array header); default `0` |
+| `stride` | bytes between consecutive elements (a pointer array → `8`) |
+| `element` | per-element chain from a slot to the value; empty means the slot *is* the value's address |
+| `type` | element type (`i32` … or a `string` — see [Strings](#strings)) |
+| `max` | hard cap — a garbage count can neither allocate nor loop unboundedly |
+
+The C# `List<T>` shape (validated against Sea of Stars — `items` at `+0x10`,
+`count` at `+0x18`, array header `0x20`, pointer stride `8`) reading the party
+roster as an ordered list of names:
+
+```json
+{ "tier": "collection", "name": "party_roster",
+  "base": { "tier": "tier1", "module": "GameAssembly.dll",
+            "offsets": ["0x38BB238", 0] },
+  "count": ["0x18"], "items": ["0x10"], "first": "0x20", "stride": 8,
+  "element": [], "type": { "string": "il2cpp" }, "max": 16 }
+```
+
+A bare pointer array (an "enemy HP list" of entity pointers), with the count read
+from the container and each element's HP reached through the entity:
+
+```json
+{ "tier": "collection", "name": "enemy_hp",
+  "base": { "tier": "tier2", "anchor": "48 8B 05 ?? ?? ?? ?? …",
+            "rip": { "disp": 3, "len": 7 }, "offsets": [0] },
+  "count": [16], "stride": 8, "element": ["0x0", "0x58"], "type": "i32", "max": 64 }
+```
+
+Per-element resolution is **fail-soft**: a broken element is `unavailable` in
+place without sinking the list. A base/count/items failure makes the whole watch
+`unavailable` — the list can't be sized or located, so there is nothing honest to
+emit.
+
+The IL2CPP converter (`docs/authoring-il2cpp.md`) speaks the same shape with
+`Class::field` names in every chain, so the fragile offsets are derived from a
+dump rather than hand-counted.
