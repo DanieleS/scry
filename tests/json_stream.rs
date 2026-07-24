@@ -53,6 +53,7 @@ fn cavia_profile_json(exe: &str, player_offset: i64) -> String {
     format!(
         r#"{{
           "label": "cavia",
+          "contractVersion": 3,
           "match": {{
             "process": "{exe}",
             "module": "{exe}",
@@ -129,6 +130,16 @@ fn stdout_is_a_stream_of_json_events() {
     assert!(
         attached["pid"].is_u64() && attached["pointer_bits"].is_u64(),
         "attach identity must be machine-readable: {attached}"
+    );
+    // Which profile won, and what shape it emits: the host can't derive either
+    // on its own, so both travel with the attach. The contract is passed through
+    // verbatim from the file — 3 here precisely because nothing defaults to it.
+    assert_eq!(attached["contract_version"], 3);
+    assert!(
+        attached["profile_file"]
+            .as_str()
+            .is_some_and(|p| p.ends_with("cavia.json")),
+        "attach must name the file the profile came from: {attached}"
     );
 
     let last = events.last().unwrap();

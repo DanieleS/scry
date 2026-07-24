@@ -94,6 +94,13 @@ JSON OUTPUT:
         {\"event\":\"values\",\"t_ms\":123,\"values\":{\"hp\":42}}
         {\"event\":\"detached\",\"t_ms\":9000}
 
+    The `attached` event names *which* profile won the probe test — the choice
+    was made by the target's memory, not by the caller, so it is the one thing a
+    host cannot know on its own. `profile` is the label, `profile_file` the file
+    it was read from, and `contract_version` the profile's `contractVersion`
+    (`null` when it declares none): the shape of the values that follow, which is
+    what a renderer downstream needs in order to know how to read them.
+
     `values` carries only what *changed* this tick (the first one carries
     everything readable). Readings are untagged — a number is a number, a list an
     array, a record an object, and an unreadable watch is `null`; the consumer
@@ -214,11 +221,17 @@ JSON OUTPUT:
             }
         };
 
-        // Gather the candidate profiles.
+        // Gather the candidate profiles, each remembering the file it came from:
+        // the resolver reports *a profile*, and a host pointed at a folder needs
+        // to know which file that was.
         let mut profiles: Vec<Profile> = Vec::new();
+        let mut sources: Vec<PathBuf> = Vec::new();
         for f in &profile_files {
             match load_profile(Path::new(f)) {
-                Ok(p) => profiles.push(p),
+                Ok(p) => {
+                    profiles.push(p);
+                    sources.push(PathBuf::from(f));
+                }
                 Err(e) => {
                     eprintln!("scry: {f}: {e}");
                     return 1;
@@ -227,7 +240,12 @@ JSON OUTPUT:
         }
         if let Some(dir) = &profiles_dir {
             match load_profiles_dir(Path::new(dir)) {
-                Ok(mut ps) => profiles.append(&mut ps),
+                Ok(loaded) => {
+                    for (path, profile) in loaded {
+                        profiles.push(profile);
+                        sources.push(path);
+                    }
+                }
                 Err(e) => {
                     eprintln!("scry: {dir}: {e}");
                     return 1;
@@ -283,6 +301,15 @@ JSON OUTPUT:
             }
         };
 
+        // Which file the winning profile came from. `chosen` borrows out of
+        // `profiles`, so its address identifies its slot exactly — and `sources`
+        // was filled in lockstep with it.
+        let source = profiles
+            .iter()
+            .position(|p| std::ptr::eq(p, chosen))
+            .and_then(|i| sources.get(i))
+            .map(|p| p.display().to_string());
+
         let label = chosen.label.as_deref().unwrap_or("(unlabeled profile)");
         let pointer_bits = backend.pointer_size() * 8;
         eprintln!("scry: attached to {name} (pid {pid}) with {label}");
@@ -294,6 +321,8 @@ JSON OUTPUT:
         // The identity of what we attached to, announced once. A host needs this
         // to confirm it is reading the game it meant to — the profile is chosen
         // by the target's *memory*, not by the caller, so which one won is news.
+        // `contract_version` travels with it because the values that follow are
+        // only interpretable against the shape the profile declares.
         if format == Format::Json {
             emit(&serde_json::json!({
                 "event": "attached",
@@ -301,6 +330,8 @@ JSON OUTPUT:
                 "pid": pid,
                 "process": name,
                 "profile": label,
+                "profile_file": source,
+                "contract_version": chosen.contract_version,
                 "watches": chosen.watches.len(),
                 "pointer_bits": pointer_bits,
             }));
@@ -646,10 +677,11 @@ USAGE:
         Profile::from_json(&text).map_err(|e| e.to_string())
     }
 
-    /// Load every `*.json` in `dir` as a profile. A file that fails to parse is
-    /// skipped with a warning rather than sinking the batch — one broken
-    /// community profile must not deny telemetry to the valid ones.
-    fn load_profiles_dir(dir: &Path) -> Result<Vec<Profile>, String> {
+    /// Load every `*.json` in `dir` as a profile, paired with the file it came
+    /// from. A file that fails to parse is skipped with a warning rather than
+    /// sinking the batch — one broken community profile must not deny telemetry
+    /// to the valid ones.
+    fn load_profiles_dir(dir: &Path) -> Result<Vec<(PathBuf, Profile)>, String> {
         let mut out = Vec::new();
         for entry in std::fs::read_dir(dir).map_err(|e| e.to_string())? {
             let entry = entry.map_err(|e| e.to_string())?;
@@ -658,7 +690,7 @@ USAGE:
                 continue;
             }
             match load_profile(&path) {
-                Ok(p) => out.push(p),
+                Ok(p) => out.push((path, p)),
                 Err(e) => eprintln!("scry: skipping {}: {e}", path.display()),
             }
         }

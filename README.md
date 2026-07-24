@@ -38,6 +38,25 @@ authors ship profiles without touching the engine.
 The filename is just a label. **Identity lives entirely in the `match` block** —
 above all in its `probe`.
 
+### The contract — what a profile *emits*
+
+A profile can also declare an optional `"contractVersion": 1`. It versions the
+**shape** of the output — the watch names and their types — and it is orthogonal
+to `match.version`, which pins the *build* the offsets were authored against:
+
+```text
+build 1.4.2 -> profile 1.4.2 -\
+build 1.5.0 -> profile 1.5.0 --+-> contract 1
+build 2.0.0 -> profile 2.0.0 ---> contract 2
+```
+
+Offsets move every patch; names outlive them. So the usual patch costs one new
+profile sharing the old contract, and a consumer that renders `hp` and `party`
+keeps working untouched. The engine **never reads this field** — it parses it and
+hands it back on the `attached` event, for whoever is rendering the values. An
+engine that acted on it would be forming an opinion about what a value *means*,
+which is exactly the line this one doesn't cross.
+
 ### Two tiers of watch
 
 Both tiers walk a pointer chain and read a typed value (`i32`, `u32`, `f32`,

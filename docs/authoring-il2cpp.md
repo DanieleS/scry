@@ -209,6 +209,7 @@ Top-level fields:
 | `process` | yes | Executable name → `match.process`. |
 | `module` | yes | Anchoring module (usually `"GameAssembly.dll"`) → `match.module`, and the default module for Tier-1 watches. |
 | `version` | no | Build discriminant → `match.version`. |
+| `contractVersion` | no | Version of the emitted *shape* → `contractVersion`. Bump it when a re-conversion renames, retypes, adds, or drops a watch — **not** when a new build merely moves the offsets, which is the common case. |
 | `probe` | yes | Identity signature (see below). |
 | `watches` | yes | Array of watches, emitted in order. |
 

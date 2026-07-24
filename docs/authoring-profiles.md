@@ -118,6 +118,13 @@ scry watch --process SeaOfStars.exe --profile seaofstars.json --no-resolve # HP 
   single-player game you can also just **pin the game version** (disable
   auto-update) so nothing moves until you choose.
 
+Because you should expect to re-do a profile per patch, keep the *names* stable
+while you do. Add an optional `"contractVersion": 1` next to `label`: it versions
+the shape you emit (which watches, of which types), so a new profile for a new
+build normally keeps the same contract and nothing downstream has to change.
+Bump it only when you rename, retype, add, or remove a watch. scry doesn't read
+the field — it reports it on `attached`, for whatever is rendering your values.
+
 ## Strings
 
 A `string` value type reads text. How a string is laid out varies **by engine**
