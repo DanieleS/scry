@@ -1,10 +1,17 @@
 name: CI
 
+permissions: {}
+
 on:
   push:
     branches: [main, "claude/**"]
   pull_request:
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Tag to publish, e.g. v0.1.0 — re-runs a release that failed part-way.
+        required: false
+        type: string
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -14,12 +21,191 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # Decide, *before* anything is published, whether this run is a release — and
+  # of what exactly. Releases are tag-driven: you tag a commit on a watched
+  # branch and push both, and this job notices the tag sitting on the pushed
+  # HEAD. Every gate below exists to make an accidental release impossible:
+  # a stray tag, a re-pushed one, a tag on an unreachable commit, or one with no
+  # release notes written for it all resolve to "not a release" and CI carries on
+  # as normal. Nothing here writes anything.
+  release-candidate:
+    name: Release candidate
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      release_commit: ${{ steps.release-candidate.outputs.release_commit }}
+      release_version: ${{ steps.release-candidate.outputs.release_version }}
+      should_release: ${{ steps.release-candidate.outputs.should_release }}
+      tag_name: ${{ steps.release-candidate.outputs.tag_name }}
+    steps:
+      # Full history: the gates below compare the tag's commit against the run's
+      # ref and read the notes file out of the tag commit itself.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve release candidate
+        id: release-candidate
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          RELEASE_TAG: ${{ github.event.inputs.release_tag || '' }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          python3 <<'PY'
+          import os
+          import re
+          import subprocess
+          import sys
+          from pathlib import Path
+
+          VERSION_RE = re.compile(r"^v?([0-9]+\.[0-9]+\.[0-9]+)([-.][0-9A-Za-z.-]+)?$")
+          REPO = os.environ["GITHUB_REPOSITORY"]
+
+          def run(*args, check=True):
+            return subprocess.run(args, check=check, text=True, capture_output=True).stdout.strip()
+
+          def output(**values):
+            with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
+              for key, value in values.items():
+                print(f"{key}={value}", file=fh)
+
+          def skip(reason):
+            print(f"::notice::{reason}")
+            output(should_release="false", tag_name="", release_version="", release_commit="")
+            sys.exit(0)
+
+          # Order releases within a channel, and rank channels against each other,
+          # so "is this tag newer than what is already out?" has one answer.
+          def version_key(tag):
+            match = VERSION_RE.match(tag)
+            if not match:
+              return None
+
+            major, minor, patch = (int(part) for part in match.group(1).split("."))
+            suffix = (match.group(2) or "").lstrip("-.").lower()
+            suffix_parts = re.split(r"[-.]", suffix) if suffix else []
+            suffix_num = next((int(part) for part in suffix_parts if part.isdigit()), 0)
+
+            if not suffix:
+              suffix_rank = 40
+            elif "rc" in suffix_parts:
+              suffix_rank = 30
+            elif "beta" in suffix_parts:
+              suffix_rank = 20
+            elif "alpha" in suffix_parts:
+              suffix_rank = 10
+            else:
+              suffix_rank = 5
+
+            return (major, minor, patch, suffix_rank, suffix_num, suffix)
+
+          def is_prerelease_key(key):
+            return key[3] < 40
+
+          # The notes must exist *in the tagged commit*, not merely in the branch:
+          # what ships is what was tagged.
+          def release_notes_for(tag, commit):
+            release_version = tag[1:] if tag.startswith("v") else tag
+            for candidate in (
+              Path("release_notes") / f"{release_version}.md",
+              Path("release_notes") / f"{tag}.md",
+            ):
+              notes_path = candidate.as_posix()
+              if subprocess.run(
+                ["git", "cat-file", "-e", f"{commit}:{notes_path}"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+              ).returncode == 0:
+                return notes_path
+            return None
+
+          event_name = os.environ["EVENT_NAME"]
+          if event_name not in {"push", "workflow_dispatch"}:
+            skip("Release gate only applies to push and manual workflow_dispatch events.")
+
+          run("git", "fetch", "--force", "--tags")
+
+          # Compare against what is actually published, not against local tags: a
+          # tag can exist without a release (that is exactly the case we act on).
+          release_tags = set(filter(None, run(
+            "gh", "api", "--paginate", f"repos/{REPO}/releases", "--jq", ".[].tag_name"
+          ).splitlines()))
+          release_versions = [version_key(tag) for tag in release_tags]
+          release_versions = [key for key in release_versions if key is not None]
+
+          release_tag_input = os.environ.get("RELEASE_TAG", "").strip()
+          if event_name == "workflow_dispatch":
+            if not release_tag_input:
+              skip("Manual release dispatch requires the release_tag input.")
+            candidate_tags = [release_tag_input]
+          else:
+            candidate_tags = run("git", "tag", "--points-at", "HEAD").splitlines()
+
+          valid_candidates = []
+          for tag in candidate_tags:
+            key = version_key(tag)
+            if key is None:
+              continue
+            # A tag is one name for one release. Accept `v0.1.0` or `0.1.0`, but
+            # never publish both — and never re-publish one.
+            alternates = {tag, tag[1:] if tag.startswith("v") else f"v{tag}"}
+            if alternates & release_tags:
+              print(f"Skipping {tag}: a release already exists for it.")
+              continue
+            comparable_releases = [
+              release_key for release_key in release_versions
+              if is_prerelease_key(release_key) == is_prerelease_key(key)
+            ]
+            current_release_version = max(comparable_releases) if comparable_releases else None
+            if current_release_version is not None and key <= current_release_version:
+              print(f"Skipping {tag}: not newer than the current release.")
+              continue
+            release_commit = run("git", "rev-list", "-n", "1", tag)
+            if event_name == "push":
+              head_commit = run("git", "rev-parse", "HEAD")
+              if release_commit != head_commit:
+                print(f"Skipping {tag}: tag commit {release_commit} is not the pushed HEAD.")
+                continue
+            if subprocess.run(
+              ["git", "merge-base", "--is-ancestor", release_commit, "HEAD"],
+              stdout=subprocess.DEVNULL,
+              stderr=subprocess.DEVNULL,
+            ).returncode != 0:
+              print(f"Skipping {tag}: tag commit {release_commit} is not reachable from this ref.")
+              continue
+            notes_file = release_notes_for(tag, release_commit)
+            if notes_file is None:
+              print(f"Skipping {tag}: no matching release_notes file in the tag commit.")
+              continue
+            valid_candidates.append((key, tag, notes_file, release_commit))
+
+          if not valid_candidates:
+            skip("No unreleased newer tag with matching release notes was found.")
+
+          _, tag_name, notes_file, release_commit = max(valid_candidates, key=lambda item: item[0])
+          release_version = tag_name[1:] if tag_name.startswith("v") else tag_name
+
+          print(f"Release candidate: {tag_name} ({release_commit}) using {notes_file}")
+          output(
+            should_release="true",
+            tag_name=tag_name,
+            release_version=release_version,
+            release_commit=release_commit,
+          )
+          PY
+
   # Format, lint, and test on both platforms. The Windows job is the one that
   # matters most for the production backend: `cargo test` there runs the
   # integration suite, which spawns the cavia and reads a real Windows process
   # through `WindowsBackend` — the acceptance proof for issue #4.
   test:
     name: test (${{ matrix.os }})
+    permissions:
+      contents: read
     strategy:
       fail-fast: false
       matrix:
@@ -64,6 +250,8 @@ jobs:
   # 32-bit cavia. Covers the "32-bit and 64-bit targets both handled" criterion.
   windows-32bit:
     name: test (windows, 32-bit)
+    permissions:
+      contents: read
     runs-on: windows-latest
     timeout-minutes: 25
     steps:
@@ -79,18 +267,27 @@ jobs:
 
   # Build the shippable CLI. The uploaded artifacts are exactly what you drop on
   # a Windows box to test the engine against a game *without* this pipeline:
-  # `scry.exe` (the host) and `cavia.exe` (the bundled selftest target).
+  # `scry.exe` (the host) and `cavia.exe` (the bundled selftest target) — and,
+  # when this run is a release, they are also literally what gets published.
   windows-cli:
     name: cli (${{ matrix.target }})
+    permissions:
+      contents: read
     runs-on: windows-latest
     timeout-minutes: 25
-    needs: test
+    needs: [test, release-candidate]
     strategy:
       fail-fast: false
       matrix:
         target: [x86_64-pc-windows-msvc, i686-pc-windows-msvc]
     steps:
+      # Build the *tagged* commit when releasing. On a push these are the same
+      # commit (the gate demands it); on a manual re-run of an older tag they are
+      # not, and publishing binaries built from a different tree than the one
+      # named on the release would be a lie.
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.release-candidate.outputs.release_commit || github.sha }}
       - name: Install Rust (${{ matrix.target }})
         run: |
           rustup update stable
@@ -111,3 +308,175 @@ jobs:
             target/${{ matrix.target }}/release/cavia.exe
             target/${{ matrix.target }}/release/il2cpp2scry.exe
           if-no-files-found: error
+
+  # Publish. Everything above must be green first: a release is the one artifact
+  # people run without building, so it never ships past a failing test — the
+  # 32-bit suite included.
+  release:
+    name: Release
+    if: needs.release-candidate.outputs.should_release == 'true'
+    permissions:
+      contents: write
+    needs: [release-candidate, test, windows-32bit, windows-cli]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      RELEASE_VERSION: ${{ needs.release-candidate.outputs.release_version }}
+      TAG_NAME: ${{ needs.release-candidate.outputs.tag_name }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.release-candidate.outputs.release_commit }}
+
+      # The tag and the crate must agree. A release whose `scry --version` prints
+      # something other than the tag it was downloaded under is unsupportable, so
+      # bump `Cargo.toml` (and the lockfile) in the commit you tag.
+      - name: Check the crate version matches the tag
+        run: |
+          set -euo pipefail
+          cargo_version="$(
+            awk '/^\[/ { in_pkg = ($0 == "[package]") } \
+                 in_pkg && /^version[[:space:]]*=/ { gsub(/[",]/, "", $3); print $3; exit }' Cargo.toml
+          )"
+          if [[ "${cargo_version}" != "${RELEASE_VERSION}" ]]; then
+            echo "::error::Tag ${TAG_NAME} says ${RELEASE_VERSION}, Cargo.toml says ${cargo_version}."
+            exit 1
+          fi
+          echo "Cargo.toml and ${TAG_NAME} agree on ${RELEASE_VERSION}."
+
+      - name: Resolve release metadata
+        id: metadata
+        run: |
+          set -euo pipefail
+
+          # The suffix decides the channel, and the channel decides whether this
+          # becomes the download people land on by default.
+          lower="$(printf '%s' "${RELEASE_VERSION}" | tr '[:upper:]' '[:lower:]')"
+          prerelease=false
+          case "${lower}" in
+            *alpha*|*beta*|*rc*) prerelease=true ;;
+          esac
+          if [[ "${prerelease}" == "true" ]]; then make_latest=false; else make_latest=true; fi
+
+          notes_file=""
+          for candidate in "release_notes/${RELEASE_VERSION}.md" "release_notes/${TAG_NAME}.md"; do
+            if [[ -f "${candidate}" ]]; then notes_file="${candidate}"; break; fi
+          done
+          if [[ -z "${notes_file}" ]]; then
+            echo "::error::No release notes at release_notes/${RELEASE_VERSION}.md"
+            exit 1
+          fi
+
+          {
+            echo "prerelease=${prerelease}"
+            echo "make_latest=${make_latest}"
+            echo "notes_file=${notes_file}"
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: Download CLI artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: scry-*
+          path: artifacts
+
+      # Three archives, not one, because they have three different audiences.
+      # `scry.exe` alone is what a host application vendors — it has no use for
+      # the IL2CPP converter or the test cavia, and shipping them inside its
+      # installer would be dead weight. Archives are flat so a consumer's
+      # extract-and-use path does not embed the version number in a directory.
+      - name: Package release archives
+        run: |
+          set -euo pipefail
+          root="${PWD}"
+          mkdir -p dist
+
+          package() {
+            local zip_name="$1"; shift
+            local stage
+            stage="$(mktemp -d)"
+            for file in "$@"; do
+              [[ -e "${file}" ]] || { echo "::error::missing ${file}"; exit 1; }
+              cp "${file}" "${stage}/"
+            done
+            ( cd "${stage}" && zip -qrj "${root}/dist/${zip_name}" . )
+            rm -rf "${stage}"
+            echo "packaged ${zip_name}"
+          }
+
+          for target in x86_64-pc-windows-msvc i686-pc-windows-msvc; do
+            package "scry-${RELEASE_VERSION}-${target}.zip" \
+              "artifacts/scry-${target}/scry.exe" README.md
+          done
+
+          # Authoring tooling: 64-bit only — it is an offline aid run on a
+          # developer's own box, not something a 32-bit target implies.
+          package "scry-tools-${RELEASE_VERSION}-x86_64-pc-windows-msvc.zip" \
+            artifacts/scry-x86_64-pc-windows-msvc/il2cpp2scry.exe \
+            artifacts/scry-x86_64-pc-windows-msvc/cavia.exe \
+            docs/authoring-profiles.md docs/authoring-il2cpp.md
+
+          ( cd dist && sha256sum -- *.zip > SHA256SUMS && cat SHA256SUMS )
+
+      # Idempotent on purpose: create the release if it is new, update it if a
+      # previous attempt got part-way, and replace the assets either way. A
+      # re-run after a failure converges instead of duplicating.
+      - name: Create or update the GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_COMMIT: ${{ needs.release-candidate.outputs.release_commit }}
+          MAKE_LATEST: ${{ steps.metadata.outputs.make_latest }}
+          NOTES_FILE: ${{ steps.metadata.outputs.notes_file }}
+          PRERELEASE: ${{ steps.metadata.outputs.prerelease }}
+        run: |
+          set -euo pipefail
+
+          payload="$(
+            jq -n \
+              --arg tag_name "${TAG_NAME}" \
+              --arg target_commitish "${RELEASE_COMMIT}" \
+              --arg name "v${RELEASE_VERSION}" \
+              --rawfile body "${NOTES_FILE}" \
+              --argjson prerelease "${PRERELEASE}" \
+              --arg make_latest "${MAKE_LATEST}" \
+              '{ tag_name: $tag_name, target_commitish: $target_commitish, name: $name,
+                 body: $body, draft: false, prerelease: $prerelease, make_latest: $make_latest }'
+          )"
+
+          release_id="$(
+            gh api --paginate "repos/${GITHUB_REPOSITORY}/releases" \
+              --jq ".[] | select(.tag_name == \"${TAG_NAME}\") | .id" | head -n 1
+          )"
+
+          if [[ -n "${release_id}" ]]; then
+            release_json="$(gh api --method PATCH \
+              "repos/${GITHUB_REPOSITORY}/releases/${release_id}" --input - <<< "${payload}")"
+          else
+            release_json="$(gh api --method POST \
+              "repos/${GITHUB_REPOSITORY}/releases" --input - <<< "${payload}")"
+          fi
+
+          release_id="$(jq -r '.id // empty' <<< "${release_json}")"
+          upload_url="$(jq -r '.upload_url // "" | split("{")[0]' <<< "${release_json}")"
+          release_url="$(jq -r '.html_url // empty' <<< "${release_json}")"
+          if [[ -z "${release_id}" || -z "${upload_url}" ]]; then
+            echo "::error::Failed to resolve the release for ${TAG_NAME}."
+            exit 1
+          fi
+
+          # Clear stale assets first, so a re-run cannot leave a mix of old and
+          # new binaries hanging off the same release.
+          gh api "repos/${GITHUB_REPOSITORY}/releases/${release_id}/assets" --jq '.[].id' |
+            while IFS= read -r asset_id; do
+              [[ -z "${asset_id}" ]] && continue
+              gh api --method DELETE "repos/${GITHUB_REPOSITORY}/releases/assets/${asset_id}" >/dev/null
+            done
+
+          for asset in dist/*; do
+            [[ -f "${asset}" ]] || continue
+            name="$(basename "${asset}")"
+            gh api --method POST "${upload_url}?name=$(jq -rn --arg n "${name}" '$n|@uri')" \
+              -H "Content-Type: application/octet-stream" --input "${asset}" >/dev/null
+            echo "uploaded ${name}"
+          done
+
+          echo "### Released [v${RELEASE_VERSION}](${release_url})" >> "${GITHUB_STEP_SUMMARY}"
