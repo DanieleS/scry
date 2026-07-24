@@ -118,8 +118,70 @@ scry watch --process SeaOfStars.exe --profile seaofstars.json --no-resolve # HP 
   single-player game you can also just **pin the game version** (disable
   auto-update) so nothing moves until you choose.
 
-## Beyond single values
+## Strings
 
-Party/enemy **lists** need iteration — expressed as a data-driven *collection*
-watch (base + count + stride + per-element chain), not a scripting engine. See
-[#15](https://github.com/DanieleS/scry/issues/15).
+A `string` value type reads an IL2CPP `System.String`. C# strings are reference
+types, so the chain resolves to the **slot that holds the string reference** (the
+field itself) — the engine follows the pointer and decodes the object: a 32-bit
+length at `+0x10`, UTF-16 payload at `+0x14`, capped so a garbage length can't
+run away. A null reference reads as `""` (honest empty), not `unavailable`.
+
+```json
+{ "tier": "tier1", "name": "hero",
+  "offsets": ["0x1A2B3C", "0x38"], "type": "string" }
+```
+
+The last offset lands on the reference field (Sea of Stars: the character's
+`CharacterDefinitionId` string at `+0x38`); don't add a trailing deref for it —
+the `string` type does that itself.
+
+## Collections (lists & arrays)
+
+Party/enemy **lists** need iteration. Rather than a scripting engine, a
+`collection` watch expresses it as **data** — a base chain to the container, a
+`count`, a `stride`, and a per-element chain — and emits an ordered array that
+diffs like any other value. It stays structurally read-only and zero-dependency.
+
+Fields:
+
+| field | meaning |
+|---|---|
+| `base` | how to reach the container — a nested `{ "tier": "tier1"/"tier2", … }`, same shapes as a scalar watch, whose `offsets` end at the list object / array |
+| `count` | chain from the container to the 32-bit element count (clamped to `max`) |
+| `items` | *optional* chain to the backing-array **pointer** (dereferenced); omit it when the elements live at the container itself (a bare pointer array) |
+| `first` | byte offset to element 0 within the element region (an array header); default `0` |
+| `stride` | bytes between consecutive elements (a pointer array → `8`) |
+| `element` | per-element chain from a slot to the value; empty means the slot *is* the value's address |
+| `type` | element type (`i32` … or `string`) |
+| `max` | hard cap — a garbage count can neither allocate nor loop unboundedly |
+
+The C# `List<T>` shape (validated against Sea of Stars — `items` at `+0x10`,
+`count` at `+0x18`, array header `0x20`, pointer stride `8`) reading the party
+roster as an ordered list of names:
+
+```json
+{ "tier": "collection", "name": "party_roster",
+  "base": { "tier": "tier1", "module": "GameAssembly.dll",
+            "offsets": ["0x38BB238", 0] },
+  "count": ["0x18"], "items": ["0x10"], "first": "0x20", "stride": 8,
+  "element": [], "type": "string", "max": 16 }
+```
+
+A bare pointer array (an "enemy HP list" of entity pointers), with the count read
+from the container and each element's HP reached through the entity:
+
+```json
+{ "tier": "collection", "name": "enemy_hp",
+  "base": { "tier": "tier2", "anchor": "48 8B 05 ?? ?? ?? ?? …",
+            "rip": { "disp": 3, "len": 7 }, "offsets": [0] },
+  "count": [16], "stride": 8, "element": ["0x0", "0x58"], "type": "i32", "max": 64 }
+```
+
+Per-element resolution is **fail-soft**: a broken element is `unavailable` in
+place without sinking the list. A base/count/items failure makes the whole watch
+`unavailable` — the list can't be sized or located, so there is nothing honest to
+emit.
+
+The IL2CPP converter (`docs/authoring-il2cpp.md`) speaks the same shape with
+`Class::field` names in every chain, so the fragile offsets are derived from a
+dump rather than hand-counted.

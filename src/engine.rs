@@ -52,19 +52,31 @@ use std::time::{Duration, Instant};
 
 use crate::aob;
 use crate::backend::MemoryBackend;
-use crate::profile::{Profile, Rip, ValueType, Watch};
+use crate::profile::{Base, Profile, Rip, ValueType, Watch};
 
 /// A single sampled value — or the honest absence of one.
 ///
 /// `Unavailable` is a first-class state, not an error: it means "this watch
 /// could not be read this tick", and it diffs like any other value, so a
 /// consumer learns the moment a field goes dark (and the moment it comes back).
-#[derive(Debug, Clone, Copy, PartialEq)]
+///
+/// Not `Copy`: [`Str`](Value::Str) and [`List`](Value::List) own heap data. The
+/// engine clones a value only when it actually changes, so the cost lands on
+/// real diffs, not on every quiet tick.
+#[derive(Debug, Clone, PartialEq)]
 pub enum Value {
     I32(i32),
     U32(u32),
     F32(f32),
     U64(u64),
+    /// A decoded string (an IL2CPP `System.String`). A null reference reads as
+    /// the empty string, not `Unavailable`.
+    Str(String),
+    /// A [collection](crate::profile::Watch::Collection) sampled into an ordered
+    /// array. Each element is itself a `Value`, so a broken element shows up as a
+    /// nested [`Unavailable`](Value::Unavailable) without sinking the list, and
+    /// the whole array diffs by equality like any scalar.
+    List(Vec<Value>),
     /// The watch's chain could not be resolved or read this tick. The fail-soft
     /// state — never a stale or garbage number passed off as a live reading.
     Unavailable,
@@ -116,12 +128,33 @@ enum AnchorKind {
     Invalid,
 }
 
+/// What a watch does once its anchor is resolved: read one typed value, or
+/// iterate a container into an array. The per-tier difference (how the anchor is
+/// *found*) lives in [`AnchorKind`]; this is the per-*kind* difference (what is
+/// read once we have it).
+enum Reader {
+    /// A scalar [`Watch::Tier1`]/[`Watch::Tier2`]: walk `offsets` from the anchor
+    /// and read one `ty` value.
+    Scalar { offsets: Vec<i64>, ty: ValueType },
+    /// A [`Watch::Collection`]: walk `base` from the anchor to the container,
+    /// then iterate. Field meaning mirrors [`Watch::Collection`].
+    Collection {
+        base: Vec<i64>,
+        count: Vec<i64>,
+        items: Option<Vec<i64>>,
+        first: i64,
+        stride: i64,
+        element: Vec<i64>,
+        ty: ValueType,
+        max: usize,
+    },
+}
+
 /// A watch reduced to what the loop needs each tick, plus its schedule state.
 struct Scheduled {
     name: String,
     kind: AnchorKind,
-    offsets: Vec<i64>,
-    ty: ValueType,
+    reader: Reader,
     /// Minimum time between samples (`1 / rate_hz`); `ZERO` means every tick.
     period: Duration,
     /// Cached anchor, resolved at attach; `None` when it couldn't be found, in
@@ -129,6 +162,16 @@ struct Scheduled {
     anchor: Option<u64>,
     /// Elapsed time at/after which this watch is due to sample again.
     next_due: Duration,
+}
+
+/// Parse a Tier-2 signature into an [`AnchorKind`], recording an unparseable one
+/// as [`AnchorKind::Invalid`] so it fails soft for the session's life rather
+/// than re-erroring every tick.
+fn signature_kind(anchor: &str, rip: Option<Rip>) -> AnchorKind {
+    match aob::parse_pattern(anchor) {
+        Ok(pattern) => AnchorKind::Signature { pattern, rip },
+        Err(_) => AnchorKind::Invalid,
+    }
 }
 
 /// Convert an optional rate into a minimum sampling period. A missing or
@@ -159,25 +202,84 @@ fn resolve_anchor<B: MemoryBackend + ?Sized>(backend: &B, kind: &AnchorKind) -> 
     }
 }
 
-/// Sample one watch: walk its chain from the cached anchor and read the typed
-/// value. Every failure path returns `Unavailable`, never a partial or guessed
-/// number.
+/// Read one typed value at an already-resolved address. Every read failure
+/// becomes `Unavailable`, never a partial or guessed number.
+fn read_typed<B: MemoryBackend + ?Sized>(backend: &B, addr: u64, ty: ValueType) -> Value {
+    let read = match ty {
+        ValueType::I32 => backend.read_i32(addr).map(Value::I32),
+        ValueType::U32 => backend.read_u32(addr).map(Value::U32),
+        ValueType::F32 => backend.read_f32(addr).map(Value::F32),
+        ValueType::U64 => backend.read_u64(addr).map(Value::U64),
+        ValueType::String => backend.read_string(addr).map(Value::Str),
+    };
+    read.unwrap_or(Value::Unavailable)
+}
+
+/// Sample one watch from its cached anchor. A scalar walks its chain and reads
+/// one value; a collection iterates its container. Every failure path returns
+/// `Unavailable` (or, per element, a nested `Unavailable`) — never a guess.
 fn sample_one<B: MemoryBackend + ?Sized>(backend: &B, w: &Scheduled) -> Value {
     let anchor = match w.anchor {
         Some(a) => a,
         None => return Value::Unavailable,
     };
-    let addr = match backend.resolve(anchor, &w.offsets) {
-        Ok(a) => a,
-        Err(_) => return Value::Unavailable,
-    };
-    let read = match w.ty {
-        ValueType::I32 => backend.read_i32(addr).map(Value::I32),
-        ValueType::U32 => backend.read_u32(addr).map(Value::U32),
-        ValueType::F32 => backend.read_f32(addr).map(Value::F32),
-        ValueType::U64 => backend.read_u64(addr).map(Value::U64),
-    };
-    read.unwrap_or(Value::Unavailable)
+    match &w.reader {
+        Reader::Scalar { offsets, ty } => match backend.resolve(anchor, offsets) {
+            Ok(addr) => read_typed(backend, addr, *ty),
+            Err(_) => Value::Unavailable,
+        },
+        Reader::Collection {
+            base,
+            count,
+            items,
+            first,
+            stride,
+            element,
+            ty,
+            max,
+        } => {
+            // Reach the container. A base that no longer resolves makes the whole
+            // watch unavailable — there is nothing to iterate.
+            let container = match backend.resolve(anchor, base) {
+                Ok(a) => a,
+                Err(_) => return Value::Unavailable,
+            };
+            // Size the list. If the count can't be read we can't know how many
+            // elements to walk, so the whole watch is unavailable (a per-element
+            // failure is different — that stays local to the element).
+            let n = match backend
+                .resolve(container, count)
+                .and_then(|a| backend.read_i32(a))
+            {
+                Ok(raw) => (raw.max(0) as usize).min(*max),
+                Err(_) => return Value::Unavailable,
+            };
+            // Find the element region: the backing array an `items` chain points
+            // at (dereferenced), or the container itself for a bare pointer array.
+            let region = match items {
+                Some(items) => match backend
+                    .resolve(container, items)
+                    .and_then(|a| backend.read_ptr(a))
+                {
+                    Ok(array) => array,
+                    Err(_) => return Value::Unavailable,
+                },
+                None => container,
+            };
+            let mut out = Vec::with_capacity(n);
+            for i in 0..n {
+                let slot = region
+                    .wrapping_add(*first as u64)
+                    .wrapping_add((i as u64).wrapping_mul(*stride as u64));
+                let value = match backend.resolve(slot, element) {
+                    Ok(addr) => read_typed(backend, addr, *ty),
+                    Err(_) => Value::Unavailable,
+                };
+                out.push(value);
+            }
+            Value::List(out)
+        }
+    }
 }
 
 /// A live watch over a target process: attach once, poll repeatedly.
@@ -202,7 +304,7 @@ impl<B: MemoryBackend> Session<B> {
     pub fn attach(backend: B, profile: &Profile, config: Config) -> Self {
         let mut watches = Vec::with_capacity(profile.watches.len());
         for w in &profile.watches {
-            let (name, kind, offsets, ty, rate_hz) = match w {
+            let (name, kind, reader, rate_hz) = match w {
                 Watch::Tier1 {
                     name,
                     module,
@@ -212,8 +314,10 @@ impl<B: MemoryBackend> Session<B> {
                 } => (
                     name.clone(),
                     AnchorKind::Module(module.clone()),
-                    offsets.clone(),
-                    *ty,
+                    Reader::Scalar {
+                        offsets: offsets.clone(),
+                        ty: *ty,
+                    },
                     *rate_hz,
                 ),
                 Watch::Tier2 {
@@ -223,22 +327,64 @@ impl<B: MemoryBackend> Session<B> {
                     offsets,
                     ty,
                     rate_hz,
-                } => {
+                } => (
+                    name.clone(),
                     // Parse the signature once. A malformed signature can never
                     // resolve, so record that rather than re-failing every tick.
-                    let kind = match aob::parse_pattern(anchor) {
-                        Ok(pattern) => AnchorKind::Signature { pattern, rip: *rip },
-                        Err(_) => AnchorKind::Invalid,
+                    signature_kind(anchor, *rip),
+                    Reader::Scalar {
+                        offsets: offsets.clone(),
+                        ty: *ty,
+                    },
+                    *rate_hz,
+                ),
+                Watch::Collection {
+                    name,
+                    base,
+                    count,
+                    items,
+                    first,
+                    stride,
+                    element,
+                    ty,
+                    max,
+                    rate_hz,
+                } => {
+                    // A collection's base is anchored exactly like a scalar
+                    // watch; only its `offsets` reach the container rather than a
+                    // value. Everything after the base is the iteration recipe.
+                    let (kind, base_offsets) = match base {
+                        Base::Tier1 { module, offsets } => {
+                            (AnchorKind::Module(module.clone()), offsets.clone())
+                        }
+                        Base::Tier2 {
+                            anchor,
+                            rip,
+                            offsets,
+                        } => (signature_kind(anchor, *rip), offsets.clone()),
                     };
-                    (name.clone(), kind, offsets.clone(), *ty, *rate_hz)
+                    (
+                        name.clone(),
+                        kind,
+                        Reader::Collection {
+                            base: base_offsets,
+                            count: count.clone(),
+                            items: items.clone(),
+                            first: *first,
+                            stride: *stride,
+                            element: element.clone(),
+                            ty: *ty,
+                            max: *max,
+                        },
+                        *rate_hz,
+                    )
                 }
             };
             let anchor = resolve_anchor(&backend, &kind);
             watches.push(Scheduled {
                 name,
                 kind,
-                offsets,
-                ty,
+                reader,
                 period: period_of(rate_hz),
                 anchor,
                 next_due: Duration::ZERO,
@@ -279,10 +425,11 @@ impl<B: MemoryBackend> Session<B> {
             }
 
             // Emit only genuine changes. A first sighting (no prior value) always
-            // counts as a change, including a first-seen `Unavailable`.
+            // counts as a change, including a first-seen `Unavailable`. The clone
+            // lands only on an actual change — a quiet tick copies nothing.
             let changed = self.last.get(&w.name) != Some(&value);
             if changed {
-                self.last.insert(w.name.clone(), value);
+                self.last.insert(w.name.clone(), value.clone());
                 diff.insert(w.name.clone(), value);
             }
         }
@@ -619,7 +766,7 @@ mod tests {
         let mut recovered = None;
         for i in 3..40u64 {
             if let Some(v) = s.poll(Duration::from_millis(i * 50)).get("hp") {
-                recovered = Some(*v);
+                recovered = Some(v.clone());
                 break;
             }
         }
@@ -775,6 +922,190 @@ mod tests {
             s.poll(Duration::ZERO).get("marker"),
             Some(&Value::U32(0x1122_3344)),
             "a rip-less Tier-2 watch must anchor at the match address"
+        );
+    }
+
+    /// Lay out a C#-`List<T>`-shaped container in a `Fake`, returning the watch
+    /// that reads it. Container at 0x100 (items ptr @+0, count @+8); backing
+    /// array at 0x200 with a 0x20 header then `stride`-8 pointer slots; each slot
+    /// points at a 4-byte element. `hps` supplies both the element values and the
+    /// stored count.
+    fn plant_collection(fake: &Fake, hps: &[i32]) {
+        let base = fake.base;
+        fake.write_u64(0x100, base + 0x200); // items -> backing array
+        fake.write_i32(0x108, hps.len() as i32); // count
+        for (i, &hp) in hps.iter().enumerate() {
+            let elem_off = 0x300 + i * 0x40;
+            fake.write_u64(0x220 + i * 8, base + elem_off as u64); // slot -> element
+            fake.write_i32(elem_off, hp);
+        }
+    }
+
+    fn i32_collection_watch(name: &str, max: usize) -> Watch {
+        Watch::Collection {
+            name: name.to_string(),
+            base: Base::Tier1 {
+                module: "fake".to_string(),
+                offsets: vec![0x100],
+            },
+            count: vec![0x8],
+            items: Some(vec![0x0]),
+            first: 0x20,
+            stride: 8,
+            element: vec![0, 0], // slot -> deref -> element base
+            ty: ValueType::I32,
+            max,
+            rate_hz: None,
+        }
+    }
+
+    #[test]
+    fn collection_reads_an_ordered_typed_array() {
+        let fake = Rc::new(Fake::new(0x600));
+        plant_collection(&fake, &[11, 22, 33]);
+        let profile = Profile {
+            label: None,
+            match_: ident(),
+            watches: vec![i32_collection_watch("enemy_hp", 64)],
+        };
+        let mut s = Session::attach(Rc::clone(&fake), &profile, Config::default());
+
+        let d = s.poll(Duration::ZERO);
+        assert_eq!(
+            d.get("enemy_hp"),
+            Some(&Value::List(vec![
+                Value::I32(11),
+                Value::I32(22),
+                Value::I32(33)
+            ])),
+            "a collection must emit its elements in order"
+        );
+        // Unchanged list -> quiet tick.
+        assert!(s.poll(Duration::from_millis(50)).is_empty());
+
+        // Mutate one element from the outside; the whole array re-diffs, once.
+        fake.write_i32(0x340, 99);
+        let d = s.poll(Duration::from_millis(100));
+        assert_eq!(
+            d.get("enemy_hp"),
+            Some(&Value::List(vec![
+                Value::I32(11),
+                Value::I32(99),
+                Value::I32(33)
+            ]))
+        );
+    }
+
+    #[test]
+    fn collection_count_is_clamped_to_max() {
+        // A bogus count (here a truthful 3, but max is 2) can never walk past the
+        // cap — the guard against a garbage count looping unboundedly.
+        let fake = Rc::new(Fake::new(0x600));
+        plant_collection(&fake, &[11, 22, 33]);
+        let profile = Profile {
+            label: None,
+            match_: ident(),
+            watches: vec![i32_collection_watch("capped", 2)],
+        };
+        let mut s = Session::attach(Rc::clone(&fake), &profile, Config::default());
+        assert_eq!(
+            s.poll(Duration::ZERO).get("capped"),
+            Some(&Value::List(vec![Value::I32(11), Value::I32(22)])),
+            "count must be clamped to max"
+        );
+    }
+
+    #[test]
+    fn collection_element_fails_soft_without_sinking_the_list() {
+        let fake = Rc::new(Fake::new(0x600));
+        plant_collection(&fake, &[11, 22, 33]);
+        // Point the middle slot at an unmapped address: its element must read as
+        // a nested Unavailable while its neighbours stay live.
+        fake.write_u64(0x228, 0xdead_0000);
+        let profile = Profile {
+            label: None,
+            match_: ident(),
+            watches: vec![i32_collection_watch("enemy_hp", 64)],
+        };
+        let mut s = Session::attach(Rc::clone(&fake), &profile, Config::default());
+        assert_eq!(
+            s.poll(Duration::ZERO).get("enemy_hp"),
+            Some(&Value::List(vec![
+                Value::I32(11),
+                Value::Unavailable,
+                Value::I32(33)
+            ])),
+            "a broken element is Unavailable in place, never sinking the list"
+        );
+    }
+
+    #[test]
+    fn collection_unreadable_count_is_wholly_unavailable() {
+        // No memory planted: the count read fails, so the list can't be sized and
+        // the whole watch is Unavailable (not an empty list, which would be a lie).
+        let fake = Rc::new(Fake::new(0x10));
+        let profile = Profile {
+            label: None,
+            match_: ident(),
+            watches: vec![i32_collection_watch("enemy_hp", 64)],
+        };
+        let mut s = Session::attach(Rc::clone(&fake), &profile, Config::default());
+        assert_eq!(
+            s.poll(Duration::ZERO).get("enemy_hp"),
+            Some(&Value::Unavailable)
+        );
+    }
+
+    #[test]
+    fn reads_an_il2cpp_string_value() {
+        // Plant a System.String object (len @+0x10, utf16 @+0x14) at 0x40 and a
+        // slot at 0x10 holding a reference to it — the shape a string field takes.
+        let fake = Rc::new(Fake::new(0x100));
+        let base = fake.base;
+        fake.write_u64(0x10, base + 0x40); // slot -> string object
+        fake.write_i32(0x50, 4); // object+0x10 = length
+        let utf16: Vec<u8> = "ZALE".encode_utf16().flat_map(u16::to_le_bytes).collect();
+        fake.write_bytes(0x54, &utf16); // object+0x14 = payload
+
+        let profile = Profile {
+            label: None,
+            match_: ident(),
+            watches: vec![Watch::Tier1 {
+                name: "name".to_string(),
+                module: "fake".to_string(),
+                offsets: vec![0x10], // resolve to the reference slot; read_string derefs
+                ty: ValueType::String,
+                rate_hz: None,
+            }],
+        };
+        let mut s = Session::attach(Rc::clone(&fake), &profile, Config::default());
+        assert_eq!(
+            s.poll(Duration::ZERO).get("name"),
+            Some(&Value::Str("ZALE".to_string())),
+            "a string watch must decode the referenced System.String"
+        );
+    }
+
+    #[test]
+    fn null_string_reference_reads_empty_not_unavailable() {
+        let fake = Rc::new(Fake::new(0x100));
+        // Slot at 0x10 holds a null reference (zeroed memory).
+        let profile = Profile {
+            label: None,
+            match_: ident(),
+            watches: vec![Watch::Tier1 {
+                name: "name".to_string(),
+                module: "fake".to_string(),
+                offsets: vec![0x10],
+                ty: ValueType::String,
+                rate_hz: None,
+            }],
+        };
+        let mut s = Session::attach(Rc::clone(&fake), &profile, Config::default());
+        assert_eq!(
+            s.poll(Duration::ZERO).get("name"),
+            Some(&Value::Str(String::new())),
+            "a null string reference is an empty string, not Unavailable"
         );
     }
 

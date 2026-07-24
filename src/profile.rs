@@ -68,6 +68,25 @@ mod hexnum {
     pub fn de_vec_i64<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<i64>, D::Error> {
         Vec::<Repr>::deserialize(d)?.into_iter().map(one).collect()
     }
+
+    /// `deserialize_with` for an *optional* `Vec<i64>` field, so a collection's
+    /// `items` chain accepts hex-or-decimal like every other chain while still
+    /// being omittable. Absent (or `null`) stays `None`.
+    pub fn de_opt_vec_i64<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Vec<i64>>, D::Error> {
+        match Option::<Vec<Repr>>::deserialize(d)? {
+            None => Ok(None),
+            Some(v) => v
+                .into_iter()
+                .map(one)
+                .collect::<Result<Vec<_>, _>>()
+                .map(Some),
+        }
+    }
+}
+
+/// `skip_serializing_if` helper: a zero offset is the default and stays implicit.
+fn is_zero(n: &i64) -> bool {
+    *n == 0
 }
 
 /// The type of a value read from memory. Each variant maps to one of the typed
@@ -79,6 +98,14 @@ pub enum ValueType {
     U32,
     F32,
     U64,
+    /// An IL2CPP `System.String` reached through a reference: the resolved
+    /// address holds a *pointer* to the string object, whose 32-bit length lives
+    /// at `+0x10` and whose UTF-16 payload starts at `+0x14`. Read length is hard
+    /// capped so a garbage length can't drive an unbounded read. This is the one
+    /// value type with an engine-shaped layout baked in — the layout IL2CPP has
+    /// used for years — because a string is the one field a plain offset can't
+    /// describe (its bytes live behind a pointer, at a length the object states).
+    String,
 }
 
 /// A RIP-relative displacement decode, applied to a Tier-2 anchor *before* its
@@ -138,8 +165,40 @@ pub struct Match {
     pub probe: String,
 }
 
-/// One value the engine reads. The two tiers differ only in how the *anchor*
-/// address is found; both then walk `offsets` and read a typed value.
+/// How a [collection](Watch::Collection)'s container is anchored. It is exactly
+/// the two-tier distinction a scalar [`Watch`] draws — a static module base
+/// (Tier-1) or an AOB signature with an optional RIP-relative decode (Tier-2) —
+/// minus the value type: a collection reads *many* elements, so the element type
+/// lives on the collection, not on its base. `offsets` walks from the resolved
+/// anchor to the **container** (the list object / array) the collection iterates.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "tier", rename_all = "lowercase")]
+pub enum Base {
+    /// Tier-1 base: `offsets` starts from `module`'s load base.
+    Tier1 {
+        /// Module whose load base anchors the chain.
+        module: String,
+        /// Pointer chain from the module base to the container.
+        #[serde(deserialize_with = "hexnum::de_vec_i64")]
+        offsets: Vec<i64>,
+    },
+    /// Tier-2 base: `offsets` starts from an AOB match (optionally RIP-decoded).
+    Tier2 {
+        /// AOB signature whose match address anchors the chain.
+        anchor: String,
+        /// Optional RIP-relative decode applied before the chain is walked; see
+        /// [`Rip`]. Absent means the AOB hit is itself the chain start.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rip: Option<Rip>,
+        /// Pointer chain from the anchor address to the container.
+        #[serde(deserialize_with = "hexnum::de_vec_i64")]
+        offsets: Vec<i64>,
+    },
+}
+
+/// One value the engine reads. The two scalar tiers differ only in how the
+/// *anchor* address is found; both then walk `offsets` and read a typed value. A
+/// [`Collection`](Watch::Collection) instead iterates a container into an array.
 ///
 /// `Eq` is intentionally *not* derived: `rate_hz` is a float, and the polling
 /// loop only ever needs `PartialEq` (for the schedule) — never total equality.
@@ -188,6 +247,69 @@ pub enum Watch {
         /// How to interpret the bytes at the resolved address.
         #[serde(rename = "type")]
         ty: ValueType,
+        /// Per-watch sample rate in hertz; see [`Watch::Tier1::rate_hz`].
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rate_hz: Option<f64>,
+    },
+    /// A **collection**: iterate a container (a C# `List<T>`, an array of entity
+    /// pointers, …) into an *array* of typed values, without a scripting engine.
+    /// Iteration is expressed as data — a count, a stride, and per-element chains
+    /// — so the runtime stays structurally read-only and dependency-free.
+    ///
+    /// Resolution each tick: walk [`base`](Watch::Collection::base) to the
+    /// container; read [`count`](Watch::Collection::count) (clamped to
+    /// [`max`](Watch::Collection::max)); find the element region — the array a
+    /// [`items`](Watch::Collection::items) chain points at (dereferenced), or the
+    /// container itself when `items` is absent; then for `i in 0..count` read the
+    /// value reached by [`element`](Watch::Collection::element) from
+    /// `region + first + i*stride`. A broken element is
+    /// [`Unavailable`](crate::engine::Value::Unavailable) without sinking the
+    /// list; a base/count/items failure makes the whole watch unavailable, since
+    /// the list can't be sized or located.
+    Collection {
+        /// Label for the value; the emitted snapshot value is an array.
+        name: String,
+        /// How to reach the container (list object / array). See [`Base`].
+        base: Base,
+        /// Chain from the container to the 32-bit element count. Clamped to
+        /// `max`; a negative count reads as zero.
+        #[serde(deserialize_with = "hexnum::de_vec_i64")]
+        count: Vec<i64>,
+        /// Optional chain from the container to the backing-array *pointer*,
+        /// which is dereferenced to reach the elements (the C# `List<T>` shape:
+        /// `list.items`). Absent means the elements live at the container itself
+        /// (a bare pointer array).
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "hexnum::de_opt_vec_i64"
+        )]
+        items: Option<Vec<i64>>,
+        /// Byte offset from the element region to element 0 — e.g. an IL2CPP
+        /// array's header before its first slot. Defaults to 0.
+        #[serde(
+            default,
+            skip_serializing_if = "is_zero",
+            deserialize_with = "hexnum::de_i64"
+        )]
+        first: i64,
+        /// Bytes between consecutive elements (a pointer array → 8).
+        #[serde(deserialize_with = "hexnum::de_i64")]
+        stride: i64,
+        /// Per-element chain from an element slot to the value's address. Empty
+        /// means the slot *is* the value's address.
+        #[serde(
+            default,
+            skip_serializing_if = "Vec::is_empty",
+            deserialize_with = "hexnum::de_vec_i64"
+        )]
+        element: Vec<i64>,
+        /// How to interpret each element's bytes.
+        #[serde(rename = "type")]
+        ty: ValueType,
+        /// Hard cap on the element count — a garbage count can neither allocate
+        /// nor loop unboundedly.
+        max: usize,
         /// Per-watch sample rate in hertz; see [`Watch::Tier1::rate_hz`].
         #[serde(default, skip_serializing_if = "Option::is_none")]
         rate_hz: Option<f64>,
@@ -403,6 +525,89 @@ mod tests {
         }
         "#;
         assert!(Profile::from_json(json).is_err());
+    }
+
+    #[test]
+    fn collection_watch_deserializes_and_round_trips() {
+        // The C# `List<T>` shape from issue #18: a Tier-1 base into the list
+        // object, count and items chains off it, a header-offset `first`, a
+        // pointer stride, and a per-element chain — emitting strings.
+        let json = r#"
+        {
+          "match": { "process": "g.exe", "module": "GameAssembly.dll", "probe": "90 90" },
+          "watches": [
+            { "tier": "collection", "name": "party_roster",
+              "base": { "tier": "tier1", "module": "GameAssembly.dll", "offsets": ["0x38BB238", 0] },
+              "count": ["0x18"], "items": ["0x10"], "first": "0x20", "stride": 8,
+              "element": [0], "type": "string", "max": 16, "rate_hz": 4.0 }
+          ]
+        }
+        "#;
+        let p = Profile::from_json(json).expect("parse");
+        assert_eq!(
+            p.watches[0],
+            Watch::Collection {
+                name: "party_roster".to_string(),
+                base: Base::Tier1 {
+                    module: "GameAssembly.dll".to_string(),
+                    offsets: vec![0x38BB238, 0],
+                },
+                count: vec![0x18],
+                items: Some(vec![0x10]),
+                first: 0x20,
+                stride: 8,
+                element: vec![0],
+                ty: ValueType::String,
+                max: 16,
+                rate_hz: Some(4.0),
+            }
+        );
+        // Survives a serialize round-trip unchanged.
+        let back = Profile::from_json(&p.to_json().unwrap()).expect("re-parse");
+        assert_eq!(p, back, "collection watch changed across a JSON round-trip");
+    }
+
+    #[test]
+    fn collection_omits_defaulted_fields_when_absent() {
+        // The bare pointer-array shape from issue #15: a Tier-2 base, no `items`
+        // (elements live at the container), `first` defaulting to 0. The absent
+        // fields must not be invented on serialize.
+        let json = r#"
+        {
+          "match": { "process": "g", "module": "g", "probe": "90" },
+          "watches": [
+            { "tier": "collection", "name": "enemy_hp",
+              "base": { "tier": "tier2", "anchor": "48 8B 05 ?? ?? ?? ??",
+                        "rip": { "disp": 3, "len": 7 }, "offsets": [0] },
+              "count": [16], "stride": 8, "element": [0, 88], "type": "i32", "max": 64 }
+          ]
+        }
+        "#;
+        let p = Profile::from_json(json).expect("parse");
+        match &p.watches[0] {
+            Watch::Collection {
+                items,
+                first,
+                base,
+                rate_hz,
+                ..
+            } => {
+                assert_eq!(*items, None);
+                assert_eq!(*first, 0);
+                assert_eq!(*rate_hz, None);
+                assert!(matches!(base, Base::Tier2 { rip: Some(_), .. }));
+            }
+            other => panic!("expected a collection, got {other:?}"),
+        }
+        let out = p.to_json().unwrap();
+        assert!(!out.contains("items"), "absent items must not appear");
+        assert!(
+            !out.contains("\"first\""),
+            "a zero first must stay implicit"
+        );
+        assert!(!out.contains("rate_hz"), "absent rate must stay implicit");
+        // ...and it still round-trips.
+        assert_eq!(Profile::from_json(&out).unwrap(), p);
     }
 
     #[test]

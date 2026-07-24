@@ -41,7 +41,8 @@ above all in its `probe`.
 ### Two tiers of watch
 
 Both tiers walk a pointer chain and read a typed value (`i32`, `u32`, `f32`,
-`u64`). They differ only in how the *anchor* address is found:
+`u64`, or a `string` — an IL2CPP `System.String`, decoded and length-capped).
+They differ only in how the *anchor* address is found:
 
 | | Anchor | Survives |
 |---|---|---|
@@ -65,6 +66,19 @@ base = anchor + len + i32_at(anchor + disp)
 That is the glue that lets a signature-anchored watch reach a real static base
 on x64 (and survive a patch, since the bytes are matched wherever the loader put
 them). Omit `rip` and the AOB hit *is* the chain start, as before.
+
+### Collections
+
+Party and enemy **lists** need iteration, not a single read. A third watch kind,
+`collection`, expresses that as **data** — a `base` chain to the container, a
+`count`, a `stride`, and a per-element chain — and emits an ordered array that
+diffs like any other value. No scripting engine, no new dependency; the runtime
+stays structurally read-only. It reads the C# `List<T>` shape (a `count`, an
+`items` backing-array pointer, a `first` header offset) or a bare pointer array,
+and with `type: string` a single watch yields an ordered party roster like
+`["VALERE", "ZALE", "GARL"]`. A garbage count can't run away — it's clamped to a
+required `max` — and a broken element is `unavailable` in place without sinking
+the list. See [`docs/authoring-profiles.md`](docs/authoring-profiles.md).
 
 ### The resolver — the anti-collision core
 

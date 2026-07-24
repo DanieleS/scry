@@ -17,6 +17,14 @@ pub mod pe;
 
 use crate::error::{Error, Result};
 
+/// Byte offset, within an IL2CPP `System.String` object, of its 32-bit length.
+const STRING_LEN_OFFSET: u64 = 0x10;
+/// Byte offset, within an IL2CPP `System.String` object, of its UTF-16 payload.
+const STRING_CHARS_OFFSET: u64 = 0x14;
+/// Hard cap on UTF-16 code units read for a string — a garbage length can't
+/// drive an unbounded read. 512 units is 1 KiB, ample for any name/label.
+const STRING_MAX_UTF16: usize = 512;
+
 /// A contiguous span of the target's address space.
 #[derive(Debug, Clone, Copy)]
 pub struct Region {
@@ -85,6 +93,37 @@ pub trait MemoryBackend {
                 format!("unsupported pointer size: {other}"),
             ))),
         }
+    }
+
+    /// Read an IL2CPP `System.String` *referenced* at `addr`.
+    ///
+    /// C# strings are reference types, so a pointer-chain that reaches a string
+    /// field lands on the slot **holding a pointer** to the string object, not on
+    /// the object itself. This reads that pointer, then decodes the object: a
+    /// 32-bit length at `+0x10` and the UTF-16 payload at `+0x14`. The length is
+    /// clamped to [`STRING_MAX_UTF16`] so a bogus value can't run away, and the
+    /// bytes are decoded lossily — an invalid unit becomes U+FFFD rather than an
+    /// error, keeping a live read from going dark on one corrupt character.
+    ///
+    /// A null reference is an empty string, not a failure — a party slot with no
+    /// character reads as `""`, which is honest state, not "unavailable".
+    fn read_string(&self, addr: u64) -> Result<String> {
+        let object = self.read_ptr(addr)?;
+        if object == 0 {
+            return Ok(String::new());
+        }
+        let len = self.read_i32(object.wrapping_add(STRING_LEN_OFFSET))?;
+        let units = (len.max(0) as usize).min(STRING_MAX_UTF16);
+        if units == 0 {
+            return Ok(String::new());
+        }
+        let mut bytes = vec![0u8; units * 2];
+        self.read_bytes(object.wrapping_add(STRING_CHARS_OFFSET), &mut bytes)?;
+        let wide: Vec<u16> = bytes
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        Ok(String::from_utf16_lossy(&wide))
     }
 
     /// Decode a RIP-relative reference at `anchor` and return the operand's
