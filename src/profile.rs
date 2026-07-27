@@ -37,6 +37,13 @@ mod hexnum {
         Text(String),
     }
 
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum FloatRepr {
+        Num(f64),
+        Text(String),
+    }
+
     /// Parse a signed decimal or `0x`-prefixed hex integer. Returns `None` on
     /// anything else, which the callers turn into a serde error.
     fn parse(text: &str) -> Option<i64> {
@@ -91,6 +98,23 @@ mod hexnum {
         match Option::<Repr>::deserialize(d)? {
             None => Ok(None),
             Some(r) => one(r).map(Some),
+        }
+    }
+
+    /// `deserialize_with` for an `f64` that accepts the same number-or-hex-string
+    /// forms — a [derived](crate::profile::Expr) watch's `{"const": …}`.
+    ///
+    /// The literal is usually an integer, and often nicer read as the hex a
+    /// disassembler showed, which is exactly what the helpers above are for. But
+    /// the expression language evaluates in `f64`, so a fractional literal is a
+    /// legitimate thing to write and is accepted rather than rejected on a
+    /// technicality.
+    pub fn de_f64<'de, D: Deserializer<'de>>(d: D) -> Result<f64, D::Error> {
+        match FloatRepr::deserialize(d)? {
+            FloatRepr::Num(x) => Ok(x),
+            FloatRepr::Text(s) => parse(&s)
+                .map(|n| n as f64)
+                .ok_or_else(|| de::Error::custom(format!("not a decimal or 0x-hex number: {s:?}"))),
         }
     }
 }
@@ -340,10 +364,222 @@ pub struct Field {
     pub ty: ValueType,
 }
 
+/// One node of a [derived](Watch::Derived) watch's **expression** — a total,
+/// deliberately tiny arithmetic language carried as *data*.
+///
+/// The discipline is the one a [`Collection`](Watch::Collection) already
+/// follows: iteration is expressed as `count`/`stride`/`element` rather than as
+/// a script, and arithmetic is expressed as this tree rather than as an embedded
+/// interpreter. There is no binding, no control flow, no recursion a profile can
+/// author, and every node is total — the worst a malformed expression can do is
+/// evaluate to [`Unavailable`](crate::engine::Value::Unavailable).
+///
+/// **No node touches memory.** Values arrive only through [`Ref`](Expr::Ref)
+/// (another watch's reading this tick) or [`Item`](Expr::Item) (a field of the
+/// current element under an `each`), and by then they are already plain numbers.
+/// That single rule is what stops this from growing into an interpreter, and
+/// what makes the tier engine-agnostic by construction: no offset, no signature
+/// and no [`StringLayout`] appears anywhere below.
+///
+/// Deserialized `#[serde(untagged)]` and discriminated by each node's unique
+/// key, so the JSON reads as the arithmetic it denotes.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum Expr {
+    /// A literal number: `{"const": 6}`. Accepts the hex form every other number
+    /// in a profile does (`{"const": "0x10"}`).
+    Const {
+        /// The literal's value.
+        #[serde(rename = "const", deserialize_with = "hexnum::de_f64")]
+        value: f64,
+    },
+    /// Another watch's value this tick: `{"watch": "hp"}`, optionally narrowed by
+    /// an `index` into a [`List`](crate::engine::Value::List) and/or a `field` of
+    /// a [`Map`](crate::engine::Value::Map) — `{"watch": "characters", "index": 2,
+    /// "field": "base_hp"}` indexes first, then keys.
+    ///
+    /// The referenced watch must be declared **earlier in the array**; that rule
+    /// (checked by [`Profile::validate`]) is the whole cycle-prevention story,
+    /// and it is why evaluation order can simply be declaration order.
+    Ref {
+        /// Name of the watch to read.
+        watch: String,
+        /// Index into a list-valued watch. Out of range is unavailable, never a
+        /// clamped neighbour.
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "hexnum::de_opt_i64"
+        )]
+        index: Option<i64>,
+        /// Field of a record-valued watch (applied after `index`, if both).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        field: Option<String>,
+    },
+    /// A field of the **current element**: `{"item": "base_patk"}`. Only legal
+    /// under an [`each`](Watch::Derived::each) — outside one there is no element,
+    /// and the profile is rejected rather than quietly evaluating to nothing.
+    Item {
+        /// Field name on the element.
+        item: String,
+    },
+    /// Sum of one or more operands.
+    Add {
+        /// The operands; at least one.
+        add: Vec<Expr>,
+    },
+    /// Product of one or more operands.
+    Mul {
+        /// The operands; at least one.
+        mul: Vec<Expr>,
+    },
+    /// `a - b`.
+    Sub {
+        /// Exactly two operands.
+        sub: Vec<Expr>,
+    },
+    /// `a / b`. A zero divisor is unavailable, never an infinity.
+    Div {
+        /// Exactly two operands.
+        div: Vec<Expr>,
+    },
+    /// The smaller of some operands, **or** the smallest element of a list — see
+    /// [`Extremum`] for why one key carries both.
+    Min {
+        /// An array (n-ary) or an object (fold).
+        min: Extremum,
+    },
+    /// The larger of some operands, **or** the largest element of a list.
+    Max {
+        /// An array (n-ary) or an object (fold).
+        max: Extremum,
+    },
+    /// Σ over a list watch: `{"sum": {"watch": "characters", "field": "hp"}}`.
+    ///
+    /// An empty or fully-filtered sum is `0` — "nothing matched" is a real
+    /// answer — but an unreadable element *inside* the summed range makes the
+    /// whole sum unavailable, because skipping it would quietly under-report.
+    Sum {
+        /// What to sum. See [`Fold`].
+        sum: Fold,
+    },
+    /// How many elements of a list watch match: `{"count": {"watch": "enemies",
+    /// "where": [{"field": "hp", "gt": 0}]}}`. Counting needs no value, so a
+    /// [`field`](Fold::field) is ignored here.
+    Count {
+        /// What to count. See [`Fold`].
+        count: Fold,
+    },
+}
+
+/// The two shapes `min`/`max` accept, discriminated by JSON type.
+///
+/// Both are common and the two JSON types can never collide, so one key carries
+/// both rather than inventing `min_of`/`min_over` names an author has to
+/// remember: an **array** is n-ary over operands
+/// (`{"max": [{"const": 0}, {"watch": "hp"}]}` clamps at zero), an **object** is
+/// a fold over a list (`{"max": {"watch": "enemies", "field": "hp"}}`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum Extremum {
+    /// The n-ary form: the extremum of these operands. At least one.
+    Nary(Vec<Expr>),
+    /// The fold form: the extremum over a list watch's elements. Unlike a
+    /// [`Sum`](Expr::Sum), an empty or fully-filtered fold is *unavailable* —
+    /// there is no neutral element to return honestly.
+    Fold(Fold),
+}
+
+/// A fold over a list-valued watch: which list, which field of each element,
+/// how many elements, and which of them count.
+///
+/// [`field`](Fold::field), [`take`](Fold::take) and [`clauses`](Fold::clauses)
+/// are each optional; `field` is required when the elements are records and
+/// omitted when they are scalars.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Fold {
+    /// Name of the list-valued watch to fold, declared **earlier in the array**
+    /// exactly like any other [`Ref`](Expr::Ref).
+    pub watch: String,
+    /// Field to read off each element. Omitted when the elements are scalars.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub field: Option<String>,
+    /// How many elements from the front to consider, itself an expression (a
+    /// party's level, say). Clamped to `[0, len]`; a negative or unavailable
+    /// `take` makes the fold unavailable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub take: Option<Box<Expr>>,
+    /// Filter clauses, **all** of which must hold (an implicit AND). Named
+    /// `where` on the wire, which is a Rust keyword.
+    ///
+    /// Filtering is not decoration: heterogeneous lists are the norm. A gear
+    /// modifier list is polymorphic, and an entry of the wrong kind reads its
+    /// neighbours' bytes as a number — without a clause on the type tag the sum
+    /// silently produces garbage. The predicate compares a field against a
+    /// literal and does not care where the discriminant came from; reaching it is
+    /// the profile's job, exactly as for every other field.
+    #[serde(rename = "where", default, skip_serializing_if = "Vec::is_empty")]
+    pub clauses: Vec<Clause>,
+}
+
+/// One filter clause: a field of the element compared against a literal.
+///
+/// Deliberately flat — no nesting, no boolean algebra, no `or`. A profile that
+/// genuinely needs `or` is a signal to reconsider the profile, not to grow the
+/// language.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Clause {
+    /// Field of the element to test.
+    pub field: String,
+    /// The comparison, flattened so a clause reads `{"field": "stat", "eq": 0}`
+    /// rather than nesting an operator object.
+    #[serde(flatten)]
+    pub test: Compare,
+}
+
+/// The comparison a [`Clause`] applies, named by its JSON key.
+///
+/// Numbers compare numerically; strings compare only under `eq`/`ne`, because
+/// an ordering on text would be a collation policy the engine has no business
+/// having an opinion about.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Compare {
+    /// Equal to the literal.
+    Eq(Literal),
+    /// Not equal to the literal.
+    Ne(Literal),
+    /// Strictly less than the literal (numbers only).
+    Lt(Literal),
+    /// Less than or equal to the literal (numbers only).
+    Le(Literal),
+    /// Strictly greater than the literal (numbers only).
+    Gt(Literal),
+    /// Greater than or equal to the literal (numbers only).
+    Ge(Literal),
+}
+
+/// The right-hand side of a [`Clause`]: a bare JSON number or string.
+///
+/// No hex-string form here, unlike every offset in a profile: a clause's operand
+/// is genuinely sometimes text (`"eq": "PlayerAddStatModifier"`), and quietly
+/// reinterpreting a string as a number would make the two indistinguishable.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum Literal {
+    /// A number, compared numerically against the field's reading.
+    Num(f64),
+    /// A string, compared for identity against a
+    /// [`Str`](crate::engine::Value::Str) reading.
+    Text(String),
+}
+
 /// One value the engine reads. The two scalar tiers differ only in how the
 /// *anchor* address is found; both then walk `offsets` and read a typed value. A
 /// [`Collection`](Watch::Collection) instead iterates a container into an array,
-/// and a [`Record`](Watch::Record) reads named fields off a shared base.
+/// and a [`Record`](Watch::Record) reads named fields off a shared base. A
+/// [`Derived`](Watch::Derived) watch reads no memory at all — it folds values the
+/// others already produced.
 ///
 /// `Eq` is intentionally *not* derived: `rate_hz` is a float, and the polling
 /// loop only ever needs `PartialEq` (for the schedule) — never total equality.
@@ -504,6 +740,51 @@ pub enum Watch {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         rate_hz: Option<f64>,
     },
+    /// A **derived** value: arithmetic over what other watches already read.
+    ///
+    /// Games routinely *compute* the numbers a player sees instead of storing
+    /// them, and the arithmetic is usually trivial while the plumbing to reach
+    /// its inputs is not. Percent of max, a party total, an effective stat that
+    /// is base plus equipment, a count of living enemies — each is one
+    /// expression over values scry can already read, and without this tier every
+    /// consumer re-implements it.
+    ///
+    /// **A derived watch never touches memory.** It reads only the values of
+    /// other watches in the current tick, which is what keeps the tier from
+    /// growing into an embedded interpreter and makes the failure story trivial:
+    /// any unavailable input yields an unavailable output. It is also what makes
+    /// it *engine-agnostic by construction* — everything engine-specific in scry
+    /// lives in offsets, signatures and [`StringLayout`], and by the time a value
+    /// reaches here it is just a number, a string, a list or a map.
+    ///
+    /// The whole expression is evaluated in `f64` and then coerced to
+    /// [`ty`](Watch::Derived::ty): integer types truncate toward zero, and a
+    /// non-finite result — or one outside the target's range — is
+    /// [`Unavailable`](crate::engine::Value::Unavailable) rather than a saturated
+    /// number, which would be a lie.
+    Derived {
+        /// Label for the value.
+        name: String,
+        /// The output type. **Never a string**: this is an arithmetic result, and
+        /// [`Profile::validate`] rejects a string type rather than emitting a
+        /// number formatted behind the consumer's back.
+        #[serde(rename = "type")]
+        ty: ValueType,
+        /// When set, names an earlier [`Collection`](Watch::Collection) watch: the
+        /// expression is evaluated **once per element** — with
+        /// [`Item`](Expr::Item) reaching that element's fields — and the watch
+        /// emits a [`List`](crate::engine::Value::List). An element whose
+        /// expression fails is a nested `Unavailable` in place and the list still
+        /// forms, exactly how a collection already treats its elements. Absent, the
+        /// watch emits a single scalar.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        each: Option<String>,
+        /// The expression to evaluate. See [`Expr`].
+        value: Expr,
+        /// Per-watch sample rate in hertz; see [`Watch::Tier1::rate_hz`].
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rate_hz: Option<f64>,
+    },
 }
 
 /// A complete per-game profile: identity plus the values to read.
@@ -569,7 +850,17 @@ impl Profile {
     ///   neither.
     /// - A [`Record`](Watch::Record) — and a record-valued collection — must
     ///   carry at least one field; an empty record reads nothing.
+    /// - A [`Derived`](Watch::Derived) watch may only refer to watches declared
+    ///   **earlier in the array**, must not declare a string `type`, may use
+    ///   [`Item`](Expr::Item) only under an `each` naming an earlier collection,
+    ///   and must give each operator the arity it takes.
     pub fn validate(&self) -> Result<()> {
+        // The watches declared *before* the one being checked, grown as the loop
+        // walks the array — because that ordering *is* the cycle-prevention story
+        // for derived watches. A reference can only point upwards, so there is no
+        // dependency graph to build and no topological sort to run, and
+        // evaluation order falls out of declaration order.
+        let mut earlier: Vec<&Watch> = Vec::with_capacity(self.watches.len());
         for w in &self.watches {
             match w {
                 Watch::Collection {
@@ -600,8 +891,16 @@ impl Profile {
                         "record {name:?}: needs at least one field"
                     )));
                 }
+                Watch::Derived {
+                    name,
+                    ty,
+                    each,
+                    value,
+                    ..
+                } => check_derived(name, *ty, each.as_deref(), value, &earlier)?,
                 _ => {}
             }
+            earlier.push(w);
         }
         Ok(())
     }
@@ -609,6 +908,167 @@ impl Profile {
     /// Serialize this profile to a pretty-printed JSON document.
     pub fn to_json(&self) -> Result<String> {
         serde_json::to_string_pretty(self).map_err(|e| Error::BadProfile(e.to_string()))
+    }
+}
+
+/// The label a watch emits under, whichever kind it is.
+fn watch_name(w: &Watch) -> &str {
+    match w {
+        Watch::Tier1 { name, .. }
+        | Watch::Tier2 { name, .. }
+        | Watch::Collection { name, .. }
+        | Watch::Record { name, .. }
+        | Watch::Derived { name, .. } => name,
+    }
+}
+
+/// Whether a watch by this name was declared before the one being checked.
+fn declared_earlier(earlier: &[&Watch], name: &str) -> bool {
+    earlier.iter().any(|w| watch_name(w) == name)
+}
+
+/// Whether that earlier watch is a [`Collection`](Watch::Collection) — the only
+/// kind an `each` may iterate, because only a collection produces the list it
+/// walks element by element.
+fn earlier_collection(earlier: &[&Watch], name: &str) -> bool {
+    let found = earlier.iter().find(|w| watch_name(w) == name);
+    matches!(found, Some(Watch::Collection { .. }))
+}
+
+/// Validate one [derived](Watch::Derived) watch against the watches declared
+/// before it. Every message names the offending watch, because a profile is
+/// hand-written data and "which one" is the first thing an author needs.
+fn check_derived(
+    name: &str,
+    ty: ValueType,
+    each: Option<&str>,
+    value: &Expr,
+    earlier: &[&Watch],
+) -> Result<()> {
+    if matches!(ty, ValueType::String(_)) {
+        return Err(Error::BadProfile(format!(
+            "derived {name:?}: `type` must be a number — a derived watch is an arithmetic \
+             result, never text"
+        )));
+    }
+    if let Some(each) = each {
+        if !earlier_collection(earlier, each) {
+            return Err(Error::BadProfile(format!(
+                "derived {name:?}: `each` names {each:?}, which is not a `collection` watch \
+                 declared earlier in the array"
+            )));
+        }
+    }
+    check_expr(name, value, earlier, each.is_some())
+}
+
+/// Walk an expression, checking every reference and every operator's arity.
+/// `under_each` says whether an [`Item`](Expr::Item) node has an element to read.
+fn check_expr(owner: &str, expr: &Expr, earlier: &[&Watch], under_each: bool) -> Result<()> {
+    match expr {
+        Expr::Const { .. } => Ok(()),
+        Expr::Ref { watch, .. } => check_ref(owner, watch, earlier),
+        Expr::Item { item } => {
+            if under_each {
+                Ok(())
+            } else {
+                Err(Error::BadProfile(format!(
+                    "derived {owner:?}: item {item:?} needs an `each` — outside one there is \
+                     no current element to read a field from"
+                )))
+            }
+        }
+        Expr::Add { add } => check_nary(owner, "add", add, earlier, under_each),
+        Expr::Mul { mul } => check_nary(owner, "mul", mul, earlier, under_each),
+        Expr::Sub { sub } => check_binary(owner, "sub", sub, earlier, under_each),
+        Expr::Div { div } => check_binary(owner, "div", div, earlier, under_each),
+        Expr::Min { min } => check_extremum(owner, "min", min, earlier, under_each),
+        Expr::Max { max } => check_extremum(owner, "max", max, earlier, under_each),
+        Expr::Sum { sum } => check_fold(owner, sum, earlier, under_each),
+        Expr::Count { count } => check_fold(owner, count, earlier, under_each),
+    }
+}
+
+/// Every `{"watch": …}` must name a watch declared **earlier in the array** —
+/// the rule that makes a cycle unrepresentable rather than merely detectable.
+fn check_ref(owner: &str, target: &str, earlier: &[&Watch]) -> Result<()> {
+    if target == owner {
+        return Err(Error::BadProfile(format!(
+            "derived {owner:?}: refers to itself ({target:?}); a derived watch folds only \
+             watches declared earlier in the array"
+        )));
+    }
+    if declared_earlier(earlier, target) {
+        return Ok(());
+    }
+    Err(Error::BadProfile(format!(
+        "derived {owner:?}: refers to watch {target:?}, which is not declared earlier in the \
+         array; evaluation order is declaration order, so a reference may only point upwards"
+    )))
+}
+
+/// An n-ary operator (`add`/`mul`, and the array form of `min`/`max`) needs at
+/// least one operand: there is no reading to report from no operands at all.
+fn check_nary(
+    owner: &str,
+    op: &str,
+    operands: &[Expr],
+    earlier: &[&Watch],
+    under_each: bool,
+) -> Result<()> {
+    if operands.is_empty() {
+        return Err(Error::BadProfile(format!(
+            "derived {owner:?}: `{op}` needs at least one operand"
+        )));
+    }
+    for operand in operands {
+        check_expr(owner, operand, earlier, under_each)?;
+    }
+    Ok(())
+}
+
+/// `sub`/`div` take exactly two operands — not "at least two", so a typo can
+/// never silently fold a third away.
+fn check_binary(
+    owner: &str,
+    op: &str,
+    operands: &[Expr],
+    earlier: &[&Watch],
+    under_each: bool,
+) -> Result<()> {
+    if operands.len() != 2 {
+        return Err(Error::BadProfile(format!(
+            "derived {owner:?}: `{op}` takes exactly two operands, got {}",
+            operands.len()
+        )));
+    }
+    for operand in operands {
+        check_expr(owner, operand, earlier, under_each)?;
+    }
+    Ok(())
+}
+
+/// `min`/`max` in either shape: an array of operands, or a fold over a list.
+fn check_extremum(
+    owner: &str,
+    op: &str,
+    extremum: &Extremum,
+    earlier: &[&Watch],
+    under_each: bool,
+) -> Result<()> {
+    match extremum {
+        Extremum::Nary(operands) => check_nary(owner, op, operands, earlier, under_each),
+        Extremum::Fold(fold) => check_fold(owner, fold, earlier, under_each),
+    }
+}
+
+/// A fold's list watch obeys the same declared-earlier rule as any reference,
+/// and its `take` is an expression like any other.
+fn check_fold(owner: &str, fold: &Fold, earlier: &[&Watch], under_each: bool) -> Result<()> {
+    check_ref(owner, &fold.watch, earlier)?;
+    match &fold.take {
+        Some(take) => check_expr(owner, take, earlier, under_each),
+        None => Ok(()),
     }
 }
 
@@ -1113,6 +1573,251 @@ mod tests {
         }
         "#;
         assert!(Profile::from_json(json).is_err());
+    }
+
+    /// A profile carrying one derived watch, wrapped around the minimum
+    /// identity and whatever watches it needs to refer to.
+    fn derived_profile(watches: &str) -> Result<Profile> {
+        Profile::from_json(&format!(
+            r#"{{ "match": {{ "process": "g", "module": "g", "probe": "90" }},
+                  "watches": [{watches}] }}"#
+        ))
+    }
+
+    /// A `collection` watch named `name` — the thing an `each` and a fold need
+    /// to point at. Its offsets are irrelevant here; only validation is.
+    fn a_collection(name: &str) -> String {
+        format!(
+            r#"{{ "tier": "collection", "name": "{name}",
+                  "base": {{ "tier": "tier1", "module": "g", "offsets": [0] }},
+                  "count": [0], "stride": 8, "type": "i32", "max": 8 }}"#
+        )
+    }
+
+    #[test]
+    fn derived_watch_deserializes_and_round_trips() {
+        // The full expression surface in one watch: a literal, an indexed and
+        // keyed reference, both fold shapes, a `take` that is itself an
+        // expression, and a multi-clause `where` mixing a string and a number.
+        let json = r#"
+        {
+          "match": { "process": "g.exe", "module": "GameAssembly.dll", "probe": "90 90" },
+          "watches": [
+            { "tier": "collection", "name": "characters",
+              "base": { "tier": "tier1", "module": "GameAssembly.dll", "offsets": ["0x38BB238", 0] },
+              "count": ["0x18"], "items": ["0x10"], "first": "0x20", "stride": 8,
+              "element": [0, 0],
+              "fields": { "hp": { "offsets": ["0x18"], "type": "i32" } }, "max": 8 },
+            { "tier": "record", "name": "party_progress",
+              "base": { "tier": "tier1", "module": "GameAssembly.dll", "offsets": ["0x2C4E120", 0] },
+              "fields": { "level": { "offsets": ["0x18"], "type": "i32" } } },
+            { "tier": "collection", "name": "levelups",
+              "base": { "tier": "tier1", "module": "GameAssembly.dll", "offsets": ["0x38BB240", 0] },
+              "count": ["0x18"], "items": ["0x10"], "first": "0x20", "stride": 8,
+              "element": [0, 0],
+              "fields": { "hp": { "offsets": ["0x10"], "type": "i32" },
+                          "kind": { "offsets": ["0x38"], "type": { "string": "il2cpp" } } },
+              "max": 64 },
+            { "tier": "derived", "name": "max_hp", "type": "i32",
+              "value": { "add": [
+                { "watch": "characters", "index": 2, "field": "hp" },
+                { "const": 6 },
+                { "sum": { "watch": "levelups", "field": "hp",
+                           "take": { "sub": [{ "watch": "party_progress", "field": "level" },
+                                             { "const": 1 }] },
+                           "where": [{ "field": "kind", "eq": "PlayerAddStatModifier" },
+                                     { "field": "hp", "gt": 0 }] } },
+                { "max": [{ "const": 0 }, { "min": { "watch": "levelups", "field": "hp" } }] }
+              ] },
+              "rate_hz": 2.0 },
+            { "tier": "derived", "name": "attack_rating", "type": "i32", "each": "characters",
+              "value": { "mul": [{ "item": "hp" }, { "const": 2 }] } }
+          ]
+        }
+        "#;
+        let p = Profile::from_json(json).expect("parse");
+
+        // The untagged nodes discriminated the way the docs promise — in
+        // particular `max` as an *array* is n-ary while `min` as an *object* is a
+        // fold, which is the one place two shapes share a key.
+        match &p.watches[3] {
+            Watch::Derived {
+                name,
+                ty,
+                each,
+                value,
+                ..
+            } => {
+                assert_eq!(name, "max_hp");
+                assert_eq!(*ty, ValueType::I32);
+                assert_eq!(*each, None);
+                let operands = match value {
+                    Expr::Add { add } => add,
+                    other => panic!("expected an add, got {other:?}"),
+                };
+                assert_eq!(
+                    operands[0],
+                    Expr::Ref {
+                        watch: "characters".to_string(),
+                        index: Some(2),
+                        field: Some("hp".to_string()),
+                    }
+                );
+                assert_eq!(operands[1], Expr::Const { value: 6.0 });
+                match &operands[2] {
+                    Expr::Sum { sum } => {
+                        assert_eq!(sum.field.as_deref(), Some("hp"));
+                        assert!(sum.take.is_some(), "the take is itself an expression");
+                        assert_eq!(sum.clauses.len(), 2);
+                        assert_eq!(sum.clauses[0].field, "kind");
+                        assert_eq!(
+                            sum.clauses[0].test,
+                            Compare::Eq(Literal::Text("PlayerAddStatModifier".to_string()))
+                        );
+                        assert_eq!(sum.clauses[1].test, Compare::Gt(Literal::Num(0.0)));
+                    }
+                    other => panic!("expected a sum, got {other:?}"),
+                }
+                match &operands[3] {
+                    Expr::Max {
+                        max: Extremum::Nary(nary),
+                    } => match &nary[1] {
+                        Expr::Min {
+                            min: Extremum::Fold(_),
+                        } => {}
+                        other => panic!("an object min must be a fold, got {other:?}"),
+                    },
+                    other => panic!("an array max must be n-ary, got {other:?}"),
+                }
+            }
+            other => panic!("expected a derived watch, got {other:?}"),
+        }
+
+        // The `each` form carries its collection through.
+        match &p.watches[4] {
+            Watch::Derived { each, .. } => assert_eq!(each.as_deref(), Some("characters")),
+            other => panic!("expected a derived watch, got {other:?}"),
+        }
+
+        // …and the whole thing survives a serialize round-trip unchanged.
+        let back = Profile::from_json(&p.to_json().unwrap()).expect("re-parse");
+        assert_eq!(p, back, "derived watch changed across a JSON round-trip");
+    }
+
+    #[test]
+    fn derived_rejects_a_forward_reference() {
+        // `total` names a watch declared *below* it. Declaration order is
+        // evaluation order, so this can never be satisfied.
+        let err = derived_profile(
+            r#"{ "tier": "derived", "name": "total", "type": "i32",
+                 "value": { "watch": "hp" } },
+               { "tier": "tier1", "name": "hp", "module": "g", "offsets": [0], "type": "i32" }"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("total"), "error should name the watch: {err}");
+        assert!(err.contains("hp"), "…and the one it reached for: {err}");
+    }
+
+    #[test]
+    fn derived_rejects_a_self_reference() {
+        let err = derived_profile(
+            r#"{ "tier": "derived", "name": "spin", "type": "i32",
+                 "value": { "add": [{ "watch": "spin" }, { "const": 1 }] } }"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("spin"), "error should name the watch: {err}");
+        assert!(err.contains("itself"), "…and say what it did: {err}");
+    }
+
+    #[test]
+    fn derived_rejects_item_outside_an_each() {
+        let err = derived_profile(
+            r#"{ "tier": "derived", "name": "orphan", "type": "i32",
+                 "value": { "item": "base_hp" } }"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("orphan"), "error should name the watch: {err}");
+        assert!(
+            err.contains("each"),
+            "…and point at the missing each: {err}"
+        );
+    }
+
+    #[test]
+    fn derived_requires_each_to_name_an_earlier_collection() {
+        // A record is not a collection: there is no list of elements to walk.
+        let err = derived_profile(
+            r#"{ "tier": "record", "name": "player",
+                 "base": { "tier": "tier1", "module": "g", "offsets": [0] },
+                 "fields": { "hp": { "offsets": [0], "type": "i32" } } },
+               { "tier": "derived", "name": "doubled", "type": "i32", "each": "player",
+                 "value": { "item": "hp" } }"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("doubled"),
+            "error should name the watch: {err}"
+        );
+        assert!(
+            err.contains("player"),
+            "…and what it tried to iterate: {err}"
+        );
+
+        // The same watch over a real collection is fine.
+        let watches = format!(
+            r#"{}, {{ "tier": "derived", "name": "doubled", "type": "i32", "each": "party",
+                      "value": {{ "item": "hp" }} }}"#,
+            a_collection("party")
+        );
+        assert!(derived_profile(&watches).is_ok());
+    }
+
+    #[test]
+    fn derived_rejects_a_bad_arity() {
+        // `sub` is exactly two — never three, so a stray operand can't be folded
+        // away silently.
+        let err = derived_profile(
+            r#"{ "tier": "derived", "name": "headroom", "type": "i32",
+                 "value": { "sub": [{ "const": 1 }, { "const": 2 }, { "const": 3 }] } }"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("headroom"),
+            "error should name the watch: {err}"
+        );
+        assert!(err.contains("sub"), "…and the operator: {err}");
+
+        // …and an n-ary operator needs at least one operand.
+        let err = derived_profile(
+            r#"{ "tier": "derived", "name": "nothing", "type": "i32", "value": { "add": [] } }"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("nothing"),
+            "error should name the watch: {err}"
+        );
+        assert!(err.contains("add"), "…and the operator: {err}");
+    }
+
+    #[test]
+    fn derived_rejects_a_string_output_type() {
+        let err = derived_profile(
+            r#"{ "tier": "derived", "name": "label", "type": { "string": "il2cpp" },
+                 "value": { "const": 1 } }"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("label"), "error should name the watch: {err}");
+        assert!(
+            err.contains("type"),
+            "…and say the output type is the problem: {err}"
+        );
     }
 
     #[test]

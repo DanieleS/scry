@@ -144,6 +144,39 @@ Structure stops here — **exactly one level deep**. Deeper trees (member →
 inventory → items → …) stay the consumer's job to compose; recursion is where the
 engine would start modelling game entities, which it deliberately doesn't.
 
+### Derived values — arithmetic without an interpreter
+
+Games routinely **compute** the numbers a player sees rather than storing them:
+percent of max, a party total, an effective stat that is base plus equipment, a
+count of living enemies. The arithmetic is trivial; reaching the inputs is not.
+A `derived` watch closes that gap with a small expression carried as **data** —
+the same discipline that makes `collection` express iteration as
+`count`/`stride`/`element` instead of as a script:
+
+```json
+{ "tier": "derived", "name": "hp_percent", "type": "f32",
+  "value": { "mul": [ { "const": 100 },
+                      { "div": [ { "watch": "hp" }, { "watch": "hp_max" } ] } ] } }
+```
+
+**A derived watch never touches memory.** It reads only the values of other
+watches in the current tick, which is what keeps this from growing into an
+embedded interpreter — and what makes it engine-agnostic by construction, since
+by the time a value gets here it is just a number, a string, a list or a map.
+References must point at a watch declared **earlier** in the array, so a cycle is
+unrepresentable rather than merely detected, and evaluation order is simply
+declaration order.
+
+Nodes cover literals, references (optionally `index`ed into a list and `field`ed
+into a record), `add`/`mul`/`sub`/`div`/`min`/`max`, and folds over a list —
+`sum`, `count`, `min`, `max` — with an optional `take` and a flat `where` filter
+(`{"field": "kind", "eq": "PlayerAddStatModifier"}`) for the polymorphic lists
+that are the norm rather than the exception. With `each` naming a collection, the
+expression runs once per element and the watch emits a list. Everything fails
+soft: any unavailable input, a zero divisor, an out-of-range coercion or a
+missing field yields `unavailable` — never a saturated number, which would be a
+lie. See [`docs/authoring-profiles.md`](docs/authoring-profiles.md).
+
 ### The resolver — the anti-collision core
 
 Two games built on the same engine can share an executable name and a broad
@@ -293,6 +326,10 @@ Early — version `0.0.0`, API not yet stable. What works today:
 - Tier-2 AOB signature scanning with wildcards, incl. RIP-relative (`[rip+disp32]`)
   displacement decoding to reach a static base on x64
 - Data-driven JSON profile format (serde, round-trip tested)
+- `collection` and `record` watches — iteration and one shallow level of
+  structure, both expressed as data rather than as a script
+- `derived` watches — arithmetic over what the other watches read, touching no
+  memory of their own and so engine-agnostic by construction
 - Probe-based resolver with the fail-safe property
 - `scry` host CLI — attach to a running game and stream telemetry (`watch`),
   find signatures (`scan`), and prove the backend end-to-end (`selftest`)
@@ -301,8 +338,9 @@ Early — version `0.0.0`, API not yet stable. What works today:
   `authoring` feature so the runtime stays engine-agnostic
 - CI on Linux **and** Windows: the Windows job runs the integration suite
   against a real process (32- and 64-bit), and ships prebuilt CLI artifacts
-- 42 tests, plus the authoring converter's own suite; zero external dependencies
-  beyond serde, offline build
+- A unit and integration suite (the latter against a real process), plus the
+  authoring converter's own; zero external dependencies beyond serde, offline
+  build
 
 ---
 

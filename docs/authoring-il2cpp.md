@@ -266,6 +266,23 @@ array — every chain is name-resolved just like a scalar `chain`:
   `stride` are single literals (or a field reference); `max` caps the count.
 - See `docs/authoring-profiles.md` → *Collections* for the runtime semantics.
 
+A **`derived`** watch is written exactly as it is in a profile — `name`, `type`,
+optional `each`, and a `value` expression — and the converter **passes it through
+verbatim**:
+
+```json
+{ "name": "hp_percent", "tier": "derived", "type": "f32",
+  "value": { "mul": [ { "const": 100 },
+                      { "div": [ { "watch": "hp" }, { "watch": "hp_max" } ] } ] } }
+```
+
+There is nothing here for a dump to resolve, and that is the interesting part: a
+derived watch carries **no offsets**, so it is the one watch kind a game patch
+cannot invalidate. The fragile numbers all live in the watches it folds; re-run
+the converter against a new dump and every formula above them still holds. It is
+also why the tier needs no IL2CPP knowledge at all — see
+`docs/authoring-profiles.md` → *Derived values*.
+
 **`chain`** entries are resolved left to right into the profile's `offsets`. Each
 entry is either:
 

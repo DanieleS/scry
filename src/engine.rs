@@ -44,15 +44,19 @@
 //! # }
 //! ```
 
+use std::cmp::Ordering;
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use crate::aob;
 use crate::backend::MemoryBackend;
-use crate::profile::{Base, Field, Profile, Rip, StringEncoding, StringLayout, ValueType, Watch};
+use crate::profile::{
+    Base, Clause, Compare, Expr, Extremum, Field, Fold, Literal, Profile, Rip, StringEncoding,
+    StringLayout, ValueType, Watch,
+};
 
 /// A single sampled value — or the honest absence of one.
 ///
@@ -220,12 +224,29 @@ enum Reader {
         base: Vec<i64>,
         fields: RecordFields,
     },
+    /// A [`Watch::Derived`]: read **no memory at all** — fold the values other
+    /// watches already produced this tick. The odd one out here, and deliberately
+    /// so: it has no anchor to resolve, so it never reaches the anchor lookup, and
+    /// it is sampled in its own phase of [`Session::poll`] once `last` holds this
+    /// tick's readings.
+    Derived {
+        /// The earlier collection watch to evaluate once per element, if any.
+        each: Option<String>,
+        /// The expression, evaluated in `f64` and coerced to `ty`.
+        expr: Expr,
+        /// The declared output type.
+        ty: ValueType,
+    },
 }
 
 /// A watch reduced to what the loop needs each tick, plus its schedule state.
 struct Scheduled {
     name: String,
-    kind: AnchorKind,
+    /// How this watch's anchor is (re)found — `None` for a [`Reader::Derived`],
+    /// which has no anchor at all because it reads no memory. Modelled as an
+    /// absence rather than a stand-in [`AnchorKind`]: there is no address to
+    /// invent, and a fake one would have to be excluded from re-attach anyway.
+    kind: Option<AnchorKind>,
     reader: Reader,
     /// Minimum time between samples (`1 / rate_hz`); `ZERO` means every tick.
     period: Duration,
@@ -424,10 +445,354 @@ fn read_until_nul<B: MemoryBackend + ?Sized>(
     Ok(out)
 }
 
-/// Sample one watch from its cached anchor. A scalar walks its chain and reads
-/// one value; a collection iterates its container. Every failure path returns
-/// `Unavailable` (or, per element, a nested `Unavailable`) — never a guess.
-fn sample_one<B: MemoryBackend + ?Sized>(backend: &B, w: &Scheduled) -> Value {
+/// What a [derived](crate::profile::Watch::Derived) expression is evaluated
+/// against: this tick's readings, plus the current element when the watch
+/// iterates an `each` collection.
+///
+/// Note what is *not* here: no backend, no anchor, no address. A derived
+/// expression is structurally incapable of reading memory, which is what keeps
+/// the tier engine-agnostic and its failure story trivial.
+struct Ctx<'a> {
+    last: &'a BTreeMap<String, Value>,
+    element: Option<&'a Value>,
+}
+
+/// Which list fold is being evaluated. The four share everything but how they
+/// accumulate, so they share one walk of the list.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FoldKind {
+    Sum,
+    Count,
+    Min,
+    Max,
+}
+
+/// 2^64. `u64::MAX as f64` rounds *up* to exactly this, so it is the
+/// **exclusive** upper bound a `u64` coercion has to stay below; using the
+/// rounded maximum would admit a value that cannot round-trip.
+const U64_LIMIT: f64 = 18_446_744_073_709_551_616.0;
+
+/// A reading as an `f64`, or `None` when it simply is not a number.
+///
+/// A string, a list, a record or an `Unavailable` where arithmetic needs a
+/// number is a *shape* error, and shape errors propagate: they make the whole
+/// expression unavailable rather than contributing a zero nobody read.
+fn number_of(value: &Value) -> Option<f64> {
+    match value {
+        Value::I32(n) => Some(*n as f64),
+        Value::U32(n) => Some(*n as f64),
+        Value::F32(x) => Some(*x as f64),
+        Value::U64(n) => Some(*n as f64),
+        Value::Str(_) | Value::List(_) | Value::Map(_) | Value::Unavailable => None,
+    }
+}
+
+/// Narrow a watch's value by an optional list `index` and an optional map
+/// `field`, in that order. Indexing a scalar, keying a list, or an index out of
+/// range is a shape error — `None`, never a clamped neighbour.
+fn pick<'a>(value: &'a Value, index: Option<i64>, field: Option<&str>) -> Option<&'a Value> {
+    let value = match index {
+        Some(i) => match value {
+            Value::List(items) => items.get(usize::try_from(i).ok()?)?,
+            _ => return None,
+        },
+        None => value,
+    };
+    match field {
+        Some(key) => match value {
+            Value::Map(fields) => fields.get(key),
+            _ => None,
+        },
+        None => Some(value),
+    }
+}
+
+/// Evaluate an expression to a number, or `None` for "no honest answer this
+/// tick". Every failure path — a missing watch, a wrong shape, an index out of
+/// range, a zero divisor — funnels here, which is why the tier needs no error
+/// type of its own.
+fn eval(expr: &Expr, ctx: &Ctx<'_>) -> Option<f64> {
+    match expr {
+        Expr::Const { value } => Some(*value),
+        Expr::Ref {
+            watch,
+            index,
+            field,
+        } => {
+            let value = ctx.last.get(watch)?;
+            number_of(pick(value, *index, field.as_deref())?)
+        }
+        Expr::Item { item } => match ctx.element? {
+            Value::Map(fields) => number_of(fields.get(item)?),
+            // An element that is not a record has no fields to name; under an
+            // `each` over a scalar collection this is the honest answer.
+            _ => None,
+        },
+        Expr::Add { add } => accumulate(add, ctx, 0.0, |a, b| a + b),
+        Expr::Mul { mul } => accumulate(mul, ctx, 1.0, |a, b| a * b),
+        Expr::Sub { sub } => {
+            let (a, b) = two(sub, ctx)?;
+            Some(a - b)
+        }
+        Expr::Div { div } => {
+            let (a, b) = two(div, ctx)?;
+            // An infinity is not a reading. Division by zero is unavailable.
+            if b == 0.0 {
+                return None;
+            }
+            Some(a / b)
+        }
+        Expr::Min { min } => extremum(min, ctx, FoldKind::Min),
+        Expr::Max { max } => extremum(max, ctx, FoldKind::Max),
+        Expr::Sum { sum } => eval_fold(sum, ctx, FoldKind::Sum),
+        Expr::Count { count } => eval_fold(count, ctx, FoldKind::Count),
+    }
+}
+
+/// Fold n-ary operands into `unit` with `op`; any unavailable operand sinks the
+/// whole node.
+fn accumulate(operands: &[Expr], ctx: &Ctx<'_>, unit: f64, op: fn(f64, f64) -> f64) -> Option<f64> {
+    let mut acc = unit;
+    for operand in operands {
+        acc = op(acc, eval(operand, ctx)?);
+    }
+    Some(acc)
+}
+
+/// Evaluate exactly two operands. A validated profile guarantees the arity; a
+/// hand-built one gets `None` rather than a silently dropped operand.
+fn two(operands: &[Expr], ctx: &Ctx<'_>) -> Option<(f64, f64)> {
+    match operands {
+        [a, b] => Some((eval(a, ctx)?, eval(b, ctx)?)),
+        _ => None,
+    }
+}
+
+/// `min`/`max` in whichever shape the profile wrote: an array of operands, or a
+/// fold over a list watch.
+fn extremum(extremum: &Extremum, ctx: &Ctx<'_>, kind: FoldKind) -> Option<f64> {
+    match extremum {
+        Extremum::Nary(operands) => {
+            let mut acc: Option<f64> = None;
+            for operand in operands {
+                let x = eval(operand, ctx)?;
+                acc = Some(match acc {
+                    Some(a) if kind == FoldKind::Min => a.min(x),
+                    Some(a) => a.max(x),
+                    None => x,
+                });
+            }
+            acc
+        }
+        Extremum::Fold(fold) => eval_fold(fold, ctx, kind),
+    }
+}
+
+/// Fold a list-valued watch: take a prefix, keep the elements every clause
+/// accepts, and accumulate.
+///
+/// The empty cases differ on purpose. A `sum` of nothing is `0` — "nothing
+/// matched" is a real answer — while a `min`/`max` of nothing is unavailable,
+/// because there is no neutral element to return honestly. An element that
+/// cannot be read *inside* the range is unavailable for every kind: skipping it
+/// would quietly under-report.
+fn eval_fold(fold: &Fold, ctx: &Ctx<'_>, kind: FoldKind) -> Option<f64> {
+    let items = match ctx.last.get(&fold.watch)? {
+        Value::List(items) => items,
+        _ => return None,
+    };
+    let take = match &fold.take {
+        Some(take) => {
+            let n = eval(take, ctx)?;
+            // A negative take is a broken formula, not an empty range.
+            if !n.is_finite() || n < 0.0 {
+                return None;
+            }
+            (n as usize).min(items.len())
+        }
+        None => items.len(),
+    };
+
+    let mut matched = 0u64;
+    let mut total = 0.0;
+    let mut best: Option<f64> = None;
+    for item in &items[..take] {
+        if !matches_clauses(item, &fold.clauses)? {
+            continue;
+        }
+        matched += 1;
+        // Counting asks how many elements match, never what they hold, so it
+        // needs no `field` and survives an element it could not have read.
+        if kind == FoldKind::Count {
+            continue;
+        }
+        let value = match &fold.field {
+            Some(key) => match item {
+                Value::Map(fields) => fields.get(key)?,
+                _ => return None,
+            },
+            None => item,
+        };
+        let x = number_of(value)?;
+        total += x;
+        best = Some(match best {
+            Some(b) if kind == FoldKind::Min => b.min(x),
+            Some(b) => b.max(x),
+            None => x,
+        });
+    }
+
+    match kind {
+        FoldKind::Sum => Some(total),
+        FoldKind::Count => Some(matched as f64),
+        FoldKind::Min | FoldKind::Max => best,
+    }
+}
+
+/// Test one element against a fold's `where` clauses — all of which must hold.
+///
+/// `None` means the question could not be answered: a field the element lacks,
+/// or a comparison between text and a number. That makes the whole fold
+/// unavailable rather than silently dropping the element, which is the
+/// difference between a filter and a lie.
+fn matches_clauses(item: &Value, clauses: &[Clause]) -> Option<bool> {
+    let mut all = true;
+    for clause in clauses {
+        let value = match item {
+            Value::Map(fields) => fields.get(&clause.field)?,
+            _ => return None,
+        };
+        // Every clause is evaluated, not short-circuited: a clause naming a
+        // field that isn't there is a broken profile, and it should surface even
+        // when an earlier clause already excluded the element.
+        if !compare(value, &clause.test)? {
+            all = false;
+        }
+    }
+    Some(all)
+}
+
+/// Apply one clause's comparison to a field's reading.
+fn compare(value: &Value, test: &Compare) -> Option<bool> {
+    match test {
+        Compare::Eq(lit) => equals(value, lit),
+        Compare::Ne(lit) => equals(value, lit).map(|eq| !eq),
+        Compare::Lt(lit) => order(value, lit).map(Ordering::is_lt),
+        Compare::Le(lit) => order(value, lit).map(Ordering::is_le),
+        Compare::Gt(lit) => order(value, lit).map(Ordering::is_gt),
+        Compare::Ge(lit) => order(value, lit).map(Ordering::is_ge),
+    }
+}
+
+/// Identity against a literal: numbers numerically, strings textually. A number
+/// tested against a string reading (or the reverse) is undecidable, not `false`.
+fn equals(value: &Value, lit: &Literal) -> Option<bool> {
+    match lit {
+        Literal::Num(n) => Some(number_of(value)? == *n),
+        Literal::Text(s) => match value {
+            Value::Str(v) => Some(v == s),
+            _ => None,
+        },
+    }
+}
+
+/// Ordering against a **numeric** literal. Text orders under nothing but
+/// `eq`/`ne`, so a string operand is undecidable here rather than collated.
+fn order(value: &Value, lit: &Literal) -> Option<Ordering> {
+    match lit {
+        Literal::Num(n) => number_of(value)?.partial_cmp(n),
+        Literal::Text(_) => None,
+    }
+}
+
+/// Coerce an evaluated `f64` to the watch's declared type.
+///
+/// Integer types truncate toward zero; anything the target cannot hold — a
+/// non-finite result, or one outside its range — is `Unavailable`. Never a
+/// saturated number: `i32::MAX` reported for an overflow would be a lie a
+/// consumer has no way to detect.
+fn coerce(value: Option<f64>, ty: ValueType) -> Value {
+    let x = match value {
+        Some(x) if x.is_finite() => x,
+        _ => return Value::Unavailable,
+    };
+    match ty {
+        // An f32 keeps its fraction; a magnitude it cannot hold becomes infinite,
+        // which is the same "no honest reading" as any other overflow.
+        ValueType::F32 => match x as f32 {
+            f if f.is_finite() => Value::F32(f),
+            _ => Value::Unavailable,
+        },
+        ValueType::I32 => match x.trunc() {
+            n if (i32::MIN as f64..=i32::MAX as f64).contains(&n) => Value::I32(n as i32),
+            _ => Value::Unavailable,
+        },
+        ValueType::U32 => match x.trunc() {
+            n if (0.0..=u32::MAX as f64).contains(&n) => Value::U32(n as u32),
+            _ => Value::Unavailable,
+        },
+        ValueType::U64 => match x.trunc() {
+            n if (0.0..U64_LIMIT).contains(&n) => Value::U64(n as u64),
+            _ => Value::Unavailable,
+        },
+        // Unreachable in a validated profile — a derived watch may not declare a
+        // string type — and still not a guess if a hand-built one does.
+        ValueType::String(_) => Value::Unavailable,
+    }
+}
+
+/// Evaluate a derived watch against the readings already in `last`.
+///
+/// Without an `each` this is one scalar. With one, the named collection is
+/// walked and the expression evaluated per element: an element whose expression
+/// fails is a nested `Unavailable` in place and the list still forms — exactly
+/// how a collection already treats a broken element. A missing, unavailable or
+/// non-list `each` target makes the whole watch unavailable: there is nothing to
+/// iterate, so there is no list to emit.
+fn derive(last: &BTreeMap<String, Value>, each: Option<&str>, expr: &Expr, ty: ValueType) -> Value {
+    let each = match each {
+        Some(name) => name,
+        // No `each`: a single scalar, evaluated with no current element.
+        None => {
+            let ctx = Ctx {
+                last,
+                element: None,
+            };
+            return coerce(eval(expr, &ctx), ty);
+        }
+    };
+    let items = match last.get(each) {
+        Some(Value::List(items)) => items,
+        _ => return Value::Unavailable,
+    };
+    let values = items
+        .iter()
+        .map(|element| {
+            let ctx = Ctx {
+                last,
+                element: Some(element),
+            };
+            coerce(eval(expr, &ctx), ty)
+        })
+        .collect();
+    Value::List(values)
+}
+
+/// Sample one watch. A derived watch folds this tick's readings and returns
+/// before any anchor is consulted — it has none. Otherwise a scalar walks its
+/// chain and reads one value, a collection iterates its container, and every
+/// failure path returns `Unavailable` (or, per element, a nested `Unavailable`)
+/// — never a guess.
+fn sample_one<B: MemoryBackend + ?Sized>(
+    backend: &B,
+    w: &Scheduled,
+    last: &BTreeMap<String, Value>,
+) -> Value {
+    // Before the anchor lookup, because a derived watch has no anchor: it reads
+    // no memory, only what the memory watches already produced.
+    if let Reader::Derived { each, expr, ty } = &w.reader {
+        return derive(last, each.as_deref(), expr, *ty);
+    }
     let anchor = match w.anchor {
         Some(a) => a,
         None => return Value::Unavailable,
@@ -500,6 +865,8 @@ fn sample_one<B: MemoryBackend + ?Sized>(backend: &B, w: &Scheduled) -> Value {
             }
             Value::List(out)
         }
+        // Answered above, before the anchor lookup this arm sits behind.
+        Reader::Derived { .. } => Value::Unavailable,
     }
 }
 
@@ -534,7 +901,7 @@ impl<B: MemoryBackend> Session<B> {
                     rate_hz,
                 } => (
                     name.clone(),
-                    AnchorKind::Module(module.clone()),
+                    Some(AnchorKind::Module(module.clone())),
                     Reader::Scalar {
                         offsets: offsets.clone(),
                         ty: *ty,
@@ -552,7 +919,7 @@ impl<B: MemoryBackend> Session<B> {
                     name.clone(),
                     // Parse the signature once. A malformed signature can never
                     // resolve, so record that rather than re-failing every tick.
-                    signature_kind(anchor, *rip),
+                    Some(signature_kind(anchor, *rip)),
                     Reader::Scalar {
                         offsets: offsets.clone(),
                         ty: *ty,
@@ -585,7 +952,7 @@ impl<B: MemoryBackend> Session<B> {
                     };
                     (
                         name.clone(),
-                        kind,
+                        Some(kind),
                         Reader::Collection {
                             base: base_offsets,
                             count: count.clone(),
@@ -610,7 +977,7 @@ impl<B: MemoryBackend> Session<B> {
                     let (kind, base_offsets) = anchor_from_base(base);
                     (
                         name.clone(),
-                        kind,
+                        Some(kind),
                         Reader::Record {
                             base: base_offsets,
                             fields: flatten_fields(fields),
@@ -618,8 +985,26 @@ impl<B: MemoryBackend> Session<B> {
                         *rate_hz,
                     )
                 }
+                Watch::Derived {
+                    name,
+                    ty,
+                    each,
+                    value,
+                    rate_hz,
+                } => (
+                    name.clone(),
+                    // No anchor: this watch reads no memory, so there is nothing
+                    // to resolve now and nothing to re-resolve on a re-attach.
+                    None,
+                    Reader::Derived {
+                        each: each.clone(),
+                        expr: value.clone(),
+                        ty: *ty,
+                    },
+                    *rate_hz,
+                ),
             };
-            let anchor = resolve_anchor(&backend, &kind);
+            let anchor = kind.as_ref().and_then(|k| resolve_anchor(&backend, k));
             watches.push(Scheduled {
                 name,
                 kind,
@@ -646,32 +1031,23 @@ impl<B: MemoryBackend> Session<B> {
     /// `start.elapsed()`; a test can pass exact instants. A watch is due when
     /// `elapsed` has reached its `next_due`; after sampling, its next due time is
     /// pushed out by its period.
+    ///
+    /// A tick runs in **two phases**, and they must not interleave. Phase one
+    /// samples every due *memory* watch, writing this tick's readings into
+    /// `last`. Phase two evaluates every due *derived* watch against that same
+    /// `last` — so it sees fresh values for whatever was sampled just now and the
+    /// most recent value for whatever was not due, which is exactly the "latest
+    /// known" semantics a computed value wants. Interleaved, a derived watch
+    /// would see this tick's reading or last tick's depending on declaration
+    /// order, which is no semantics at all.
     pub fn poll(&mut self, elapsed: Duration) -> Snapshot {
         let mut diff = Snapshot::new();
-        let mut sampled = 0u32;
-        let mut failed = 0u32;
-
-        for w in &mut self.watches {
-            if elapsed < w.next_due {
-                continue;
-            }
-            sampled += 1;
-            w.next_due = elapsed + w.period;
-
-            let value = sample_one(&self.backend, w);
-            if value == Value::Unavailable {
-                failed += 1;
-            }
-
-            // Emit only genuine changes. A first sighting (no prior value) always
-            // counts as a change, including a first-seen `Unavailable`. The clone
-            // lands only on an actual change — a quiet tick copies nothing.
-            let changed = self.last.get(&w.name) != Some(&value);
-            if changed {
-                self.last.insert(w.name.clone(), value.clone());
-                diff.insert(w.name.clone(), value);
-            }
-        }
+        let (sampled, failed) = self.sample_phase(elapsed, false, &mut diff);
+        // Phase two's counts are deliberately discarded. A derived watch reads no
+        // memory, so letting it vote on the re-attach decision would make a
+        // formula error look like a process that moved out from under us — and a
+        // healthy derived watch would mask a target that really is gone.
+        let _ = self.sample_phase(elapsed, true, &mut diff);
 
         // Re-attach bookkeeping runs only on ticks that actually sampled
         // something: a quiet tick (nothing due) is neither success nor failure.
@@ -690,12 +1066,59 @@ impl<B: MemoryBackend> Session<B> {
         diff
     }
 
+    /// Sample the watches of one phase that are due at `elapsed`, folding what
+    /// changed into `diff` and returning `(sampled, failed)` for the caller's
+    /// re-attach bookkeeping. `derived` selects the phase: `false` for the memory
+    /// watches, `true` for the derived ones.
+    fn sample_phase(
+        &mut self,
+        elapsed: Duration,
+        derived: bool,
+        diff: &mut Snapshot,
+    ) -> (u32, u32) {
+        let mut sampled = 0u32;
+        let mut failed = 0u32;
+        for w in &mut self.watches {
+            if matches!(w.reader, Reader::Derived { .. }) != derived {
+                continue;
+            }
+            if elapsed < w.next_due {
+                continue;
+            }
+            sampled += 1;
+            w.next_due = elapsed + w.period;
+
+            let value = sample_one(&self.backend, w, &self.last);
+            if value == Value::Unavailable {
+                failed += 1;
+            }
+
+            // Emit only genuine changes. A first sighting (no prior value) always
+            // counts as a change, including a first-seen `Unavailable`. The clone
+            // lands only on an actual change — a quiet tick copies nothing.
+            //
+            // Writing back here also feeds the phase: a derived watch declared
+            // after another sees the value this loop just stored, which is why
+            // declaration order is a sufficient evaluation order.
+            let changed = self.last.get(&w.name) != Some(&value);
+            if changed {
+                self.last.insert(w.name.clone(), value.clone());
+                diff.insert(w.name.clone(), value);
+            }
+        }
+        (sampled, failed)
+    }
+
     /// Re-resolve every watch's anchor against the live target. Called when a
     /// run of fully-failed ticks suggests the process moved (relocated module,
-    /// freed region) — the same resolution attach did, repeated.
+    /// freed region) — the same resolution attach did, repeated. A derived watch
+    /// has no anchor and is skipped: there is nothing about it that a moved
+    /// process could invalidate.
     fn reattach(&mut self) {
         for w in &mut self.watches {
-            w.anchor = resolve_anchor(&self.backend, &w.kind);
+            if let Some(kind) = &w.kind {
+                w.anchor = resolve_anchor(&self.backend, kind);
+            }
         }
     }
 
@@ -727,7 +1150,7 @@ impl<B: MemoryBackend + Send + 'static> Session<B> {
         let join = std::thread::spawn(move || {
             lower_thread_priority();
             let start = Instant::now();
-            while !stop_thread.load(Ordering::Relaxed) {
+            while !stop_thread.load(AtomicOrdering::Relaxed) {
                 let diff = self.poll(start.elapsed());
                 if !diff.is_empty() {
                     sink(diff);
@@ -764,7 +1187,7 @@ impl Handle {
     /// Signal the loop to stop and wait for the thread to finish. Idempotent;
     /// also invoked automatically when the handle is dropped.
     pub fn stop(&mut self) {
-        self.stop.store(true, Ordering::Relaxed);
+        self.stop.store(true, AtomicOrdering::Relaxed);
         if let Some(join) = self.join.take() {
             let _ = join.join();
         }
@@ -1631,6 +2054,556 @@ mod tests {
             s.poll(Duration::ZERO).get("name"),
             Some(&Value::Str(String::new())),
             "a null string reference is an empty string, not Unavailable"
+        );
+    }
+
+    // ---- derived watches ---------------------------------------------------
+
+    /// Assemble a profile around `watches` — the derived tests declare several
+    /// at a time, and only the watch list ever differs.
+    fn profile(watches: Vec<Watch>) -> Profile {
+        Profile {
+            label: None,
+            contract_version: None,
+            match_: ident(),
+            watches,
+        }
+    }
+
+    /// A derived watch whose expression is given as the JSON an author would
+    /// actually type. Building it this way keeps the tests readable *and* pins
+    /// the untagged node discrimination the docs promise — an expression that
+    /// parses wrongly here fails as loudly as one that evaluates wrongly.
+    fn derived(name: &str, ty: ValueType, each: Option<&str>, value: &str) -> Watch {
+        Watch::Derived {
+            name: name.to_string(),
+            ty,
+            each: each.map(str::to_string),
+            value: serde_json::from_str(value).expect("parse expression"),
+            rate_hz: None,
+        }
+    }
+
+    /// A Tier-1 watch whose chain derefs past the mapped region — permanently
+    /// unreadable, so it stands in for any input that has gone dark.
+    fn broken_tier1(name: &str) -> Watch {
+        Watch::Tier1 {
+            name: name.to_string(),
+            module: "fake".to_string(),
+            offsets: vec![0x1000, 0],
+            ty: ValueType::I32,
+            rate_hz: None,
+        }
+    }
+
+    #[test]
+    fn derived_watch_folds_other_watches_and_diffs_like_any_value() {
+        let fake = Rc::new(Fake::new(64));
+        fake.write_i32(0, 100);
+        fake.write_i32(8, 25);
+        let p = profile(vec![
+            tier1("hp", 0, None),
+            tier1("shield", 8, None),
+            derived(
+                "effective_hp",
+                ValueType::I32,
+                None,
+                r#"{ "add": [{ "watch": "hp" }, { "watch": "shield" }] }"#,
+            ),
+        ]);
+        let mut s = Session::attach(Rc::clone(&fake), &p, Config::default());
+
+        assert_eq!(
+            s.poll(Duration::ZERO).get("effective_hp"),
+            Some(&Value::I32(125))
+        );
+        // Quiet inputs, quiet output: a derived watch diffs like any other value.
+        assert!(s.poll(Duration::from_millis(50)).is_empty());
+
+        // Move an input: the derived value must reflect the reading taken in the
+        // *same* tick, which is the whole reason poll runs in two phases.
+        fake.write_i32(0, 90);
+        let d = s.poll(Duration::from_millis(100));
+        assert_eq!(d.get("hp"), Some(&Value::I32(90)));
+        assert_eq!(
+            d.get("effective_hp"),
+            Some(&Value::I32(115)),
+            "a derived watch must fold this tick's readings, not last tick's"
+        );
+    }
+
+    #[test]
+    fn an_unavailable_input_makes_the_whole_expression_unavailable() {
+        let fake = Rc::new(Fake::new(64));
+        fake.write_i32(0, 10);
+        let p = profile(vec![
+            tier1("hp", 0, None),
+            broken_tier1("gone"),
+            derived(
+                "total",
+                ValueType::I32,
+                None,
+                r#"{ "add": [{ "watch": "hp" }, { "watch": "gone" }] }"#,
+            ),
+        ]);
+        let mut s = Session::attach(Rc::clone(&fake), &p, Config::default());
+        let d = s.poll(Duration::ZERO);
+        assert_eq!(d.get("gone"), Some(&Value::Unavailable));
+        assert_eq!(
+            d.get("total"),
+            Some(&Value::Unavailable),
+            "one unavailable input sinks the whole expression — never a partial sum"
+        );
+    }
+
+    #[test]
+    fn division_by_zero_and_an_out_of_range_result_are_unavailable() {
+        let fake = Rc::new(Fake::new(64));
+        fake.write_i32(0, 10);
+        fake.write_i32(4, 0);
+        fake.write_i32(8, i32::MAX);
+        let p = profile(vec![
+            tier1("hp", 0, None),
+            tier1("zero", 4, None),
+            tier1("huge", 8, None),
+            derived(
+                "ratio",
+                ValueType::I32,
+                None,
+                r#"{ "div": [{ "watch": "hp" }, { "watch": "zero" }] }"#,
+            ),
+            derived(
+                "overflow",
+                ValueType::I32,
+                None,
+                r#"{ "mul": [{ "watch": "huge" }, { "const": 2 }] }"#,
+            ),
+            derived(
+                "quarter",
+                ValueType::I32,
+                None,
+                r#"{ "div": [{ "watch": "hp" }, { "const": 4 }] }"#,
+            ),
+        ]);
+        let mut s = Session::attach(Rc::clone(&fake), &p, Config::default());
+        let d = s.poll(Duration::ZERO);
+        assert_eq!(
+            d.get("ratio"),
+            Some(&Value::Unavailable),
+            "division by zero is unavailable, never an infinity"
+        );
+        assert_eq!(
+            d.get("overflow"),
+            Some(&Value::Unavailable),
+            "an out-of-range result is unavailable, never a saturated number"
+        );
+        assert_eq!(
+            d.get("quarter"),
+            Some(&Value::I32(2)),
+            "an in-range fraction truncates toward zero"
+        );
+    }
+
+    #[test]
+    fn sum_takes_a_prefix_and_clamps_it_to_the_list() {
+        let fake = Rc::new(Fake::new(0x600));
+        plant_collection(&fake, &[11, 22, 33]);
+        let p = profile(vec![
+            i32_collection_watch("enemy_hp", 64),
+            derived(
+                "first_two",
+                ValueType::I32,
+                None,
+                r#"{ "sum": { "watch": "enemy_hp", "take": { "const": 2 } } }"#,
+            ),
+            derived(
+                "past_the_end",
+                ValueType::I32,
+                None,
+                r#"{ "sum": { "watch": "enemy_hp", "take": { "const": 9 } } }"#,
+            ),
+            derived(
+                "none_of_them",
+                ValueType::I32,
+                None,
+                r#"{ "sum": { "watch": "enemy_hp", "take": { "const": 0 } } }"#,
+            ),
+            derived(
+                "negative_take",
+                ValueType::I32,
+                None,
+                r#"{ "sum": { "watch": "enemy_hp", "take": { "const": -1 } } }"#,
+            ),
+        ]);
+        let mut s = Session::attach(Rc::clone(&fake), &p, Config::default());
+        let d = s.poll(Duration::ZERO);
+        assert_eq!(d.get("first_two"), Some(&Value::I32(33)));
+        assert_eq!(
+            d.get("past_the_end"),
+            Some(&Value::I32(66)),
+            "a take past the end clamps to the list rather than failing"
+        );
+        assert_eq!(d.get("none_of_them"), Some(&Value::I32(0)));
+        assert_eq!(
+            d.get("negative_take"),
+            Some(&Value::Unavailable),
+            "a negative take is a broken formula, not an empty range"
+        );
+    }
+
+    /// Plant a **polymorphic** modifier list: elements of different kinds in one
+    /// array, each `{kind: string, stat: i32, amount: i32}`. This is the shape a
+    /// `where` clause exists for — without a clause on the type tag, an entry of
+    /// the wrong kind contributes a number that means nothing.
+    fn plant_modifiers(fake: &Fake, mods: &[(&str, i32, i32)]) {
+        let base = fake.base;
+        fake.write_u64(0x100, base + 0x200); // items -> backing array
+        fake.write_i32(0x108, mods.len() as i32); // count
+        for (i, (kind, stat, amount)) in mods.iter().enumerate() {
+            let elem = 0x300 + i * 0x40;
+            let text = 0x400 + i * 0x80;
+            fake.write_u64(0x220 + i * 8, base + elem as u64); // slot -> element
+            fake.write_u64(elem, base + text as u64); // element.kind -> string
+            fake.write_i32(elem + 8, *stat);
+            fake.write_i32(elem + 12, *amount);
+            let utf16: Vec<u8> = kind.encode_utf16().flat_map(u16::to_le_bytes).collect();
+            fake.write_i32(text + 0x10, (utf16.len() / 2) as i32);
+            fake.write_bytes(text + 0x14, &utf16);
+        }
+    }
+
+    /// The record collection over [`plant_modifiers`]'s layout.
+    fn modifier_collection(name: &str) -> Watch {
+        Watch::Collection {
+            name: name.to_string(),
+            base: Base::Tier1 {
+                module: "fake".to_string(),
+                offsets: vec![0x100],
+            },
+            count: vec![0x8],
+            items: Some(vec![0x0]),
+            first: 0x20,
+            stride: 8,
+            element: vec![0, 0],
+            ty: None,
+            fields: Some(fields(&[
+                ("kind", vec![0], il2cpp_string()),
+                ("stat", vec![8], ValueType::I32),
+                ("amount", vec![12], ValueType::I32),
+            ])),
+            max: 16,
+            rate_hz: None,
+        }
+    }
+
+    #[test]
+    fn a_multi_clause_where_filters_a_polymorphic_list() {
+        let fake = Rc::new(Fake::new(0x800));
+        // The third entry is of another kind entirely: its `stat` slot is not a
+        // stat id and its `amount` is not an amount. A sum that trusts it lies.
+        plant_modifiers(
+            &fake,
+            &[
+                ("PlayerAddStatModifier", 0, 15),
+                ("PlayerAddStatModifier", 1, 3),
+                ("PercentageBasicAttackDamageHealModifier", 0, 999),
+                ("PlayerAddStatModifier", 0, 10),
+            ],
+        );
+        let p = profile(vec![
+            modifier_collection("mods"),
+            derived(
+                "hp_bonus",
+                ValueType::I32,
+                None,
+                r#"{ "sum": { "watch": "mods", "field": "amount", "where": [
+                     { "field": "kind", "eq": "PlayerAddStatModifier" },
+                     { "field": "stat", "eq": 0 } ] } }"#,
+            ),
+            derived(
+                "unfiltered",
+                ValueType::I32,
+                None,
+                r#"{ "sum": { "watch": "mods", "field": "amount",
+                     "where": [{ "field": "stat", "eq": 0 }] } }"#,
+            ),
+            derived(
+                "add_stat_mods",
+                ValueType::U32,
+                None,
+                r#"{ "count": { "watch": "mods",
+                     "where": [{ "field": "kind", "eq": "PlayerAddStatModifier" }] } }"#,
+            ),
+        ]);
+        let mut s = Session::attach(Rc::clone(&fake), &p, Config::default());
+        let d = s.poll(Duration::ZERO);
+        assert_eq!(
+            d.get("hp_bonus"),
+            Some(&Value::I32(25)),
+            "both clauses must hold: 15 + 10, and not the foreign entry"
+        );
+        assert_eq!(
+            d.get("unfiltered"),
+            Some(&Value::I32(1024)),
+            "without the type-tag clause the foreign entry's bytes join the sum — \
+             the exact silent garbage the clause exists to exclude"
+        );
+        assert_eq!(
+            d.get("add_stat_mods"),
+            Some(&Value::U32(3)),
+            "count reports how many elements matched, needing no field"
+        );
+    }
+
+    #[test]
+    fn a_where_clause_naming_a_missing_field_is_unavailable() {
+        let fake = Rc::new(Fake::new(0x800));
+        plant_modifiers(&fake, &[("PlayerAddStatModifier", 0, 15)]);
+        let p = profile(vec![
+            modifier_collection("mods"),
+            derived(
+                "typo",
+                ValueType::I32,
+                None,
+                r#"{ "sum": { "watch": "mods", "field": "amount",
+                     "where": [{ "field": "staat", "eq": 0 }] } }"#,
+            ),
+        ]);
+        let mut s = Session::attach(Rc::clone(&fake), &p, Config::default());
+        assert_eq!(
+            s.poll(Duration::ZERO).get("typo"),
+            Some(&Value::Unavailable),
+            "a clause that cannot be answered must not quietly filter everything out"
+        );
+    }
+
+    #[test]
+    fn an_empty_sum_is_zero_but_an_empty_extremum_is_unavailable() {
+        let fake = Rc::new(Fake::new(0x600));
+        plant_collection(&fake, &[]);
+        let p = profile(vec![
+            i32_collection_watch("enemy_hp", 64),
+            derived(
+                "total",
+                ValueType::I32,
+                None,
+                r#"{ "sum": { "watch": "enemy_hp" } }"#,
+            ),
+            derived(
+                "worst",
+                ValueType::I32,
+                None,
+                r#"{ "min": { "watch": "enemy_hp" } }"#,
+            ),
+        ]);
+        let mut s = Session::attach(Rc::clone(&fake), &p, Config::default());
+        let d = s.poll(Duration::ZERO);
+        assert_eq!(
+            d.get("enemy_hp"),
+            Some(&Value::List(vec![])),
+            "the fixture really is an empty list, not a failed read"
+        );
+        assert_eq!(
+            d.get("total"),
+            Some(&Value::I32(0)),
+            "nothing matched is a real answer for a sum"
+        );
+        assert_eq!(
+            d.get("worst"),
+            Some(&Value::Unavailable),
+            "an extremum over nothing has no neutral element to report honestly"
+        );
+    }
+
+    #[test]
+    fn a_sum_spanning_a_broken_element_is_unavailable() {
+        let fake = Rc::new(Fake::new(0x600));
+        plant_collection(&fake, &[11, 22, 33]);
+        // The middle slot points at unmapped memory: the list still forms, with a
+        // nested Unavailable — but a sum across it would under-report by 22.
+        fake.write_u64(0x228, 0xdead_0000);
+        let p = profile(vec![
+            i32_collection_watch("enemy_hp", 64),
+            derived(
+                "total",
+                ValueType::I32,
+                None,
+                r#"{ "sum": { "watch": "enemy_hp" } }"#,
+            ),
+            derived(
+                "first_only",
+                ValueType::I32,
+                None,
+                r#"{ "sum": { "watch": "enemy_hp", "take": { "const": 1 } } }"#,
+            ),
+        ]);
+        let mut s = Session::attach(Rc::clone(&fake), &p, Config::default());
+        let d = s.poll(Duration::ZERO);
+        assert_eq!(
+            d.get("total"),
+            Some(&Value::Unavailable),
+            "skipping an unreadable element would quietly under-report the sum"
+        );
+        assert_eq!(
+            d.get("first_only"),
+            Some(&Value::I32(11)),
+            "…but a range that stops short of it is perfectly answerable"
+        );
+    }
+
+    #[test]
+    fn min_and_max_accept_both_the_n_ary_and_the_fold_form() {
+        let fake = Rc::new(Fake::new(0x600));
+        plant_collection(&fake, &[11, 22, 33]);
+        fake.write_i32(0x10, -5); // a stat that has gone negative
+        let p = profile(vec![
+            i32_collection_watch("enemy_hp", 64),
+            tier1("drain", 0x10, None),
+            derived(
+                "clamped",
+                ValueType::I32,
+                None,
+                r#"{ "max": [{ "const": 0 }, { "watch": "drain" }] }"#,
+            ),
+            derived(
+                "worst_enemy",
+                ValueType::I32,
+                None,
+                r#"{ "min": { "watch": "enemy_hp" } }"#,
+            ),
+            derived(
+                "best_enemy",
+                ValueType::I32,
+                None,
+                r#"{ "max": { "watch": "enemy_hp" } }"#,
+            ),
+        ]);
+        let mut s = Session::attach(Rc::clone(&fake), &p, Config::default());
+        let d = s.poll(Duration::ZERO);
+        assert_eq!(
+            d.get("clamped"),
+            Some(&Value::I32(0)),
+            "the array form is n-ary over operands — here a clamp at zero"
+        );
+        assert_eq!(d.get("worst_enemy"), Some(&Value::I32(11)));
+        assert_eq!(
+            d.get("best_enemy"),
+            Some(&Value::I32(33)),
+            "the object form folds a list; the two never collide"
+        );
+    }
+
+    #[test]
+    fn each_emits_a_list_with_a_failing_element_unavailable_in_place() {
+        let fake = Rc::new(Fake::new(0x400));
+        let base = fake.base;
+        fake.write_u64(0x100, base + 0x200); // items -> backing array
+        fake.write_i32(0x108, 3); // count
+        fake.write_u64(0x220, base + 0x300); // slot0 -> member0
+        fake.write_i32(0x300, 100); // member0.hp
+        fake.write_i32(0x304, 20); // member0.mp
+        fake.write_u64(0x228, 0xdead_0000); // slot1 -> unmapped
+        fake.write_u64(0x230, base + 0x340); // slot2 -> member2
+        fake.write_i32(0x340, 80); // member2.hp
+        fake.write_i32(0x344, 55); // member2.mp
+
+        let p = profile(vec![
+            Watch::Collection {
+                name: "party".to_string(),
+                base: Base::Tier1 {
+                    module: "fake".to_string(),
+                    offsets: vec![0x100],
+                },
+                count: vec![0x8],
+                items: Some(vec![0x0]),
+                first: 0x20,
+                stride: 8,
+                element: vec![0, 0],
+                ty: None,
+                fields: Some(fields(&[
+                    ("hp", vec![0], ValueType::I32),
+                    ("mp", vec![4], ValueType::I32),
+                ])),
+                max: 8,
+                rate_hz: None,
+            },
+            derived(
+                "reserves",
+                ValueType::I32,
+                Some("party"),
+                r#"{ "add": [{ "item": "hp" }, { "item": "mp" }] }"#,
+            ),
+        ]);
+        let mut s = Session::attach(Rc::clone(&fake), &p, Config::default());
+        assert_eq!(
+            s.poll(Duration::ZERO).get("reserves"),
+            Some(&Value::List(vec![
+                Value::I32(120),
+                Value::Unavailable,
+                Value::I32(135),
+            ])),
+            "an element whose expression fails is unavailable in place; the list forms"
+        );
+    }
+
+    #[test]
+    fn an_each_over_a_watch_that_is_not_a_list_is_wholly_unavailable() {
+        // Too small a region for the container chain to resolve at all: the
+        // collection is Unavailable rather than a list, so `each` has nothing to
+        // iterate.
+        let fake = Rc::new(Fake::new(0x10));
+        let p = profile(vec![
+            i32_collection_watch("enemy_hp", 64),
+            derived(
+                "doubled",
+                ValueType::I32,
+                Some("enemy_hp"),
+                r#"{ "mul": [{ "item": "hp" }, { "const": 2 }] }"#,
+            ),
+        ]);
+        let mut s = Session::attach(Rc::clone(&fake), &p, Config::default());
+        let d = s.poll(Duration::ZERO);
+        assert_eq!(d.get("enemy_hp"), Some(&Value::Unavailable));
+        assert_eq!(
+            d.get("doubled"),
+            Some(&Value::Unavailable),
+            "no list to walk means no list to emit — not an empty one"
+        );
+    }
+
+    #[test]
+    fn derived_watches_do_not_vote_on_the_reattach_decision() {
+        // A derived watch reads no memory, so a healthy one must not mask a
+        // target that has genuinely gone. Here `always` succeeds every tick (it
+        // folds nothing but a literal) while the only memory watch fails: the
+        // re-attach must still fire on schedule.
+        let fake = Rc::new(Fake::new(64));
+        fake.write_i32(0, 1);
+        let p = profile(vec![
+            tier1("hp", 0, None),
+            derived("always", ValueType::I32, None, r#"{ "const": 1 }"#),
+        ]);
+        let config = Config {
+            base_tick: Duration::from_millis(50),
+            reattach_after: 3,
+        };
+        let mut s = Session::attach(Rc::clone(&fake), &p, config);
+        assert_eq!(fake.base_calls.get(), 1, "attach resolved the base once");
+
+        s.poll(Duration::ZERO);
+        fake.fail.set(true);
+        s.poll(Duration::from_millis(50));
+        s.poll(Duration::from_millis(100));
+        assert_eq!(
+            fake.base_calls.get(),
+            1,
+            "no re-attach before the threshold"
+        );
+        s.poll(Duration::from_millis(150));
+        assert_eq!(
+            fake.base_calls.get(),
+            2,
+            "a derived watch that still evaluates must not look like a live target"
         );
     }
 

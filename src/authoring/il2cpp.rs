@@ -70,7 +70,7 @@ use std::fmt;
 use serde::Deserialize;
 
 use crate::aob;
-use crate::profile::{Base, Match, Profile, Rip, ValueType, Watch};
+use crate::profile::{Base, Expr, Match, Profile, Rip, ValueType, Watch};
 
 // ---- the dump.cs symbol table ---------------------------------------------
 
@@ -450,6 +450,29 @@ pub enum WatchSpec {
         #[serde(default)]
         rate_hz: Option<f64>,
     },
+    /// A derived value: arithmetic over what the other watches read. Mirrors
+    /// [`Watch::Derived`] **exactly**, because there is nothing here for the
+    /// converter to resolve — a derived watch carries no offsets, so it is
+    /// copied through verbatim.
+    ///
+    /// That makes it the one watch kind a game patch cannot invalidate: the
+    /// fragile numbers all live in the watches it folds, and re-running this
+    /// converter against a new dump fixes those without touching a formula.
+    Derived {
+        /// Label for the value.
+        name: String,
+        /// The output type; never a string.
+        #[serde(rename = "type")]
+        ty: ValueType,
+        /// Optional earlier collection to evaluate once per element.
+        #[serde(default)]
+        each: Option<String>,
+        /// The expression, carried through untouched. See [`Expr`].
+        value: Expr,
+        /// Optional per-watch sample rate in hertz.
+        #[serde(default)]
+        rate_hz: Option<f64>,
+    },
 }
 
 /// One named field of a [record](WatchSpec::Record) in the author map — a chain
@@ -722,6 +745,21 @@ fn build_watch(
             name: name.clone(),
             base: build_base(name, base, symbols, default_module)?,
             fields: resolve_fields(name, fields, symbols)?,
+            rate_hz: *rate_hz,
+        }),
+        // Nothing here for the dump to have a say in: a derived watch names no
+        // fields and walks no chains, so it is copied through verbatim.
+        WatchSpec::Derived {
+            name,
+            ty,
+            each,
+            value,
+            rate_hz,
+        } => Ok(Watch::Derived {
+            name: name.clone(),
+            ty: *ty,
+            each: each.clone(),
+            value: value.clone(),
             rate_hz: *rate_hz,
         }),
     }
@@ -1348,6 +1386,73 @@ public class PartyMember
         }
         let json = profile.to_json().expect("serialize");
         assert_eq!(Profile::from_json(&json).expect("re-parse"), profile);
+    }
+
+    #[test]
+    fn carries_a_derived_watch_through_verbatim() {
+        // A derived watch has no chain for the dump to resolve — which is the
+        // interesting part: it is the one watch kind a game patch cannot
+        // invalidate, because every fragile number lives in the watches it folds.
+        let map = r#"{
+          "process": "g.exe", "module": "GameAssembly.dll",
+          "probe": "90 90",
+          "watches": [
+            { "name": "hp", "tier": "tier1",
+              "chain": ["0x2C4E120", "Combat.PartyMember::currentHp"], "type": "i32" },
+            { "name": "hp_max", "tier": "tier1",
+              "chain": ["0x2C4E120", "Combat.PartyMember::maxHp"], "type": "i32" },
+            { "name": "hp_percent", "tier": "derived", "type": "f32",
+              "value": { "mul": [{ "const": 100 },
+                                 { "div": [{ "watch": "hp" }, { "watch": "hp_max" }] }] },
+              "rate_hz": 4.0 }
+          ]
+        }"#;
+        let profile = convert_files(DUMP, map).expect("convert");
+        match &profile.watches[2] {
+            Watch::Derived {
+                name,
+                ty,
+                each,
+                value,
+                rate_hz,
+            } => {
+                assert_eq!(name, "hp_percent");
+                assert_eq!(*ty, ValueType::F32);
+                assert_eq!(*each, None);
+                assert_eq!(*rate_hz, Some(4.0));
+                // The expression arrived untouched — no offset anywhere in it.
+                match value {
+                    Expr::Mul { mul } => assert_eq!(mul.len(), 2),
+                    other => panic!("expected a mul, got {other:?}"),
+                }
+            }
+            other => panic!("expected a Derived, got {other:?}"),
+        }
+        // And the emitted profile is one the runtime accepts: the references
+        // point at watches declared above, so validation passes.
+        let json = profile.to_json().expect("serialize");
+        assert_eq!(Profile::from_json(&json).expect("re-parse"), profile);
+    }
+
+    #[test]
+    fn a_derived_watch_referring_downwards_is_rejected_at_authoring_time() {
+        // The runtime's declaration-order rule is enforced here too, so a broken
+        // formula fails at conversion rather than against a live game.
+        let map = r#"{
+          "process": "g.exe", "module": "GameAssembly.dll",
+          "probe": "90 90",
+          "watches": [
+            { "name": "doubled", "tier": "derived", "type": "i32",
+              "value": { "mul": [{ "watch": "hp" }, { "const": 2 }] } },
+            { "name": "hp", "tier": "tier1",
+              "chain": ["0x2C4E120", "Combat.PartyMember::currentHp"], "type": "i32" }
+          ]
+        }"#;
+        let err = convert_files(DUMP, map).unwrap_err().to_string();
+        assert!(
+            err.contains("doubled"),
+            "error should name the watch: {err}"
+        );
     }
 
     #[test]
