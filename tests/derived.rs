@@ -235,7 +235,11 @@ fn a_derived_watch_re_emits_exactly_when_its_input_changes() {
         match (snap.get("frame"), snap.get("frame_doubled")) {
             (None, None) => {} // quiet tick: the input did not move
             (Some(Value::I32(frame)), Some(Value::I32(doubled))) => {
-                assert_eq!(doubled, &(frame * 2), "the derived value must match the tick");
+                assert_eq!(
+                    doubled,
+                    &(frame * 2),
+                    "the derived value must match the tick"
+                );
                 changes += 1;
             }
             other => panic!("a derived watch must diff in lockstep with its input: {other:?}"),

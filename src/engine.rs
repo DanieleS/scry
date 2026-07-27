@@ -2594,7 +2594,11 @@ mod tests {
         fake.fail.set(true);
         s.poll(Duration::from_millis(50));
         s.poll(Duration::from_millis(100));
-        assert_eq!(fake.base_calls.get(), 1, "no re-attach before the threshold");
+        assert_eq!(
+            fake.base_calls.get(),
+            1,
+            "no re-attach before the threshold"
+        );
         s.poll(Duration::from_millis(150));
         assert_eq!(
             fake.base_calls.get(),

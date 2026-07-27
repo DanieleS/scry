@@ -1449,7 +1449,10 @@ public class PartyMember
           ]
         }"#;
         let err = convert_files(DUMP, map).unwrap_err().to_string();
-        assert!(err.contains("doubled"), "error should name the watch: {err}");
+        assert!(
+            err.contains("doubled"),
+            "error should name the watch: {err}"
+        );
     }
 
     #[test]

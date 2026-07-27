@@ -112,9 +112,9 @@ mod hexnum {
     pub fn de_f64<'de, D: Deserializer<'de>>(d: D) -> Result<f64, D::Error> {
         match FloatRepr::deserialize(d)? {
             FloatRepr::Num(x) => Ok(x),
-            FloatRepr::Text(s) => parse(&s).map(|n| n as f64).ok_or_else(|| {
-                de::Error::custom(format!("not a decimal or 0x-hex number: {s:?}"))
-            }),
+            FloatRepr::Text(s) => parse(&s)
+                .map(|n| n as f64)
+                .ok_or_else(|| de::Error::custom(format!("not a decimal or 0x-hex number: {s:?}"))),
         }
     }
 }
@@ -892,7 +892,11 @@ impl Profile {
                     )));
                 }
                 Watch::Derived {
-                    name, ty, each, value, ..
+                    name,
+                    ty,
+                    each,
+                    value,
+                    ..
                 } => check_derived(name, *ty, each.as_deref(), value, &earlier)?,
                 _ => {}
             }
@@ -1638,7 +1642,11 @@ mod tests {
         // fold, which is the one place two shapes share a key.
         match &p.watches[3] {
             Watch::Derived {
-                name, ty, each, value, ..
+                name,
+                ty,
+                each,
+                value,
+                ..
             } => {
                 assert_eq!(name, "max_hp");
                 assert_eq!(*ty, ValueType::I32);
@@ -1732,7 +1740,10 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(err.contains("orphan"), "error should name the watch: {err}");
-        assert!(err.contains("each"), "…and point at the missing each: {err}");
+        assert!(
+            err.contains("each"),
+            "…and point at the missing each: {err}"
+        );
     }
 
     #[test]
@@ -1747,8 +1758,14 @@ mod tests {
         )
         .unwrap_err()
         .to_string();
-        assert!(err.contains("doubled"), "error should name the watch: {err}");
-        assert!(err.contains("player"), "…and what it tried to iterate: {err}");
+        assert!(
+            err.contains("doubled"),
+            "error should name the watch: {err}"
+        );
+        assert!(
+            err.contains("player"),
+            "…and what it tried to iterate: {err}"
+        );
 
         // The same watch over a real collection is fine.
         let watches = format!(
@@ -1769,7 +1786,10 @@ mod tests {
         )
         .unwrap_err()
         .to_string();
-        assert!(err.contains("headroom"), "error should name the watch: {err}");
+        assert!(
+            err.contains("headroom"),
+            "error should name the watch: {err}"
+        );
         assert!(err.contains("sub"), "…and the operator: {err}");
 
         // …and an n-ary operator needs at least one operand.
@@ -1778,7 +1798,10 @@ mod tests {
         )
         .unwrap_err()
         .to_string();
-        assert!(err.contains("nothing"), "error should name the watch: {err}");
+        assert!(
+            err.contains("nothing"),
+            "error should name the watch: {err}"
+        );
         assert!(err.contains("add"), "…and the operator: {err}");
     }
 
