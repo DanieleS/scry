@@ -266,3 +266,131 @@ scalar or string, never another record; deeper trees stay the consumer's job.
 The IL2CPP converter (`docs/authoring-il2cpp.md`) speaks the same shape with
 `Class::field` names in every chain, so the fragile offsets are derived from a
 dump rather than hand-counted.
+
+## Derived values (computed, never read)
+
+Games routinely **compute** the numbers a player sees instead of storing them:
+percent of max, a party total, an effective stat that is base plus equipment, a
+count of living enemies. The arithmetic is trivial; the plumbing to reach the
+inputs is not — and without this tier every consumer re-implements it.
+
+A `derived` watch folds values **other watches already produced**, using a small
+expression carried as data — the same discipline that makes `collection` express
+iteration as `count`/`stride`/`element` rather than as a script:
+
+```json
+{ "tier": "derived", "name": "hp_percent", "type": "f32",
+  "value": { "mul": [ { "const": 100 },
+                      { "div": [ { "watch": "hp" }, { "watch": "hp_max" } ] } ] } }
+```
+
+**A derived watch never touches memory.** That one rule is what stops this from
+growing into an embedded interpreter, and it makes the failure story trivial: any
+unavailable input yields an unavailable output. It is also what makes the tier
+**engine-agnostic by construction** — everything engine-specific in scry lives in
+offsets, AOB signatures and string layouts, and by the time a value reaches an
+expression it is just a number, a string, a list or a map.
+
+| field | meaning |
+|---|---|
+| `type` | the output type — `i32`, `u32`, `f32`, `u64`. **Never a string**: this is an arithmetic result |
+| `each` | *optional*; names a `collection` declared earlier. The expression runs once per element and the watch emits a list |
+| `value` | the expression (below) |
+
+### Expression nodes
+
+| node | JSON | meaning |
+|---|---|---|
+| literal | `{"const": 6}` | a number (hex string accepted, as everywhere else) |
+| ref | `{"watch": "hp"}` | that watch's value this tick |
+| ref (indexed) | `{"watch": "characters", "index": 2}` | into a list |
+| ref (keyed) | `{"watch": "party_progress", "field": "level"}` | into a record |
+| ref (both) | `{"watch": "characters", "index": 2, "field": "base_hp"}` | index, then key |
+| element | `{"item": "base_patk"}` | a field of the current element; **only under `each`** |
+| n-ary | `{"add": […]}` `{"mul": […]}` `{"min": […]}` `{"max": […]}` | at least one operand |
+| binary | `{"sub": [a, b]}` `{"div": [a, b]}` | exactly two |
+| fold | `{"sum": {"watch": "…", "field": "…", "take": <expr>, "where": [ … ]}}` | Σ over a list watch |
+| fold | `{"count": {"watch": "…", "where": [ … ]}}` | how many elements match |
+| fold | `{"min": {…}}` `{"max": {…}}` | extremum over a list watch |
+
+`field`, `take` and `where` are each optional on a fold. `field` is required when
+the elements are records, omitted when they are scalars; `count` ignores it,
+since counting never reads a value.
+
+`min`/`max` deliberately accept **either** form, discriminated by JSON type: an
+**array** is n-ary over operands (`{"max": [{"const": 0}, {"watch": "hp"}]}`
+clamps at zero), an **object** is a fold over a list
+(`{"max": {"watch": "enemies", "field": "hp"}}`). Both are common and the two
+JSON types can never collide, so one key carries both.
+
+### Predicates
+
+`where` is a flat list of clauses, **all** of which must hold (implicit AND).
+Each compares one field of the element against a literal:
+
+```json
+"where": [ { "field": "kind", "eq": "PlayerAddStatModifier" },
+           { "field": "stat", "eq": 0 } ]
+```
+
+`eq`, `ne`, `lt`, `le`, `gt`, `ge`. Numbers compare numerically; strings only
+under `eq`/`ne` (an ordering on text would be a collation policy the engine has
+no business having). Clauses stay flat — no nesting, no boolean algebra, no `or`.
+A profile that genuinely needs `or` is a signal to reconsider the profile, not to
+extend the language.
+
+Filtering is not decoration: **heterogeneous lists are the norm.** `sum hp where
+alive == 1`, `count where team == 2`, `sum damage where school == "fire"`. In the
+Sea of Stars profile the gear-modifier list is polymorphic, and one element is a
+`PercentageBasicAttackDamageHealModifier` whose `stat` field reads `1041865114` —
+adjacent memory reinterpreted. Without a clause on the type tag the sum silently
+produces a garbage number. A C++ game would tag with a vtable/RTTI name, an ECS
+with an integer component id; the predicate is the same either way, and reaching
+the discriminant is the profile's job exactly as it is for every other field.
+
+### Fail-soft rules
+
+- The expression evaluates in `f64`, then coerces to `type`. Integer types
+  truncate toward zero. A non-finite result, or one outside the target's range,
+  is `unavailable` — **never a saturated number**, which would be a lie a
+  consumer can't detect.
+- **Any** referenced watch that is missing, `unavailable`, or the wrong shape
+  (indexing a scalar, keying a list, a field that isn't a number where arithmetic
+  needs one) makes the whole expression `unavailable`.
+- Index out of range → `unavailable`. Division by zero → `unavailable`.
+- `take` clamps to `[0, len]`; a negative or unavailable `take` is `unavailable`.
+- `sum` over an empty or fully-filtered list is `0` — "nothing matched" is a real
+  answer. But an `unavailable` element *inside* the summed range makes the sum
+  `unavailable`: skipping it would quietly under-report. An empty `min`/`max`
+  fold **is** `unavailable` — there is no neutral element to return honestly.
+- A `where` clause naming a field the element lacks makes the fold
+  `unavailable`, rather than silently filtering everything out.
+- Under `each`, an element whose expression fails is an `unavailable` in place
+  and the list still forms — exactly how `collection` already treats elements.
+
+### Ordering, and why there is no dependency graph
+
+Every `{"watch": n}` must name a watch declared **earlier in the array**. That is
+the whole cycle-prevention story: a cycle is unrepresentable rather than merely
+detected, there is no graph to walk and no topological sort to run, and
+evaluation order simply falls out of declaration order. A forward or self
+reference is rejected at load time, naming both watches.
+
+Each tick runs in two phases: every due *memory* watch is sampled first, then
+every due *derived* watch is evaluated against the result. So a derived watch
+sees fresh values for whatever was sampled this tick and the most recent value
+for whatever wasn't due — the correct "latest known" semantics. Derived watches
+also never count toward the failure streak that triggers a re-attach: they read
+no memory, so letting them vote would make a formula error look like a detached
+process.
+
+### Known limitation
+
+A collection element's fields must be scalars, so there is no way to hang a
+per-entity sub-list off an element. That is why a profile computing, say, each
+character's max HP from their own level-up and upgrade lists has to declare one
+collection per character (`garl_levelups`, `valere_levelups`, …) instead of one
+`each` over the roster. Letting a collection field be itself a collection,
+recursively with a depth cap, would collapse those — but it is a real relaxation
+of the "one shallow level of structure" doctrine above, so it is a separate
+decision, not a corner of this one.
