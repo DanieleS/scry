@@ -320,9 +320,16 @@ fn anchor_from_base(base: &Base) -> (AnchorKind, Vec<i64>) {
 
 /// Convert an optional rate into a minimum sampling period. A missing or
 /// non-positive rate collapses to "every tick".
+///
+/// A validated profile keeps the rate inside
+/// [`MIN_RATE_HZ`](crate::profile::MIN_RATE_HZ)..=[`MAX_RATE_HZ`](crate::profile::MAX_RATE_HZ),
+/// but a [`Profile`] can also be built by hand, and `Duration::from_secs_f64`
+/// panics on a period it cannot hold. So the conversion is the fallible one: a
+/// rate too small to express as a period means "as rarely as can be said",
+/// which is [`Duration::MAX`], not a crash.
 fn period_of(rate_hz: Option<f64>) -> Duration {
     match rate_hz {
-        Some(hz) if hz > 0.0 => Duration::from_secs_f64(1.0 / hz),
+        Some(hz) if hz > 0.0 => Duration::try_from_secs_f64(1.0 / hz).unwrap_or(Duration::MAX),
         _ => Duration::ZERO,
     }
 }
@@ -1122,7 +1129,9 @@ impl<B: MemoryBackend> Session<B> {
                 continue;
             }
             sampled += 1;
-            w.next_due = elapsed + w.period;
+            // Saturating, because a period of `Duration::MAX` (see `period_of`)
+            // would otherwise overflow the addition.
+            w.next_due = elapsed.saturating_add(w.period);
 
             let value = sample_one(&self.backend, w, &self.last);
             if value == Value::Unavailable {
@@ -1520,6 +1529,25 @@ mod tests {
             s.poll(Duration::from_millis(150)).get("speed"),
             Some(&Value::F32(1.5))
         );
+    }
+
+    /// A hand-built profile skips validation, so the engine must survive a rate
+    /// whose period no `Duration` can hold: sample once, then never again.
+    #[test]
+    fn a_vanishingly_small_rate_samples_once_instead_of_panicking() {
+        assert_eq!(period_of(Some(1e-300)), Duration::MAX);
+        let fake = Rc::new(Fake::new(64));
+        let profile = Profile {
+            label: None,
+            contract: None,
+            contract_version: None,
+            match_: ident(),
+            watches: vec![tier1("hp", 0, Some(1e-300))],
+        };
+        let mut s = Session::attach(Rc::clone(&fake), &profile, Config::default());
+        assert!(s.poll(Duration::ZERO).contains_key("hp"));
+        fake.write_i32(0, 5);
+        assert!(s.poll(Duration::from_secs(3600)).is_empty());
     }
 
     #[test]

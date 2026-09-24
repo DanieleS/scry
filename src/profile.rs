@@ -972,6 +972,7 @@ impl Profile {
     ///   [`Item`](Expr::Item) only under an `each` naming an earlier collection,
     ///   and must give each operator the arity it takes.
     /// - No two watches share a `name`, across every tier.
+    /// - A `rate_hz`, when given, lies within [`MIN_RATE_HZ`]..=[`MAX_RATE_HZ`].
     /// - A declared [`contract`](Profile::contract) has a slug id, and agrees
     ///   with the deprecated `contractVersion` when both are given.
     pub fn validate(&self) -> Result<()> {
@@ -988,6 +989,7 @@ impl Profile {
             // each other in the snapshot every tick, so the diff would never
             // settle, and a derived watch would read whichever ran last.
             let name = watch_name(w);
+            check_rate(name, watch_rate(w))?;
             if declared_earlier(&earlier, name) {
                 return Err(Error::BadProfile(format!(
                     "watch {name:?} is declared more than once; every watch needs its own name, \
@@ -1084,6 +1086,46 @@ impl Profile {
     /// Serialize this profile to a pretty-printed JSON document.
     pub fn to_json(&self) -> Result<String> {
         serde_json::to_string_pretty(self).map_err(|e| Error::BadProfile(e.to_string()))
+    }
+}
+
+/// The slowest `rate_hz` a watch may ask for: one sample every 100 seconds.
+///
+/// Anything slower is indistinguishable from "read once" for a telemetry
+/// stream, and the bound is what keeps `1 / rate_hz` a period a [`Duration`]
+/// can hold: a rate like `1e-300` passed the old "is it positive" test and then
+/// overflowed the conversion, taking the whole process down.
+///
+/// [`Duration`]: std::time::Duration
+pub const MIN_RATE_HZ: f64 = 0.01;
+
+/// The fastest `rate_hz` a watch may ask for. The loop never samples faster than
+/// its own base tick anyway, so a higher rate could only ever be a typo.
+pub const MAX_RATE_HZ: f64 = 1000.0;
+
+/// A watch's `rate_hz`, whichever kind it is.
+fn watch_rate(w: &Watch) -> Option<f64> {
+    match w {
+        Watch::Tier1 { rate_hz, .. }
+        | Watch::Tier2 { rate_hz, .. }
+        | Watch::Collection { rate_hz, .. }
+        | Watch::Record { rate_hz, .. }
+        | Watch::Derived { rate_hz, .. } => *rate_hz,
+    }
+}
+
+/// A rate is either absent (every base tick) or a finite number of hertz inside
+/// the documented range. Zero and negative rates are rejected rather than read
+/// as "every tick", because that is what leaving the field out already says, and
+/// a profile should not have two spellings of one thing, one of them a typo.
+fn check_rate(name: &str, rate_hz: Option<f64>) -> Result<()> {
+    match rate_hz {
+        None => Ok(()),
+        Some(hz) if (MIN_RATE_HZ..=MAX_RATE_HZ).contains(&hz) => Ok(()),
+        Some(hz) => Err(Error::BadProfile(format!(
+            "watch {name:?}: `rate_hz` {hz} is outside {MIN_RATE_HZ}..={MAX_RATE_HZ}; omit it to \
+             sample every base tick"
+        ))),
     }
 }
 
@@ -2130,6 +2172,25 @@ mod tests {
             err.contains("type"),
             "…and say the output type is the problem: {err}"
         );
+    }
+
+    #[test]
+    fn rate_hz_must_lie_in_the_documented_range() {
+        let with_rate = |rate: &str| {
+            derived_profile(&format!(
+                r#"{{ "tier": "tier1", "name": "hp", "module": "g.exe", "offsets": [0],
+                      "type": "i32", "rate_hz": {rate} }}"#
+            ))
+        };
+        for ok in ["0.01", "1", "20.5", "1000"] {
+            assert!(with_rate(ok).is_ok(), "rate {ok} should be accepted");
+        }
+        // 1e-300 once passed validation and then overflowed `1 / rate` into a
+        // panic; zero and negatives are what omitting the field already says.
+        for bad in ["1e-300", "0.001", "0", "-5", "1000.5", "1e300"] {
+            let err = with_rate(bad).unwrap_err().to_string();
+            assert!(err.contains("`rate_hz`"), "rate {bad}: {err}");
+        }
     }
 
     #[test]

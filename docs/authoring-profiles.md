@@ -96,6 +96,14 @@ Offsets accept **hex strings or decimal**, mixed freely — paste what CE shows.
 The RIP decode computes `base = anchor + len + i32_at(anchor + disp)`, then
 `offsets` walk from there (each dereferenced except the last).
 
+Any watch may add a `rate_hz` to sample less often than the loop's base tick
+(slow state like a zone name needs far fewer reads than HP). It must lie between
+`0.01` (once every 100 s) and `1000`; leave it out to sample every tick. A rate
+outside that range is rejected when the profile loads.
+
+Every watch needs its own `name`, whatever its tier: the name is the key the
+value is emitted under, so a repeated one is rejected too.
+
 For the mandatory `match.probe`, use any stable signature in the module. For a
 first run you can skip the probe test with `--no-resolve`.
 
