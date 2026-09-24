@@ -142,6 +142,11 @@ PROFILES (at least one source):
     target's memory — so you can point it at a whole folder of community profiles
     and let the memory decide. If none fits, nothing is read (the fail-safe).
 
+    If several fit, a warning on stderr names them all, and the winner is the
+    one whose `match.version` the target confirmed, otherwise the first in load
+    order: --profile files in the order given, then --profiles files sorted by
+    file name.
+
 OPTIONS:
     --format <fmt>      `human` (default) for a readable stream, or `json` for
                         JSON Lines — one self-describing event object per line,
@@ -354,9 +359,29 @@ JSON OUTPUT:
                 );
                 return 1;
             }
-            match resolver::select(&backend, &name, &profiles) {
-                Ok(Some(p)) => p,
-                Ok(None) => {
+            match resolver::fitting(&backend, &name, &profiles) {
+                Ok(fits) if !fits.is_empty() => {
+                    if fits.len() > 1 {
+                        // Two profiles claiming one game usually means one of
+                        // them was written for another build and its probe is
+                        // too broad. Say so, and say which one won and why, so
+                        // the choice never looks arbitrary.
+                        let names: Vec<String> = fits
+                            .iter()
+                            .map(|p| describe(p, &profiles, &sources))
+                            .collect();
+                        eprintln!(
+                            "scry: warning: {} profiles fit '{name}': {}; using {} \
+                             (a profile whose match.version the target confirmed wins, \
+                             otherwise the first in load order)",
+                            fits.len(),
+                            names.join(", "),
+                            names[0],
+                        );
+                    }
+                    fits[0]
+                }
+                Ok(_) => {
                     eprintln!(
                         "scry: no profile fits '{name}' (pid {pid}) — nothing read.\n\
                          This is the fail-safe: a profile's probe must resolve in \
@@ -442,6 +467,22 @@ JSON OUTPUT:
             std::thread::sleep(config.base_tick);
             print_diff(session.poll(start.elapsed()), start.elapsed(), format);
         }
+    }
+
+    /// How to name a profile in a diagnostic: the file it came from when there
+    /// is one, else its label.
+    fn describe(profile: &Profile, profiles: &[Profile], sources: &[PathBuf]) -> String {
+        profiles
+            .iter()
+            .position(|p| std::ptr::eq(p, profile))
+            .and_then(|i| sources.get(i))
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| {
+                profile
+                    .label
+                    .clone()
+                    .unwrap_or_else(|| "(unlabeled profile)".to_string())
+            })
     }
 
     /// Write one JSON event as a line on stdout, flushed.
@@ -760,14 +801,24 @@ USAGE:
     /// from. A file that fails to parse is skipped with a warning rather than
     /// sinking the batch — one broken community profile must not deny telemetry
     /// to the valid ones.
+    ///
+    /// Sorted by file name, because the order is the resolver's last tie-break
+    /// and `read_dir` promises no order at all: without the sort, which of two
+    /// fitting profiles won could change from one machine, or one run, to the
+    /// next.
     fn load_profiles_dir(dir: &Path) -> Result<Vec<(PathBuf, Profile)>, String> {
-        let mut out = Vec::new();
+        let mut paths = Vec::new();
         for entry in std::fs::read_dir(dir).map_err(|e| e.to_string())? {
             let entry = entry.map_err(|e| e.to_string())?;
             let path = entry.path();
             if path.extension().and_then(|e| e.to_str()) != Some("json") {
                 continue;
             }
+            paths.push(path);
+        }
+        paths.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
+        let mut out = Vec::new();
+        for path in paths {
             match load_profile(&path) {
                 Ok(p) => out.push((path, p)),
                 Err(e) => eprintln!("scry: skipping {}: {e}", path.display()),

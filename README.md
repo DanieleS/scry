@@ -212,6 +212,12 @@ The resolver refuses to guess, narrowing in three steps, cheapest first:
    `probe` signature. The profile whose probe *actually resolves in that memory*
    wins.
 
+If several probes resolve, the choice is still deterministic: a profile whose
+`match.version` the backend confirmed beats one that pins no version, and
+otherwise the earlier profile wins. The CLI loads `--profile` files in the order
+given, then a `--profiles` folder sorted by file name, and warns on stderr
+naming every profile that fit.
+
 If no probe resolves, selection returns `None`. No telemetry, never a wrong
 match. That is why emulators and unknown builds simply get nothing, at zero
 cost — and why a broken community profile can't deny telemetry to a valid one

@@ -12,8 +12,15 @@
 //!    the module, drop profiles that name a *different* version. Profiles that
 //!    don't pin a version, and backends that can't report one, are unaffected.
 //! 3. **Probe test** — the authoritative step. For each surviving candidate,
-//!    scan the target for its `probe` signature. The first profile whose probe
-//!    *actually resolves in that memory* wins.
+//!    scan the target for its `probe` signature. The best-ranked profile whose
+//!    probe *actually resolves in that memory* wins.
+//!
+//! When more than one candidate fits, the choice is deterministic: a profile
+//! whose `match.version` the backend **confirmed** beats one that could not be
+//! confirmed (it pins no version, or the backend reports none), and otherwise
+//! the earlier profile in the slice wins. A host that loads a folder should
+//! therefore hand the profiles over in a stable order (the `scry` CLI sorts by
+//! file name), and can call [`fitting`] to learn that the choice was a tie.
 //!
 //! If no candidate's probe resolves, selection returns `None`: no telemetry,
 //! never a wrong match. That is the whole safety property — a profile must fit
@@ -32,48 +39,91 @@ use crate::profile::Profile;
 /// nothing fits — the fail-safe. A candidate with an unparseable probe is
 /// skipped rather than allowed to abort selection for the others; a broken
 /// community profile must not deny telemetry to a valid one.
+///
+/// When several fit, the winner is the one [`fitting`] would rank first; this
+/// stops scanning at that winner instead of probing the rest.
 pub fn select<'a, B: MemoryBackend + ?Sized>(
     backend: &B,
     process: &str,
     profiles: &'a [Profile],
 ) -> Result<Option<&'a Profile>> {
+    for profile in ranked_candidates(backend, process, profiles) {
+        if probe_fits(backend, profile)? {
+            return Ok(Some(profile));
+        }
+    }
+    // Nothing fit the memory. Fail safe.
+    Ok(None)
+}
+
+/// Every profile among `profiles` that fits the process, best first — the
+/// order [`select`] picks from, so `fitting(..)[0]` is what `select` returns.
+///
+/// Unlike [`select`] this probes every candidate, which costs one scan of the
+/// target per candidate. It is for a host that wants to know the choice was
+/// not unanimous (two profiles claiming one game is worth a warning: one of
+/// them is probably meant for another build), not for the hot path.
+pub fn fitting<'a, B: MemoryBackend + ?Sized>(
+    backend: &B,
+    process: &str,
+    profiles: &'a [Profile],
+) -> Result<Vec<&'a Profile>> {
+    let mut out = Vec::new();
+    for profile in ranked_candidates(backend, process, profiles) {
+        if probe_fits(backend, profile)? {
+            out.push(profile);
+        }
+    }
+    Ok(out)
+}
+
+/// Steps 1 and 2 — the process bucket and the version discriminant — with the
+/// survivors ordered by the tie-break: version-confirmed first, then slice
+/// order (the sort is stable).
+fn ranked_candidates<'a, B: MemoryBackend + ?Sized>(
+    backend: &B,
+    process: &str,
+    profiles: &'a [Profile],
+) -> Vec<&'a Profile> {
     // 1. Process bucket: the cheap coarse filter. Case-insensitive because
     //    Windows file names are: the same game is `Game.exe` in one report and
     //    `game.exe` in another, and a profile must not miss it over that. ASCII
     //    folding is enough for executable names and needs no locale; on Linux
     //    it can only widen the bucket, and the probe still decides.
-    let mut candidates: Vec<&Profile> = profiles
-        .iter()
-        .filter(|p| p.match_.process.eq_ignore_ascii_case(process))
-        .collect();
-
+    //
     // 2. Version discriminant, only where it can be applied. We drop a
-    //    candidate only when the backend reports a concrete version AND
-    //    the profile pins a *different* one. Anything we can't be sure about —
-    //    an unknown backend version, a version-less profile, a version read that
+    //    candidate only when the backend reports a concrete version AND the
+    //    profile pins a *different* one. Anything we can't be sure about — an
+    //    unknown backend version, a version-less profile, a version read that
     //    errors — is kept, and the probe settles it.
-    candidates.retain(
-        |p| match (backend.module_version(&p.match_.module), &p.match_.version) {
-            (Ok(Some(actual)), Some(want)) => actual == *want,
-            _ => true,
-        },
-    );
-
-    // 3. Probe test: the authoritative fit. First match wins, in profile order.
-    for profile in candidates {
-        let pattern = match aob::parse_pattern(&profile.match_.probe) {
-            Ok(pattern) => pattern,
-            // Malformed probe: this profile can never claim anything. Skip it,
-            // but let the others still compete.
-            Err(_) => continue,
-        };
-        if aob::find_in_process(backend, &pattern)?.is_some() {
-            return Ok(Some(profile));
+    let mut candidates: Vec<(bool, &Profile)> = Vec::new();
+    for p in profiles {
+        if !p.match_.process.eq_ignore_ascii_case(process) {
+            continue;
         }
+        let confirmed = match (backend.module_version(&p.match_.module), &p.match_.version) {
+            (Ok(Some(actual)), Some(want)) if actual != *want => continue,
+            (Ok(Some(_)), Some(_)) => true,
+            _ => false,
+        };
+        candidates.push((confirmed, p));
     }
+    // A profile pinned to the exact build the backend reports was written for
+    // this build; one that pins nothing was written for "any". The specific one
+    // is the better guess, and it keeps a generic fallback profile from
+    // shadowing a build-specific one that happens to sort after it.
+    candidates.sort_by_key(|(confirmed, _)| !confirmed);
+    candidates.into_iter().map(|(_, p)| p).collect()
+}
 
-    // 4. Nothing fit the memory. Fail safe.
-    Ok(None)
+/// Step 3, the probe test for one candidate. A malformed probe can never claim
+/// anything, so it is "does not fit" rather than an error that would abort the
+/// others.
+fn probe_fits<B: MemoryBackend + ?Sized>(backend: &B, profile: &Profile) -> Result<bool> {
+    match aob::parse_pattern(&profile.match_.probe) {
+        Ok(pattern) => Ok(aob::find_in_process(backend, &pattern)?.is_some()),
+        Err(_) => Ok(false),
+    }
 }
 
 #[cfg(test)]
@@ -227,6 +277,28 @@ mod tests {
         let profiles = vec![profile("pinned", "game.exe", Some("1.0.0"), PLANTED)];
         let picked = select(&be, "game.exe", &profiles).expect("select ok");
         assert_eq!(selected_label(picked), Some("pinned"));
+    }
+
+    #[test]
+    fn several_fits_are_ranked_confirmed_version_first_then_slice_order() {
+        let be = fake_with_planted(Some("2.0.0"));
+        let profiles = vec![
+            profile("generic-a", "game.exe", None, PLANTED),
+            profile("generic-b", "game.exe", None, PLANTED),
+            profile("pinned", "game.exe", Some("2.0.0"), PLANTED),
+            profile("elsewhere", "game.exe", None, "11 22 33 44"),
+        ];
+        let all = fitting(&be, "game.exe", &profiles).expect("fitting ok");
+        let labels: Vec<_> = all.iter().map(|p| p.label.as_deref().unwrap()).collect();
+        assert_eq!(labels, ["pinned", "generic-a", "generic-b"]);
+        // `select` picks the same winner `fitting` ranks first.
+        let picked = select(&be, "game.exe", &profiles).expect("select ok");
+        assert_eq!(selected_label(picked), Some("pinned"));
+
+        // With no version to confirm, slice order alone decides.
+        let be = fake_with_planted(None);
+        let picked = select(&be, "game.exe", &profiles).expect("select ok");
+        assert_eq!(selected_label(picked), Some("generic-a"));
     }
 
     #[test]
