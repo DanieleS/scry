@@ -111,6 +111,11 @@ plain offsets/signatures, engine-agnostic, exactly as today.
 6. **[#14] Runtime by-name reflection resolver** — the resilient endgame.
 7. **[#5] Vibepollo integration** — adapter + control-channel `0x3003`.
 
+## Linux
+
+What it would take to read games on a Linux host under Proton, and what Vibepollo's integration
+lacks there, is in [linux-proton.md](linux-proton.md).
+
 ## Where to start next session
 
 Two entry points, both against **Sea of Stars** (our confirmed IL2CPP target):
