@@ -122,12 +122,19 @@ duration is in seconds or frames, is in the schema's descriptions and a
 reviewer's eyes. And a schema `maximum` does not make memory behave: values read
 from a game mid-transition can be anything, so views keep clamping.
 
+## How views reach a client
+
+Decided on 2026-09-24. ratatoskr-telemetry-views deploys `index.json` and the
+built views to GitHub Pages from `main`, once every check passes; Pages deploys
+the whole site at once, so the index never names a file that is not there yet.
+Ratatoskr downloads the index and **only the view for the contract a game
+announces**, checks it against its sha256, and keeps both for offline use. A
+view pushed onto the device by hand still wins, for trying one before it is
+published. A downloaded view is third-party code, which is why the panel's
+WebView has no network and no way back into the app.
+
 ## Still open
 
-- **How Ratatoskr distributes views**: downloaded on demand from a published
-  index (GitHub Pages or releases), or bundled in the APK. Downloading decouples
-  releases, but makes the view downloaded third-party code, which raises the bar
-  for the WebView sandbox.
 - **How Vibepollo obtains profiles**: bundled with a release, fetched from
   `scry-profiles`, or dropped in by the user as today.
 
