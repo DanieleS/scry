@@ -1,6 +1,6 @@
 [package]
 name = "scry"
-version = "0.1.0-alpha.3"
+version = "0.1.0-alpha.4"
 edition = "2021"
 description = "Profile-driven, read-only game-memory telemetry engine"
 license = "MIT OR Apache-2.0"
