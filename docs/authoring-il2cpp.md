@@ -294,6 +294,12 @@ entry is either:
   `"-4"`) — passed straight through, for the parts a dump can't name (a Tier-1
   static base, a hand-found constant).
 
+A field reference must name an **instance** field. A `static` field's offset is
+relative to the class's static storage, not to an object, so the converter
+rejects one in a chain rather than emit an offset that reads the wrong field. If
+your chain genuinely reaches the static storage by other means, the error gives
+the field's offset to write as a literal.
+
 The chain follows the engine's pointer-walk semantics: each offset is added and
 the result dereferenced, except after the last, where the value is read. See
 [`MemoryBackend::resolve`](../src/backend/mod.rs).
