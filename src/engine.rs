@@ -67,7 +67,10 @@ use crate::profile::{
 /// Not `Copy`: [`Str`](Value::Str) and [`List`](Value::List) own heap data. The
 /// engine clones a value only when it actually changes, so the cost lands on
 /// real diffs, not on every quiet tick.
-#[derive(Debug, Clone, PartialEq)]
+///
+/// Equality is what the diff runs on, so it is defined by hand rather than
+/// derived: see the [`PartialEq`] impl for how floats compare.
+#[derive(Debug, Clone)]
 pub enum Value {
     I32(i32),
     U32(u32),
@@ -93,6 +96,39 @@ pub enum Value {
     /// state — never a stale or garbage number passed off as a live reading.
     Unavailable,
 }
+
+/// Equality as the diff needs it: "would a consumer see the same reading".
+///
+/// A derived `PartialEq` compares an [`F32`](Value::F32) with IEEE `==`, under
+/// which `NaN != NaN`. A torn or uninitialised float in a game's memory is very
+/// often a NaN, and with IEEE equality the diff would call it changed on every
+/// single tick and resend it — together with the whole list or record that
+/// holds it. So floats compare by their bits instead, with every NaN equal to
+/// every other (they all reach the wire as the same `null`). The one visible
+/// consequence is that `0.0` and `-0.0` now differ, which is honest: they
+/// serialise differently too.
+///
+/// Comparing bits also makes the relation reflexive, which is what lets
+/// `Value` be [`Eq`].
+impl PartialEq for Value {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Value::I32(a), Value::I32(b)) => a == b,
+            (Value::U32(a), Value::U32(b)) => a == b,
+            (Value::F32(a), Value::F32(b)) => {
+                a.to_bits() == b.to_bits() || (a.is_nan() && b.is_nan())
+            }
+            (Value::U64(a), Value::U64(b)) => a == b,
+            (Value::Str(a), Value::Str(b)) => a == b,
+            (Value::List(a), Value::List(b)) => a == b,
+            (Value::Map(a), Value::Map(b)) => a == b,
+            (Value::Unavailable, Value::Unavailable) => true,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for Value {}
 
 /// The **wire form** of a value: the shape a host outside this process sees.
 ///
@@ -1432,6 +1468,58 @@ mod tests {
         let d = s.poll(Duration::from_millis(100));
         assert_eq!(d.get("hp"), Some(&Value::I32(250)));
         assert!(s.poll(Duration::from_millis(150)).is_empty());
+    }
+
+    /// A torn float is usually a NaN, and IEEE says `NaN != NaN`. The diff must
+    /// not take that literally, or the value — and any list holding it — would
+    /// be resent on every tick for as long as the game leaves it torn.
+    #[test]
+    fn a_nan_reading_is_reported_once_not_every_tick() {
+        let fake = Rc::new(Fake::new(0x600));
+        let nan_bits = f32::NAN.to_bits() as i32;
+        fake.write_i32(0, nan_bits);
+        // A collection of floats whose middle element is a NaN.
+        plant_collection(&fake, &[0, nan_bits, 0]);
+        let mut floats = i32_collection_watch("speeds", 8);
+        if let Watch::Collection { ty, .. } = &mut floats {
+            *ty = Some(ValueType::F32);
+        }
+        let profile = Profile {
+            label: None,
+            contract: None,
+            contract_version: None,
+            match_: ident(),
+            watches: vec![
+                Watch::Tier1 {
+                    name: "speed".to_string(),
+                    module: "fake".to_string(),
+                    offsets: vec![0],
+                    ty: ValueType::F32,
+                    rate_hz: None,
+                },
+                floats,
+            ],
+        };
+        let mut s = Session::attach(Rc::clone(&fake), &profile, Config::default());
+
+        let first = s.poll(Duration::ZERO);
+        assert!(matches!(first.get("speed"), Some(Value::F32(x)) if x.is_nan()));
+        assert!(first.contains_key("speeds"));
+        assert!(
+            s.poll(Duration::from_millis(50)).is_empty(),
+            "an unchanged NaN must not count as a change"
+        );
+
+        // A NaN with a different payload is still "no reading", so still quiet.
+        fake.write_i32(0, (f32::NAN.to_bits() | 1) as i32);
+        assert!(s.poll(Duration::from_millis(100)).is_empty());
+
+        // A real value arriving is a change, as ever.
+        fake.write_i32(0, 1.5f32.to_bits() as i32);
+        assert_eq!(
+            s.poll(Duration::from_millis(150)).get("speed"),
+            Some(&Value::F32(1.5))
+        );
     }
 
     #[test]
