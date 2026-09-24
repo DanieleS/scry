@@ -295,8 +295,9 @@ pub struct Rip {
 /// just a label — everything a resolver needs to *claim* a process lives here.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Match {
-    /// Coarse bucket: the executable name (e.g. `"game.exe"`). The first, cheap
-    /// filter — never sufficient on its own to claim a process.
+    /// Coarse bucket: the executable name (e.g. `"game.exe"`), compared ASCII
+    /// case-insensitively. The first, cheap filter — never sufficient on its
+    /// own to claim a process.
     pub process: String,
 
     /// The module that anchors static (Tier-1) addresses. Often the same as the

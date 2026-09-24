@@ -204,7 +204,7 @@ memory shape. A name match alone would happily point telemetry at the wrong one.
 The resolver refuses to guess, narrowing in three steps, cheapest first:
 
 1. **Process bucket** — keep profiles whose `match.process` equals the running
-   executable's name.
+   executable's name, ignoring ASCII case (as Windows file names do).
 2. **Version discriminant** — if the backend can report a build version, drop
    profiles pinned to a *different* one. Profiles that don't pin a version, and
    backends that can't report one (the honest answer on Linux), are unaffected.

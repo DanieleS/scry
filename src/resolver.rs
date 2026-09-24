@@ -7,7 +7,7 @@
 //! Selection narrows in three steps, cheapest first:
 //!
 //! 1. **Process bucket** — keep only profiles whose `match.process` equals the
-//!    running executable's name.
+//!    running executable's name, compared ASCII case-insensitively.
 //! 2. **Version discriminant** — if the backend can report a build version for
 //!    the module, drop profiles that name a *different* version. Profiles that
 //!    don't pin a version, and backends that can't report one, are unaffected.
@@ -37,10 +37,14 @@ pub fn select<'a, B: MemoryBackend + ?Sized>(
     process: &str,
     profiles: &'a [Profile],
 ) -> Result<Option<&'a Profile>> {
-    // 1. Process bucket: the cheap coarse filter.
+    // 1. Process bucket: the cheap coarse filter. Case-insensitive because
+    //    Windows file names are: the same game is `Game.exe` in one report and
+    //    `game.exe` in another, and a profile must not miss it over that. ASCII
+    //    folding is enough for executable names and needs no locale; on Linux
+    //    it can only widen the bucket, and the probe still decides.
     let mut candidates: Vec<&Profile> = profiles
         .iter()
-        .filter(|p| p.match_.process == process)
+        .filter(|p| p.match_.process.eq_ignore_ascii_case(process))
         .collect();
 
     // 2. Version discriminant, only where it can be applied. We drop a
@@ -181,6 +185,14 @@ mod tests {
         let profiles = vec![profile("other-game", "other.exe", None, PLANTED)];
         let picked = select(&be, "game.exe", &profiles).expect("select ok");
         assert!(picked.is_none());
+    }
+
+    #[test]
+    fn process_name_matches_regardless_of_ascii_case() {
+        let be = fake_with_planted(None);
+        let profiles = vec![profile("any-case", "Game.EXE", None, PLANTED)];
+        let picked = select(&be, "game.exe", &profiles).expect("select ok");
+        assert_eq!(selected_label(picked), Some("any-case"));
     }
 
     #[test]
