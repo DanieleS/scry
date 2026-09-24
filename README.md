@@ -117,8 +117,8 @@ stays structurally read-only. It reads the C# `List<T>` shape (a `count`, an
 `items` backing-array pointer, a `first` header offset) or a bare pointer array,
 and with `type: string` a single watch yields an ordered party roster like
 `["VALERE", "ZALE", "GARL"]`. A garbage count can't run away — it's clamped to a
-required `max` — and a broken element is `unavailable` in place without sinking
-the list. See [`docs/authoring-profiles.md`](docs/authoring-profiles.md).
+required `max`, itself at most 4096 — and a broken element is `unavailable` in
+place without sinking the list. See [`docs/authoring-profiles.md`](docs/authoring-profiles.md).
 
 ### Records — one shallow level of structure
 

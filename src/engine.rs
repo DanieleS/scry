@@ -55,7 +55,7 @@ use crate::aob;
 use crate::backend::MemoryBackend;
 use crate::profile::{
     Base, Clause, Compare, Expr, Extremum, Field, Fold, Literal, Profile, Rip, StringEncoding,
-    StringLayout, ValueType, Watch,
+    StringLayout, ValueType, Watch, MAX_COLLECTION_LEN,
 };
 
 /// A single sampled value — or the honest absence of one.
@@ -875,7 +875,10 @@ fn sample_one<B: MemoryBackend + ?Sized>(
                 .resolve(container, count)
                 .and_then(|a| backend.read_i32(a))
             {
-                Ok(raw) => (raw.max(0) as usize).min(*max),
+                // Clamped to the ceiling as well as to `max`: a validated profile
+                // cannot exceed it, but a hand-built one can, and `n` is about to
+                // size an allocation from a number read out of untrusted memory.
+                Ok(raw) => (raw.max(0) as usize).min(*max).min(MAX_COLLECTION_LEN),
                 Err(_) => return Value::Unavailable,
             };
             // Find the element region: the backing array an `items` chain points
@@ -1878,6 +1881,27 @@ mod tests {
             Some(&Value::List(vec![Value::I32(11), Value::I32(22)])),
             "count must be clamped to max"
         );
+    }
+
+    /// A hand-built profile is not validated, so the engine clamps a garbage
+    /// count to the ceiling itself rather than trusting an unbounded `max`.
+    #[test]
+    fn a_garbage_count_is_clamped_to_the_ceiling_even_with_an_unbounded_max() {
+        let fake = Rc::new(Fake::new(0x600));
+        plant_collection(&fake, &[1]);
+        fake.write_i32(0x108, i32::MAX); // a garbage count
+        let profile = Profile {
+            label: None,
+            contract: None,
+            contract_version: None,
+            match_: ident(),
+            watches: vec![i32_collection_watch("enemy_hp", usize::MAX)],
+        };
+        let mut s = Session::attach(Rc::clone(&fake), &profile, Config::default());
+        match s.poll(Duration::ZERO).get("enemy_hp") {
+            Some(Value::List(items)) => assert_eq!(items.len(), MAX_COLLECTION_LEN),
+            other => panic!("expected a clamped list, got {other:?}"),
+        }
     }
 
     #[test]

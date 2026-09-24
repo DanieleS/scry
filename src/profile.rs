@@ -704,7 +704,8 @@ pub enum Watch {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         fields: Option<BTreeMap<String, Field>>,
         /// Hard cap on the element count — a garbage count can neither allocate
-        /// nor loop unboundedly.
+        /// nor loop unboundedly. Itself capped at [`MAX_COLLECTION_LEN`] when
+        /// the profile is validated, since a cap of `u64::MAX` caps nothing.
         max: usize,
         /// Per-watch sample rate in hertz; see [`Watch::Tier1::rate_hz`].
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -971,6 +972,7 @@ impl Profile {
     ///   **earlier in the array**, must not declare a string `type`, may use
     ///   [`Item`](Expr::Item) only under an `each` naming an earlier collection,
     ///   and must give each operator the arity it takes.
+    /// - A collection's `max` is at most [`MAX_COLLECTION_LEN`].
     /// - No two watches share a `name`, across every tier.
     /// - A `rate_hz`, when given, lies within [`MIN_RATE_HZ`]..=[`MAX_RATE_HZ`].
     /// - A declared [`contract`](Profile::contract) has a slug id, and agrees
@@ -997,6 +999,12 @@ impl Profile {
                 )));
             }
             match w {
+                Watch::Collection { max, .. } if *max > MAX_COLLECTION_LEN => {
+                    return Err(Error::BadProfile(format!(
+                        "collection {name:?}: `max` {max} is above the ceiling of \
+                         {MAX_COLLECTION_LEN}; a count that large is garbage memory, not a list"
+                    )));
+                }
                 Watch::Collection {
                     name, ty, fields, ..
                 } => match (ty, fields) {
@@ -1088,6 +1096,17 @@ impl Profile {
         serde_json::to_string_pretty(self).map_err(|e| Error::BadProfile(e.to_string()))
     }
 }
+
+/// The largest `max` a [collection](Watch::Collection) may declare.
+///
+/// `max` exists so that a garbage count read out of a game mid-transition can
+/// neither allocate nor loop without bound, and that only holds if `max` is
+/// itself bounded: `18446744073709551615` would have been accepted, and then a
+/// garbage count meant millions of reads a tick. 4096 is far above any party,
+/// enemy list or inventory page seen in practice. It also keeps one `values`
+/// line within reach of a host's line limit, since the first line carries every
+/// element of every collection at once.
+pub const MAX_COLLECTION_LEN: usize = 4096;
 
 /// The slowest `rate_hz` a watch may ask for: one sample every 100 seconds.
 ///
@@ -2172,6 +2191,25 @@ mod tests {
             err.contains("type"),
             "…and say the output type is the problem: {err}"
         );
+    }
+
+    #[test]
+    fn collection_max_is_capped() {
+        let with_max = |max: &str| {
+            derived_profile(&format!(
+                r#"{{ "tier": "collection", "name": "party",
+                      "base": {{ "tier": "tier1", "module": "g", "offsets": [0] }},
+                      "count": [0], "stride": 8, "type": "i32", "max": {max} }}"#
+            ))
+        };
+        assert!(with_max("4096").is_ok());
+        for bad in ["4097", "18446744073709551615"] {
+            let err = with_max(bad).unwrap_err().to_string();
+            assert!(
+                err.contains("above the ceiling of 4096"),
+                "max {bad}: {err}"
+            );
+        }
     }
 
     #[test]

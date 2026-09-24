@@ -203,7 +203,7 @@ Fields:
 | `stride` | bytes between consecutive elements (a pointer array → `8`) |
 | `element` | per-element chain from a slot to the value; empty means the slot *is* the value's address |
 | `type` | element type (`i32` … or a `string` — see [Strings](#strings)) |
-| `max` | hard cap — a garbage count can neither allocate nor loop unboundedly |
+| `max` | hard cap — a garbage count can neither allocate nor loop unboundedly; at most `4096` |
 
 The C# `List<T>` shape (validated against Sea of Stars — `items` at `+0x10`,
 `count` at `+0x18`, array header `0x20`, pointer stride `8`) reading the party
