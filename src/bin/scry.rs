@@ -96,10 +96,13 @@ JSON OUTPUT:
 
     The `attached` event names *which* profile won the probe test — the choice
     was made by the target's memory, not by the caller, so it is the one thing a
-    host cannot know on its own. `profile` is the label, `profile_file` the file
-    it was read from, and `contract_version` the profile's `contractVersion`
-    (`null` when it declares none): the shape of the values that follow, which is
-    what a renderer downstream needs in order to know how to read them.
+    host cannot know on its own. `profile` is the label (descriptive only),
+    `profile_file` the file it was read from, and `contract` the contract the
+    profile implements, as {\"id\":\"sea-of-stars\",\"version\":\"2.1\"} (`null`
+    when it declares none): the shape of the values that follow, which is what a
+    renderer downstream needs in order to know how to read them.
+    `contract_version` is the same version's major as an integer, kept for hosts
+    that predate `contract`; it is deprecated and will be removed.
 
     `values` carries only what *changed* this tick (the first one carries
     everything readable). Readings are untagged — a number is a number, a list an
@@ -321,9 +324,15 @@ JSON OUTPUT:
         // The identity of what we attached to, announced once. A host needs this
         // to confirm it is reading the game it meant to — the profile is chosen
         // by the target's *memory*, not by the caller, so which one won is news.
-        // `contract_version` travels with it because the values that follow are
-        // only interpretable against the shape the profile declares.
+        // The contract travels with it because the values that follow are only
+        // interpretable against the shape the profile declares.
         if format == Format::Json {
+            let declared = chosen.declared_contract();
+            // Only a contract with an id is worth announcing as one: a bare
+            // deprecated integer says which version, but not of what.
+            let contract = declared.and_then(|c| {
+                c.id.map(|id| serde_json::json!({ "id": id, "version": c.version.to_string() }))
+            });
             emit(&serde_json::json!({
                 "event": "attached",
                 "scry": env!("CARGO_PKG_VERSION"),
@@ -331,7 +340,10 @@ JSON OUTPUT:
                 "process": name,
                 "profile": label,
                 "profile_file": source,
-                "contract_version": chosen.contract_version,
+                "contract": contract,
+                // Deprecated: the major alone, for hosts that read only this
+                // (Vibepollo's parser, today). Remove once hosts read `contract`.
+                "contract_version": declared.map(|c| c.version.major),
                 "watches": chosen.watches.len(),
                 "pointer_bits": pointer_bits,
             }));

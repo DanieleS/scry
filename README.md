@@ -40,22 +40,38 @@ above all in its `probe`.
 
 ### The contract — what a profile *emits*
 
-A profile can also declare an optional `"contractVersion": 1`. It versions the
-**shape** of the output — the watch names and their types — and it is orthogonal
-to `match.version`, which pins the *build* the offsets were authored against:
+A profile can also declare which **contract** it implements:
+
+```json
+"contract": { "id": "sea-of-stars", "version": "2.1" }
+```
+
+A contract is the **shape** of the output — the watch names and their types —
+and it is orthogonal to `match.version`, which pins the *build* the offsets were
+authored against:
 
 ```text
 build 1.4.2 -> profile 1.4.2 -\
-build 1.5.0 -> profile 1.5.0 --+-> contract 1
-build 2.0.0 -> profile 2.0.0 ---> contract 2
+build 1.5.0 -> profile 1.5.0 --+-> contract sea-of-stars 1.0
+build 2.0.0 -> profile 2.0.0 ---> contract sea-of-stars 2.0
 ```
 
 Offsets move every patch; names outlive them. So the usual patch costs one new
 profile sharing the old contract, and a consumer that renders `hp` and `party`
-keeps working untouched. The engine **never reads this field** — it parses it and
-hands it back on the `attached` event, for whoever is rendering the values. An
-engine that acted on it would be forming an opinion about what a value *means*,
-which is exactly the line this one doesn't cross.
+keeps working untouched. The version is `major.minor`: a minor only adds watches
+or record fields, a major is anything else. The id is a lowercase slug, and it —
+not the `label`, which stays purely descriptive — is what a renderer keys on.
+
+The engine **never reads this field** — it parses it and hands it back on the
+`attached` event, for whoever is rendering the values. An engine that acted on
+it would be forming an opinion about what a value *means*, which is exactly the
+line this one doesn't cross.
+
+The integer `"contractVersion": 2` of earlier releases is still accepted but
+**deprecated**: it reads as version `2.0` with no id. A profile may carry both
+while migrating, as long as they agree on the major. See
+[`docs/contracts-and-views.md`](docs/contracts-and-views.md) for how contracts,
+profiles and the things that draw them fit together.
 
 ### Two tiers of watch
 
@@ -266,6 +282,23 @@ Output is one line per changed value, `+<ms>  name = value`; an unchanged value
 stays silent, and a value that can't be read surfaces as `unavailable` — never a
 guess. If no profile's probe resolves in the target, nothing is read (the
 fail-safe), and `scry` says so.
+
+For a host driving `scry` as a subprocess, `--format json` writes JSON Lines, one
+event per line. The first says what was attached, including the contract the
+winning profile declares (`null` when it declares none):
+
+```json
+{"event":"attached","scry":"0.1.0","pid":1234,"process":"game.exe",
+ "profile":"Sea of Stars (Steam 1.3)","profile_file":"profiles/steam-1.3.json",
+ "contract":{"id":"sea-of-stars","version":"2.1"},"contract_version":2,
+ "watches":43,"pointer_bits":64}
+{"event":"values","t_ms":5,"values":{"hp":42}}
+{"event":"detached","t_ms":9000}
+```
+
+`contract_version` is the same contract's major as a bare integer, kept only for
+hosts that predate `contract`; it is deprecated and goes once hosts read
+`contract`. A reader must ignore event types and fields it does not know.
 
 Two more commands help author and verify:
 
