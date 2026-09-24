@@ -971,6 +971,7 @@ impl Profile {
     ///   **earlier in the array**, must not declare a string `type`, may use
     ///   [`Item`](Expr::Item) only under an `each` naming an earlier collection,
     ///   and must give each operator the arity it takes.
+    /// - No two watches share a `name`, across every tier.
     /// - A declared [`contract`](Profile::contract) has a slug id, and agrees
     ///   with the deprecated `contractVersion` when both are given.
     pub fn validate(&self) -> Result<()> {
@@ -982,6 +983,17 @@ impl Profile {
         // evaluation order falls out of declaration order.
         let mut earlier: Vec<&Watch> = Vec::with_capacity(self.watches.len());
         for w in &self.watches {
+            // A name is the key a value is emitted under, and the key a derived
+            // watch reads it back by. Two watches sharing one would overwrite
+            // each other in the snapshot every tick, so the diff would never
+            // settle, and a derived watch would read whichever ran last.
+            let name = watch_name(w);
+            if declared_earlier(&earlier, name) {
+                return Err(Error::BadProfile(format!(
+                    "watch {name:?} is declared more than once; every watch needs its own name, \
+                     whatever its tier"
+                )));
+            }
             match w {
                 Watch::Collection {
                     name, ty, fields, ..
@@ -2118,6 +2130,28 @@ mod tests {
             err.contains("type"),
             "…and say the output type is the problem: {err}"
         );
+    }
+
+    #[test]
+    fn rejects_two_watches_with_one_name_whatever_their_tier() {
+        // Two memory watches.
+        let err = derived_profile(
+            r#"{ "tier": "tier1", "name": "hp", "module": "g.exe", "offsets": [0], "type": "i32" },
+               { "tier": "tier1", "name": "hp", "module": "g.exe", "offsets": [4], "type": "i32" }"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("\"hp\" is declared more than once"), "{err}");
+
+        // A derived watch reusing a memory watch's name is just as ambiguous:
+        // a later reference could not say which one it meant.
+        let err = derived_profile(
+            r#"{ "tier": "tier1", "name": "hp", "module": "g.exe", "offsets": [0], "type": "i32" },
+               { "tier": "derived", "name": "hp", "type": "i32", "value": { "const": 1 } }"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("declared more than once"), "{err}");
     }
 
     #[test]
