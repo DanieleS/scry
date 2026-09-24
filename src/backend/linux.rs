@@ -31,6 +31,13 @@ extern "C" {
     ) -> isize;
 }
 
+/// The state letter of a `/proc/<pid>/stat` line. It follows the command
+/// name, which is parenthesised and may itself contain spaces or parentheses,
+/// so the field is found after the *last* `)`.
+fn proc_state(stat: &str) -> Option<char> {
+    stat[stat.rfind(')')? + 1..].trim_start().chars().next()
+}
+
 pub struct LinuxBackend {
     pid: c_int,
 }
@@ -101,6 +108,17 @@ impl MemoryBackend for LinuxBackend {
         base.ok_or_else(|| Error::ModuleNotFound(name.to_string()))
     }
 
+    /// Exited once `/proc/<pid>` is gone, or while the process is a zombie
+    /// (`Z`) or dead (`X`) waiting to be reaped: a zombie keeps its `/proc`
+    /// entry until its parent waits for it, but it has no memory left to read.
+    /// Any other failure to read the file is "cannot tell", not "exited".
+    fn has_exited(&self) -> bool {
+        match fs::read_to_string(format!("/proc/{}/stat", self.pid)) {
+            Ok(stat) => matches!(proc_state(&stat), Some('Z' | 'X')),
+            Err(e) => e.kind() == io::ErrorKind::NotFound,
+        }
+    }
+
     fn readable_regions(&self) -> Result<Vec<Region>> {
         let maps = fs::read_to_string(format!("/proc/{}/maps", self.pid))?;
         let mut regions = Vec::new();
@@ -134,5 +152,24 @@ impl MemoryBackend for LinuxBackend {
             }
         }
         Ok(regions)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reads_the_state_after_the_last_parenthesis() {
+        assert_eq!(proc_state("42 (game) S 1 42"), Some('S'));
+        assert_eq!(proc_state("42 (a) b) Z 1 42"), Some('Z'));
+        assert_eq!(proc_state("garbage"), None);
+    }
+
+    #[test]
+    fn the_running_test_has_not_exited_and_a_missing_pid_has() {
+        assert!(!LinuxBackend::new(std::process::id() as i32).has_exited());
+        // Above the kernel's pid_max ceiling (2^22), so it can never exist.
+        assert!(LinuxBackend::new(i32::MAX).has_exited());
     }
 }

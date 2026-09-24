@@ -30,6 +30,8 @@ type Dword = u32;
 const PROCESS_QUERY_INFORMATION: Dword = 0x0400;
 const PROCESS_VM_READ: Dword = 0x0010;
 
+const STILL_ACTIVE: Dword = 259;
+
 const MEM_COMMIT: Dword = 0x1000;
 const PAGE_GUARD: Dword = 0x100;
 
@@ -83,6 +85,7 @@ extern "system" {
     fn OpenProcess(access: Dword, inherit: Bool, pid: Dword) -> Handle;
     fn CloseHandle(handle: Handle) -> Bool;
     fn IsWow64Process(handle: Handle, wow64: *mut Bool) -> Bool;
+    fn GetExitCodeProcess(handle: Handle, exit_code: *mut Dword) -> Bool;
     fn ReadProcessMemory(
         handle: Handle,
         base: *const c_void,
@@ -302,6 +305,20 @@ impl MemoryBackend for WindowsBackend {
 
     fn pointer_size(&self) -> usize {
         self.ptr_size
+    }
+
+    /// Asked of the handle scry already holds, which keeps the process object
+    /// alive, so the pid cannot be reused under it. `GetExitCodeProcess` needs
+    /// only the `PROCESS_QUERY_INFORMATION` right the backend opened with.
+    ///
+    /// A process that is running reports `STILL_ACTIVE` (259). One that exited
+    /// *with* code 259 is indistinguishable from a running one and is taken as
+    /// running, which only means scry keeps watching a dead game, as before.
+    /// A failed query is "cannot tell", not "exited".
+    fn has_exited(&self) -> bool {
+        let mut code: Dword = 0;
+        let ok = unsafe { GetExitCodeProcess(self.handle, &mut code) };
+        ok != 0 && code != STILL_ACTIVE
     }
 }
 

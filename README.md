@@ -303,8 +303,15 @@ winning profile declares (`null` when it declares none):
  "contract":{"id":"sea-of-stars","version":"2.1"},"contract_version":2,
  "watches":43,"pointer_bits":64}
 {"event":"values","t_ms":5,"values":{"hp":42}}
-{"event":"detached","t_ms":9000}
+{"event":"detached","t_ms":9000,"reason":"duration"}
 ```
+
+`detached` ends the stream and says why: `once` or `duration` when the watch
+ran out as asked (`--once`, `--for`), `target_exited` when the game went away —
+`scry` asks the OS, since to its reads a closed game looks just like one on a
+loading screen, and then exits with status 5. A host that restarts `scry`
+when the game relaunches can rely on that end rather than on watches going
+`null`.
 
 `contract_version` is the same contract's major as a bare integer, kept only for
 hosts that predate `contract`; it is deprecated and goes once hosts read
@@ -347,6 +354,7 @@ exit status that follows.
 | 2 | No running process has the `--process` name. |
 | 3 | No profile fits the target. |
 | 4 | `scan` found no match for the signature. |
+| 5 | `watch` stopped because the target process exited. |
 | 101 | A crash. |
 
 Three more commands help author and verify:

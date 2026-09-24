@@ -149,6 +149,7 @@ fn stdout_is_a_stream_of_json_events() {
 
     let last = events.last().unwrap();
     assert_eq!(last["event"], "detached");
+    assert_eq!(last["reason"], "duration", "`--for` ran out: {last}");
 
     // Every event is self-describing and time-stamped past the attach line, so a
     // host never has to infer what a line is from its position in the stream.
@@ -194,4 +195,72 @@ fn values_events_carry_the_first_picture_then_only_changes() {
             "a later event must carry the watch that moved: {later}"
         );
     }
+}
+
+/// A game that closes ends the stream: scry notices the target has exited,
+/// says so with `detached` / `target_exited`, and exits 5, rather than running
+/// on and reporting every watch `null` forever. `--for` is only a safety net
+/// here, far longer than the test waits.
+#[test]
+fn a_target_that_exits_ends_the_stream() {
+    use std::io::Read;
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+
+    let (cavia, ready) = spawn_cavia();
+    let scratch = Scratch::new();
+    let profile = scratch.write(
+        "cavia.json",
+        &cavia_profile_json(&ready.exe, (ready.player - ready.base) as i64),
+    );
+    let mut scry = Command::new(env!("CARGO_BIN_EXE_scry"))
+        .args(["watch", "--pid"])
+        .arg(ready.pid.to_string())
+        .arg("--profile")
+        .arg(&profile)
+        .args([
+            "--no-resolve",
+            "--format",
+            "json",
+            "--tick",
+            "20",
+            "--for",
+            "60",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn scry watch");
+
+    std::thread::sleep(Duration::from_millis(300));
+    // Kills and reaps the cavia, so it is gone rather than a zombie.
+    drop(cavia);
+
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let status = loop {
+        if let Some(status) = scry.try_wait().expect("poll scry") {
+            break status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "scry kept running after its target exited"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert_eq!(
+        status.code(),
+        Some(5),
+        "exit status for a target that exited"
+    );
+
+    let mut stdout = String::new();
+    scry.stdout
+        .take()
+        .unwrap()
+        .read_to_string(&mut stdout)
+        .expect("read stdout");
+    let last: serde_json::Value =
+        serde_json::from_str(stdout.lines().last().expect("some output")).expect("JSON line");
+    assert_eq!(last["event"], "detached", "{stdout}");
+    assert_eq!(last["reason"], "target_exited", "{stdout}");
 }

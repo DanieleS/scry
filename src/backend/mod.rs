@@ -49,6 +49,18 @@ pub trait MemoryBackend {
         Ok(None)
     }
 
+    /// Whether the target process has exited.
+    ///
+    /// Reads alone cannot answer this: a dead process and a live one whose
+    /// values are momentarily unmapped (a loading screen) both just fail to
+    /// read, so without asking the OS a host would watch a closed game emit
+    /// `null` forever. `false` is the default and means "not known to have
+    /// exited" — a backend that cannot tell never claims it, and the caller
+    /// carries on as before.
+    fn has_exited(&self) -> bool {
+        false
+    }
+
     /// Pointer width of the target, in bytes. 64-bit unless a backend says
     /// otherwise.
     fn pointer_size(&self) -> usize {

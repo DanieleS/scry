@@ -168,6 +168,7 @@ EXIT STATUS:
     2    no running process has the --process name
     3    no profile fits the target (the fail-safe)
     4    scan: signature not found
+    5    watch: the target process exited
     101  crash (a bug; please report it)
 ";
 
@@ -200,7 +201,8 @@ OPTIONS:
                         JSON Lines — one self-describing event object per line,
                         for a host program that consumes this as a subprocess.
     --once              Print one snapshot of all values, then exit.
-    --for <secs>        Stop after this many seconds (default: run until killed).
+    --for <secs>        Stop after this many seconds (default: run until killed
+                        or until the target exits).
     --tick <ms>         Base polling cadence in milliseconds (default: 50).
     --no-resolve        Skip the probe test and attach the single given profile
                         directly (only valid with exactly one profile).
@@ -212,7 +214,7 @@ JSON OUTPUT:
 
         {\"event\":\"attached\",\"pid\":1234,\"process\":\"game.exe\", ... }
         {\"event\":\"values\",\"t_ms\":123,\"values\":{\"hp\":42}}
-        {\"event\":\"detached\",\"t_ms\":9000}
+        {\"event\":\"detached\",\"t_ms\":9000,\"reason\":\"duration\"}
 
     The `attached` event names *which* profile won the probe test — the choice
     was made by the target's memory, not by the caller, so it is the one thing a
@@ -223,6 +225,9 @@ JSON OUTPUT:
     renderer downstream needs in order to know how to read them.
     `contract_version` is the same version's major as an integer, kept for hosts
     that predate `contract`; it is deprecated and will be removed.
+
+    `detached` closes the stream, with a `reason`: `once` or `duration` when
+    the watch ran out as asked, `target_exited` when the game went away.
 
     `values` carries only what *changed* this tick (the first one carries
     everything readable). Readings are untagged — a number is a number, a list an
@@ -243,6 +248,7 @@ EXIT STATUS:
     1    usage error, unreadable profile, target cannot be opened, resolver error
     2    no running process has the --process name
     3    no profile fits the target (the fail-safe)
+    5    the target process exited
     101  crash (a bug; please report it)
 ";
 
@@ -546,7 +552,7 @@ EXIT STATUS:
         // First poll always reports every value it can read — the initial picture.
         print_diff(session.poll(Duration::ZERO), start.elapsed(), format);
         if once {
-            print_detached(start.elapsed(), format);
+            print_detached(start.elapsed(), format, "once");
             return 0;
         }
 
@@ -557,11 +563,20 @@ EXIT STATUS:
         loop {
             if let Some(d) = deadline {
                 if Instant::now() >= d {
-                    print_detached(start.elapsed(), format);
+                    print_detached(start.elapsed(), format, "duration");
                     return 0;
                 }
             }
             std::thread::sleep(config.base_tick);
+            // Asked before polling, since a dead target would only produce a
+            // last tick of nulls. Without this a closed game left scry running
+            // forever, reporting every watch unavailable; a host that restarts
+            // scry when the game relaunches needs it to end instead.
+            if session.target_exited() {
+                eprintln!("scry: {name} (pid {pid}) has exited; stopping");
+                print_detached(start.elapsed(), format, "target_exited");
+                return exit::TARGET_EXITED;
+            }
             print_diff(session.poll(start.elapsed()), start.elapsed(), format);
         }
     }
@@ -580,6 +595,8 @@ EXIT STATUS:
         pub const NO_PROFILE_FITS: i32 = 3;
         /// `scry scan` found no match for the signature.
         pub const NOT_FOUND: i32 = 4;
+        /// `scry watch` stopped because the target process exited.
+        pub const TARGET_EXITED: i32 = 5;
     }
 
     /// End `watch` with a known failure: in JSON mode, say so on stdout first.
@@ -658,13 +675,17 @@ EXIT STATUS:
     }
 
     /// Close the stream deliberately, so a consumer can tell "the watch ended"
-    /// (`--once`/`--for` ran out) from "the process died under me".
-    ///
-    /// Note this is *our* end, not the game's: nothing here detects the target
-    /// exiting — a dead target shows up as watches going `null`.
-    fn print_detached(at: Duration, format: Format) {
+    /// from "scry died under me", and say why it ended: `once` and `duration`
+    /// are the watch running out as asked, `target_exited` is the game going
+    /// away. The `reason` field is newer than the event; a host that predates it
+    /// ignores it and still sees the end.
+    fn print_detached(at: Duration, format: Format, reason: &str) {
         if format == Format::Json {
-            emit(&serde_json::json!({ "event": "detached", "t_ms": at.as_millis() as u64 }));
+            emit(&serde_json::json!({
+                "event": "detached",
+                "t_ms": at.as_millis() as u64,
+                "reason": reason,
+            }));
         }
     }
 

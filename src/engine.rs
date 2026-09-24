@@ -21,6 +21,13 @@
 //! from under it. While nothing reads, further re-attaches back off from one
 //! second to eight, so a long menu does not rescan the process twice a second.
 //!
+//! A re-attach only re-resolves anchors on the same target; it cannot bring
+//! back a process that has **exited**, and a dead process looks, to reads,
+//! exactly like a live one on a loading screen. So the session never decides
+//! on its own that the target is gone. A host asks
+//! [`Session::target_exited`] (the backend asks the OS) and ends the watch
+//! itself; the `scry` CLI does so every tick.
+//!
 //! # Driving it
 //!
 //! [`Session::poll`] is synchronous and takes the elapsed time explicitly, so a
@@ -1223,6 +1230,17 @@ impl<B: MemoryBackend> Session<B> {
         }
     }
 
+    /// Whether the target process has exited, as far as the backend can tell
+    /// (see [`MemoryBackend::has_exited`]).
+    ///
+    /// Nothing in [`poll`](Session::poll) acts on this: it is the host's call
+    /// whether a gone target ends the watch, and one that polls for a process
+    /// that will be restarted may want to keep going. [`Session::run`] does not
+    /// stop on it either.
+    pub fn target_exited(&self) -> bool {
+        self.backend.has_exited()
+    }
+
     /// The last known value of every label sampled so far — the full state a
     /// diff stream is relative to. Useful for a consumer that joins late and
     /// needs the current picture, not just the next change.
@@ -1414,6 +1432,7 @@ mod tests {
         reads_at: RefCell<HashMap<u64, u32>>,
         base_calls: Cell<u32>,
         fail: Cell<bool>,
+        exited: Cell<bool>,
     }
 
     impl Fake {
@@ -1424,6 +1443,7 @@ mod tests {
                 reads_at: RefCell::new(HashMap::new()),
                 base_calls: Cell::new(0),
                 fail: Cell::new(false),
+                exited: Cell::new(false),
             }
         }
 
@@ -1482,6 +1502,10 @@ mod tests {
                 start: self.base,
                 len: self.mem.borrow().len() as u64,
             }])
+        }
+
+        fn has_exited(&self) -> bool {
+            self.exited.get()
         }
     }
 
@@ -1773,6 +1797,25 @@ mod tests {
         s.poll(Duration::from_millis(t + 50));
         s.poll(Duration::from_millis(t + 100));
         assert_eq!(fake.base_calls.get(), before + 1);
+    }
+
+    /// The session reports what the backend knows about the target's exit and
+    /// leaves the decision to the host; polling carries on regardless.
+    #[test]
+    fn target_exit_is_reported_not_acted_on() {
+        let fake = Rc::new(Fake::new(64));
+        let profile = Profile {
+            label: None,
+            contract: None,
+            contract_version: None,
+            match_: ident(),
+            watches: vec![tier1("hp", 0, None)],
+        };
+        let mut s = Session::attach(Rc::clone(&fake), &profile, Config::default());
+        assert!(!s.target_exited());
+        fake.exited.set(true);
+        assert!(s.target_exited());
+        assert!(s.poll(Duration::ZERO).contains_key("hp"));
     }
 
     #[test]
