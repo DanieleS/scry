@@ -73,6 +73,10 @@ while migrating, as long as they agree on the major. See
 [`docs/contracts-and-views.md`](docs/contracts-and-views.md) for how contracts,
 profiles and the things that draw them fit together.
 
+`scry schema <profile.json>` prints the JSON Schema of the `values` a profile
+produces — one nullable property per watch, typed from its value type — which is
+how a contract's schema is generated rather than written by hand.
+
 ### Two tiers of watch
 
 Both tiers walk a pointer chain and read a typed value (`i32`, `u32`, `f32`,
@@ -300,11 +304,14 @@ winning profile declares (`null` when it declares none):
 hosts that predate `contract`; it is deprecated and goes once hosts read
 `contract`. A reader must ignore event types and fields it does not know.
 
-Two more commands help author and verify:
+Three more commands help author and verify:
 
 ```sh
 # Find an AOB signature in a live process (for writing a profile's probe/anchor):
 scry scan --process game.exe --signature "48 8B 05 ?? ?? ?? ?? 48 8B 88"
+
+# Print the JSON Schema of the values a profile produces (any platform, no game):
+scry schema game.json
 
 # Prove the backend works on this machine — no game needed. Spawns the bundled
 # cavia and checks the full read path (module base, pointer chain, AOB,

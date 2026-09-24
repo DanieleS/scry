@@ -126,7 +126,9 @@ downstream has to change. The id is a lowercase slug and never changes; the
 version is `major.minor`. Bump the **minor** when you only *add* a watch or a
 record field, and the **major** when you rename, retype or remove one, or when a
 value starts to mean something else. scry doesn't read the field — it reports it
-on `attached`, for whatever is rendering your values.
+on `attached`, for whatever is rendering your values — and `scry schema
+<profile.json>` prints the JSON Schema of what the profile emits, so the shape
+can be checked rather than remembered.
 
 The older integer `"contractVersion": 1` is still accepted but deprecated. It
 reads as version `1.0` with no id, which is enough to say *which* version but not

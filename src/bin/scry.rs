@@ -18,18 +18,84 @@
 //! and the two platform lookups (find a pid by name, name a pid) are hand-rolled
 //! against the same OS surface the backends already use.
 
-// Everything here needs a memory backend for the host OS. On a platform that has
-// none (e.g. macOS) the binary still builds, but every command is a no-op that
-// says so, rather than failing to compile.
-#[cfg(any(target_os = "linux", target_os = "windows"))]
+// `schema` reads a file and writes a file, and needs no process to read, so it
+// works on every platform — including the macOS or CI box a profile repository
+// is checked on. It is dispatched before anything that needs a backend.
 fn main() {
-    std::process::exit(imp::main());
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().map(String::as_str) == Some("schema") {
+        std::process::exit(schema_cmd::run(&args[1..]));
+    }
+    std::process::exit(platform_main());
+}
+
+// Everything else needs a memory backend for the host OS. On a platform that has
+// none (e.g. macOS) the binary still builds, but every other command is a no-op
+// that says so, rather than failing to compile.
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+fn platform_main() -> i32 {
+    imp::main()
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "windows")))]
-fn main() {
-    eprintln!("scry: no memory backend is built for this platform (Windows and Linux only)");
-    std::process::exit(1);
+fn platform_main() -> i32 {
+    eprintln!(
+        "scry: no memory backend is built for this platform (Windows and Linux only); \
+         only `scry schema` works here"
+    );
+    1
+}
+
+/// `scry schema <profile.json>`: print the JSON Schema of the `values` object
+/// the profile produces. See [`scry::schema`].
+mod schema_cmd {
+    const USAGE: &str = "\
+scry schema — print the JSON Schema of the values a profile produces.
+
+USAGE:
+    scry schema <profile.json>
+
+The schema (draft 2020-12) describes the `values` object of the JSON stream:
+one property per watch, typed from the watch's value type, every one nullable.
+When the profile declares a `contract`, its id and version name the schema.
+Output is deterministic, so it can be committed and diffed. Works on every
+platform: it reads the profile file and nothing else.
+";
+
+    pub fn run(args: &[String]) -> i32 {
+        let path = match args {
+            [flag] if flag == "-h" || flag == "--help" => {
+                print!("{USAGE}");
+                return 0;
+            }
+            [path] => path,
+            _ => {
+                eprintln!("scry: schema takes exactly one profile path\n");
+                eprint!("{USAGE}");
+                return 1;
+            }
+        };
+        let text = match std::fs::read_to_string(path) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("scry: {path}: {e}");
+                return 1;
+            }
+        };
+        match scry::Profile::from_json(&text) {
+            Ok(profile) => {
+                print!(
+                    "{}",
+                    scry::schema::to_pretty(&scry::schema::values_schema(&profile))
+                );
+                0
+            }
+            Err(e) => {
+                eprintln!("scry: {path}: {e}");
+                1
+            }
+        }
+    }
 }
 
 #[cfg(any(target_os = "linux", target_os = "windows"))]
@@ -49,6 +115,7 @@ USAGE:
 COMMANDS:
     watch       Attach to a game and stream its values as they change.
     scan        Find an AOB signature in a running process (profile authoring).
+    schema      Print the JSON Schema of the values a profile produces.
     selftest    Prove the engine end-to-end against a bundled test process.
     help        Show this message.
     version     Print the version.

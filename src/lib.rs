@@ -17,6 +17,7 @@ pub mod backend;
 pub mod engine;
 pub mod profile;
 pub mod resolver;
+pub mod schema;
 
 /// Offline **profile-authoring** tools — present only under the `authoring`
 /// feature, and never part of the read-only telemetry runtime.
