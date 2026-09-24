@@ -2481,13 +2481,18 @@ mod tests {
             ))
         };
         assert!(with_max("4096").is_ok());
-        for bad in ["4097", "18446744073709551615"] {
+        // 4294967295 is the largest `max` a 32-bit reader can even parse, so it
+        // reaches the ceiling check on every target.
+        for bad in ["4097", "4294967295"] {
             let err = with_max(bad).unwrap_err().to_string();
             assert!(
                 err.contains("above the ceiling of 4096"),
                 "max {bad}: {err}"
             );
         }
+        // Wider than usize on a 32-bit reader, where it fails to parse at all
+        // instead of reaching the ceiling check. Rejected either way.
+        assert!(with_max("18446744073709551615").is_err());
     }
 
     #[test]
