@@ -787,6 +787,109 @@ pub enum Watch {
     },
 }
 
+/// Which **contract** a profile implements: the shape of the values it emits,
+/// named by an [`id`](Contract::id) and a [`version`](Contract::version).
+///
+/// A contract is not a profile. Many profiles implement one contract — one per
+/// build, one per storefront — and a new profile for a new build normally keeps
+/// it, so nothing that renders the values has to change when a game patches.
+/// Carrying the id alongside the version is what lets a consumer find the right
+/// renderer without keying on the [`label`](Profile::label), which stays purely
+/// descriptive: renaming a profile must never unbind the thing that draws it.
+///
+/// The engine never reads either half. See [`Profile::contract`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Contract {
+    /// Stable identifier of the contract, a lowercase slug (`"sea-of-stars"`).
+    /// Restricted to `[a-z0-9]` and single inner dashes because it ends up in
+    /// file names, URLs and cache keys on every consumer, and each of those has
+    /// its own ideas about what else is safe.
+    pub id: String,
+    /// Semver-style `major.minor` of the contract. A minor adds; a major is
+    /// anything else. See [`ContractVersion`].
+    pub version: ContractVersion,
+}
+
+/// A contract's `major.minor`, written as a string (`"2.1"`) on the wire.
+///
+/// Only two components, on purpose. A contract describes a shape, and a shape
+/// either gained something (minor) or changed in a way a reader has to know
+/// about (major); there is no "patch" to a shape that leaves every reader
+/// exactly where it was. A string rather than a JSON number because `2.10` and
+/// `2.1` are different versions, and a float cannot tell them apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ContractVersion {
+    /// Bumped by any change a reader of the previous version could trip over: a
+    /// rename, a retype, a removal, or a value whose meaning changes.
+    pub major: u32,
+    /// Bumped by additions only: new watches, new fields inside records.
+    pub minor: u32,
+}
+
+impl ContractVersion {
+    /// Parse `"<major>.<minor>"`. Both parts are plain decimal digits: no sign,
+    /// no whitespace and no third component, so a version reads the same to
+    /// every tool that has to compare it.
+    pub fn parse(text: &str) -> Option<Self> {
+        let (major, minor) = text.split_once('.')?;
+        let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+        if !digits(major) || !digits(minor) {
+            return None;
+        }
+        Some(ContractVersion {
+            major: major.parse().ok()?,
+            minor: minor.parse().ok()?,
+        })
+    }
+}
+
+impl std::fmt::Display for ContractVersion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}.{}", self.major, self.minor)
+    }
+}
+
+impl Serialize for ContractVersion {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        s.collect_str(self)
+    }
+}
+
+impl<'de> Deserialize<'de> for ContractVersion {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        let text = String::deserialize(d)?;
+        ContractVersion::parse(&text).ok_or_else(|| {
+            serde::de::Error::custom(format!(
+                "contract version must be \"<major>.<minor>\", got {text:?}"
+            ))
+        })
+    }
+}
+
+/// Whether `id` is a contract slug: lowercase ASCII letters and digits in
+/// dash-separated runs, with no leading, trailing or doubled dash.
+fn is_slug(id: &str) -> bool {
+    !id.is_empty()
+        && id.split('-').all(|run| {
+            !run.is_empty()
+                && run
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+        })
+}
+
+/// The contract a profile declares, after reconciling [`Profile::contract`]
+/// with the deprecated [`Profile::contract_version`]. See
+/// [`Profile::declared_contract`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeclaredContract<'a> {
+    /// The contract id, or `None` when only the deprecated integer was given —
+    /// which names a version of *some* shape but not which one.
+    pub id: Option<&'a str>,
+    /// The contract version. From the deprecated integer `n` this is `n.0`.
+    pub version: ContractVersion,
+}
+
 /// A complete per-game profile: identity plus the values to read.
 ///
 /// Not `Eq` because a [`Watch`] carries a float `rate_hz`; `PartialEq` is all
@@ -798,7 +901,7 @@ pub struct Profile {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
 
-    /// The **contract**: an opaque version for the *shape* of what this profile
+    /// The **contract** this profile implements: which shape of values it
     /// emits — the set of watch names and their types — as opposed to
     /// [`Match::version`], which pins the game build the offsets were authored
     /// against. The two are orthogonal, and deliberately so: offsets move every
@@ -811,6 +914,20 @@ pub struct Profile {
     /// not by the caller, so which contract came out is news only the engine can
     /// report. Carried through untouched, never acted on — reading it would be
     /// the engine forming an opinion about what a value *means*.
+    ///
+    /// Optional: a profile with no contract is still a valid profile for
+    /// ad-hoc use at a terminal. It just has nothing a renderer could key on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contract: Option<Contract>,
+
+    /// **Deprecated** — write [`contract`](Profile::contract) instead.
+    ///
+    /// The integer that versioned the contract before contracts had an id.
+    /// Still accepted so profiles written against 0.1.0-alpha.2 and alpha.3 keep
+    /// loading, and read as `{"version": "<n>.0"}` with no id. Setting it next
+    /// to `contract` is allowed only when the two agree on the major (the only
+    /// thing the integer ever carried); anything else is rejected rather than
+    /// guessed at, because a host would otherwise be told two different shapes.
     #[serde(
         rename = "contractVersion",
         default,
@@ -854,7 +971,10 @@ impl Profile {
     ///   **earlier in the array**, must not declare a string `type`, may use
     ///   [`Item`](Expr::Item) only under an `each` naming an earlier collection,
     ///   and must give each operator the arity it takes.
+    /// - A declared [`contract`](Profile::contract) has a slug id, and agrees
+    ///   with the deprecated `contractVersion` when both are given.
     pub fn validate(&self) -> Result<()> {
+        self.check_contract()?;
         // The watches declared *before* the one being checked, grown as the loop
         // walks the array — because that ordering *is* the cycle-prevention story
         // for derived watches. A reference can only point upwards, so there is no
@@ -901,6 +1021,50 @@ impl Profile {
                 _ => {}
             }
             earlier.push(w);
+        }
+        Ok(())
+    }
+
+    /// The contract this profile declares, reconciling the current
+    /// [`contract`](Profile::contract) object with the deprecated integer
+    /// [`contract_version`](Profile::contract_version). `None` when it declares
+    /// neither.
+    ///
+    /// Assumes a [validated](Profile::validate) profile, where the two cannot
+    /// disagree; given both, the object wins because it is the richer of the two.
+    pub fn declared_contract(&self) -> Option<DeclaredContract<'_>> {
+        match (&self.contract, self.contract_version) {
+            (Some(c), _) => Some(DeclaredContract {
+                id: Some(&c.id),
+                version: c.version,
+            }),
+            (None, Some(n)) => Some(DeclaredContract {
+                id: None,
+                version: ContractVersion { major: n, minor: 0 },
+            }),
+            (None, None) => None,
+        }
+    }
+
+    /// The contract half of [`validate`](Profile::validate).
+    fn check_contract(&self) -> Result<()> {
+        if let Some(c) = &self.contract {
+            if !is_slug(&c.id) {
+                return Err(Error::BadProfile(format!(
+                    "contract id {:?} is not a slug: use lowercase letters, digits and single \
+                     dashes, e.g. \"sea-of-stars\"",
+                    c.id
+                )));
+            }
+            if let Some(n) = self.contract_version {
+                if n != c.version.major {
+                    return Err(Error::BadProfile(format!(
+                        "`contractVersion` {n} disagrees with `contract.version` {}; drop the \
+                         deprecated `contractVersion`",
+                        c.version
+                    )));
+                }
+            }
         }
         Ok(())
     }
@@ -1079,6 +1243,7 @@ mod tests {
     fn sample() -> Profile {
         Profile {
             label: Some("Example Game (Steam)".to_string()),
+            contract: None,
             contract_version: None,
             match_: Match {
                 process: "game.exe".to_string(),
@@ -1240,6 +1405,141 @@ mod tests {
         let json = p.to_json().expect("serialize");
         assert!(json.contains("contractVersion"));
         assert_eq!(Profile::from_json(&json).expect("re-parse"), p);
+    }
+
+    #[test]
+    fn contract_is_an_id_and_a_major_minor_version() {
+        let json = r#"
+        {
+          "label": "Example (Steam 1.3)",
+          "contract": { "id": "sea-of-stars", "version": "2.10" },
+          "match": { "process": "g.exe", "module": "g.exe", "probe": "90 90" },
+          "watches": []
+        }
+        "#;
+        let p = Profile::from_json(json).expect("parse");
+        let c = p.contract.as_ref().expect("contract");
+        assert_eq!(c.id, "sea-of-stars");
+        // `2.10` is not `2.1`: the reason the version is a string, not a float.
+        assert_eq!(
+            c.version,
+            ContractVersion {
+                major: 2,
+                minor: 10
+            }
+        );
+        assert_eq!(
+            p.declared_contract(),
+            Some(DeclaredContract {
+                id: Some("sea-of-stars"),
+                version: ContractVersion {
+                    major: 2,
+                    minor: 10
+                },
+            })
+        );
+
+        // It round-trips in the same written form, and the deprecated integer
+        // does not appear out of nowhere.
+        let out = p.to_json().expect("serialize");
+        assert!(out.contains(r#""version": "2.10""#), "{out}");
+        assert!(!out.contains("contractVersion"));
+        assert_eq!(Profile::from_json(&out).expect("re-parse"), p);
+    }
+
+    #[test]
+    fn contract_version_must_be_major_dot_minor() {
+        for bad in [
+            "2", "2.1.0", "v2.1", "2.x", "-2.1", " 2.1", "2.", ".1", "2.1 ",
+        ] {
+            assert_eq!(ContractVersion::parse(bad), None, "{bad:?} must not parse");
+            let json = format!(
+                r#"{{ "contract": {{ "id": "x", "version": "{bad}" }},
+                     "match": {{ "process": "g.exe", "module": "g.exe", "probe": "90" }},
+                     "watches": [] }}"#
+            );
+            assert!(
+                Profile::from_json(&json).is_err(),
+                "{bad:?} must be rejected"
+            );
+        }
+        // A number is not accepted either, however natural `2.1` looks.
+        let numeric = r#"{ "contract": { "id": "x", "version": 2.1 },
+            "match": { "process": "g.exe", "module": "g.exe", "probe": "90" },
+            "watches": [] }"#;
+        assert!(Profile::from_json(numeric).is_err());
+        assert_eq!(
+            ContractVersion::parse("0.0"),
+            Some(ContractVersion { major: 0, minor: 0 })
+        );
+    }
+
+    #[test]
+    fn contract_id_must_be_a_slug() {
+        for bad in [
+            "",
+            "Sea-of-Stars",
+            "sea of stars",
+            "sea_of_stars",
+            "-sea",
+            "sea-",
+            "sea--of",
+        ] {
+            let json = format!(
+                r#"{{ "contract": {{ "id": "{bad}", "version": "1.0" }},
+                     "match": {{ "process": "g.exe", "module": "g.exe", "probe": "90" }},
+                     "watches": [] }}"#
+            );
+            let err = Profile::from_json(&json).expect_err(bad).to_string();
+            assert!(err.contains("slug"), "{bad:?}: {err}");
+        }
+        for good in ["a", "sea-of-stars", "ff7-remake", "2064"] {
+            let json = format!(
+                r#"{{ "contract": {{ "id": "{good}", "version": "1.0" }},
+                     "match": {{ "process": "g.exe", "module": "g.exe", "probe": "90" }},
+                     "watches": [] }}"#
+            );
+            Profile::from_json(&json).expect(good);
+        }
+    }
+
+    #[test]
+    fn deprecated_contract_version_reads_as_major_dot_zero_with_no_id() {
+        let json = r#"
+        { "contractVersion": 2,
+          "match": { "process": "g.exe", "module": "g.exe", "probe": "90" },
+          "watches": [] }
+        "#;
+        let p = Profile::from_json(json).expect("parse");
+        assert_eq!(p.contract, None);
+        assert_eq!(
+            p.declared_contract(),
+            Some(DeclaredContract {
+                id: None,
+                version: ContractVersion { major: 2, minor: 0 },
+            })
+        );
+    }
+
+    #[test]
+    fn both_contract_forms_must_agree_on_the_major() {
+        let with = |legacy: u32, version: &str| {
+            format!(
+                r#"{{ "contractVersion": {legacy},
+                     "contract": {{ "id": "x", "version": "{version}" }},
+                     "match": {{ "process": "g.exe", "module": "g.exe", "probe": "90" }},
+                     "watches": [] }}"#
+            )
+        };
+        // The integer only ever carried the major, so it agrees with any minor
+        // of it — which is what a profile migrating from one form to the other
+        // naturally writes.
+        let p = Profile::from_json(&with(2, "2.0")).expect("same major");
+        assert_eq!(p.declared_contract().unwrap().id, Some("x"));
+        Profile::from_json(&with(2, "2.3")).expect("same major, later minor");
+
+        let err = Profile::from_json(&with(3, "2.0")).expect_err("different major");
+        assert!(err.to_string().contains("disagrees"), "{err}");
     }
 
     #[test]

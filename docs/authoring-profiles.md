@@ -119,11 +119,19 @@ scry watch --process SeaOfStars.exe --profile seaofstars.json --no-resolve # HP 
   auto-update) so nothing moves until you choose.
 
 Because you should expect to re-do a profile per patch, keep the *names* stable
-while you do. Add an optional `"contractVersion": 1` next to `label`: it versions
-the shape you emit (which watches, of which types), so a new profile for a new
-build normally keeps the same contract and nothing downstream has to change.
-Bump it only when you rename, retype, add, or remove a watch. scry doesn't read
-the field — it reports it on `attached`, for whatever is rendering your values.
+while you do. Add an optional `"contract": { "id": "my-game", "version": "1.0" }`
+next to `label`: it names the shape you emit (which watches, of which types), so
+a new profile for a new build normally keeps the same contract and nothing
+downstream has to change. The id is a lowercase slug and never changes; the
+version is `major.minor`. Bump the **minor** when you only *add* a watch or a
+record field, and the **major** when you rename, retype or remove one, or when a
+value starts to mean something else. scry doesn't read the field — it reports it
+on `attached`, for whatever is rendering your values.
+
+The older integer `"contractVersion": 1` is still accepted but deprecated. It
+reads as version `1.0` with no id, which is enough to say *which* version but not
+*of what*, so no renderer can find a view by it. If a profile carries both while
+you migrate, they must agree on the major or the profile is rejected.
 
 ## Strings
 

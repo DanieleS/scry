@@ -137,6 +137,7 @@ mod tests {
     fn profile(label: &str, process: &str, version: Option<&str>, probe: &str) -> Profile {
         Profile {
             label: Some(label.to_string()),
+            contract: None,
             contract_version: None,
             match_: Match {
                 process: process.to_string(),

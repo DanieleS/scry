@@ -70,7 +70,7 @@ use std::fmt;
 use serde::Deserialize;
 
 use crate::aob;
-use crate::profile::{Base, Expr, Match, Profile, Rip, ValueType, Watch};
+use crate::profile::{Base, Contract, Expr, Match, Profile, Rip, ValueType, Watch};
 
 // ---- the dump.cs symbol table ---------------------------------------------
 
@@ -288,11 +288,17 @@ pub struct ConvertSpec {
     /// Optional human-readable label, copied verbatim into the profile.
     #[serde(default)]
     pub label: Option<String>,
-    /// Optional contract version, copied verbatim into the profile's
-    /// `contractVersion`. This is the field an author bumps when a re-conversion
-    /// changes the *shape* of the output (a watch renamed, retyped, added, or
-    /// dropped) — not when a new game build merely moves the offsets, which is
-    /// the common case and the whole point of keeping the two apart.
+    /// Optional contract (`{"id": …, "version": "<major>.<minor>"}`), copied
+    /// verbatim into the profile's `contract`. This is the field an author bumps
+    /// when a re-conversion changes the *shape* of the output (a watch renamed,
+    /// retyped, added, or dropped) — not when a new game build merely moves the
+    /// offsets, which is the common case and the whole point of keeping the two
+    /// apart.
+    #[serde(default)]
+    pub contract: Option<Contract>,
+    /// **Deprecated** integer form of the contract version, copied verbatim
+    /// into the profile's `contractVersion`. Write `contract` instead; see
+    /// [`Profile::contract_version`].
     #[serde(default, rename = "contractVersion")]
     pub contract_version: Option<u32>,
     /// Executable name for the profile's `match.process`.
@@ -633,6 +639,7 @@ pub fn convert(spec: &ConvertSpec, symbols: &Symbols) -> Result<Profile, Convert
 
     let profile = Profile {
         label: spec.label.clone(),
+        contract: spec.contract.clone(),
         contract_version: spec.contract_version,
         match_: Match {
             process: spec.process.clone(),

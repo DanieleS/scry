@@ -123,6 +123,7 @@ fn derived_watches_compute_over_a_native_target() {
 
     let profile = Profile {
         label: Some("cavia (derived)".to_string()),
+        contract: None,
         contract_version: None,
         match_: ident(&ready.exe),
         watches: vec![
@@ -216,6 +217,7 @@ fn a_derived_watch_re_emits_exactly_when_its_input_changes() {
 
     let profile = Profile {
         label: Some("cavia (derived, moving)".to_string()),
+        contract: None,
         contract_version: None,
         match_: ident(&ready.exe),
         watches: vec![
