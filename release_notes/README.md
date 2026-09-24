@@ -32,8 +32,14 @@ channel, that no release exists for it yet, and that these notes are present —
 then builds and publishes. If any of that does not hold, the run is an ordinary
 CI run.
 
+A tag on any other branch is not a release, even though CI runs there too
+(agents push to `claude/**`): the gate refuses a push that is not to `main`,
+and a tag whose commit is not on `main`.
+
 To re-run a release that failed part-way, use the **CI** workflow's
-`workflow_dispatch` with `release_tag: v0.1.0`. Publishing is idempotent: it
+`workflow_dispatch` with `release_tag: v0.1.0`; the tag's commit must be on
+`main` there too. The re-run tests and builds that commit, not the one the
+workflow was dispatched from. Publishing is idempotent: it
 updates the existing release and replaces its assets rather than duplicating.
 
 ## Naming

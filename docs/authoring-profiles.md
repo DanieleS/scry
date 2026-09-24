@@ -96,6 +96,14 @@ Offsets accept **hex strings or decimal**, mixed freely — paste what CE shows.
 The RIP decode computes `base = anchor + len + i32_at(anchor + disp)`, then
 `offsets` walk from there (each dereferenced except the last).
 
+Any watch may add a `rate_hz` to sample less often than the loop's base tick
+(slow state like a zone name needs far fewer reads than HP). It must lie between
+`0.01` (once every 100 s) and `1000`; leave it out to sample every tick. A rate
+outside that range is rejected when the profile loads.
+
+Every watch needs its own `name`, whatever its tier: the name is the key the
+value is emitted under, so a repeated one is rejected too.
+
 For the mandatory `match.probe`, use any stable signature in the module. For a
 first run you can skip the probe test with `--no-resolve`.
 
@@ -119,11 +127,21 @@ scry watch --process SeaOfStars.exe --profile seaofstars.json --no-resolve # HP 
   auto-update) so nothing moves until you choose.
 
 Because you should expect to re-do a profile per patch, keep the *names* stable
-while you do. Add an optional `"contractVersion": 1` next to `label`: it versions
-the shape you emit (which watches, of which types), so a new profile for a new
-build normally keeps the same contract and nothing downstream has to change.
-Bump it only when you rename, retype, add, or remove a watch. scry doesn't read
-the field — it reports it on `attached`, for whatever is rendering your values.
+while you do. Add an optional `"contract": { "id": "my-game", "version": "1.0" }`
+next to `label`: it names the shape you emit (which watches, of which types), so
+a new profile for a new build normally keeps the same contract and nothing
+downstream has to change. The id is a lowercase slug and never changes; the
+version is `major.minor`. Bump the **minor** when you only *add* a watch or a
+record field, and the **major** when you rename, retype or remove one, or when a
+value starts to mean something else. scry doesn't read the field — it reports it
+on `attached`, for whatever is rendering your values — and `scry schema
+<profile.json>` prints the JSON Schema of what the profile emits, so the shape
+can be checked rather than remembered.
+
+The older integer `"contractVersion": 1` is still accepted but deprecated. It
+reads as version `1.0` with no id, which is enough to say *which* version but not
+*of what*, so no renderer can find a view by it. If a profile carries both while
+you migrate, they must agree on the major or the profile is rejected.
 
 ## Strings
 
@@ -185,7 +203,7 @@ Fields:
 | `stride` | bytes between consecutive elements (a pointer array → `8`) |
 | `element` | per-element chain from a slot to the value; empty means the slot *is* the value's address |
 | `type` | element type (`i32` … or a `string` — see [Strings](#strings)) |
-| `max` | hard cap — a garbage count can neither allocate nor loop unboundedly |
+| `max` | hard cap — a garbage count can neither allocate nor loop unboundedly; at most `4096` |
 
 The C# `List<T>` shape (validated against Sea of Stars — `items` at `+0x10`,
 `count` at `+0x18`, array header `0x20`, pointer stride `8`) reading the party

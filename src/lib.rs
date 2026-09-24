@@ -17,6 +17,7 @@ pub mod backend;
 pub mod engine;
 pub mod profile;
 pub mod resolver;
+pub mod schema;
 
 /// Offline **profile-authoring** tools — present only under the `authoring`
 /// feature, and never part of the read-only telemetry runtime.
@@ -31,7 +32,7 @@ pub mod authoring;
 pub use backend::MemoryBackend;
 pub use engine::{Config, Engine, Handle, Session, Snapshot, Value};
 pub use error::{Error, Result};
-pub use profile::{Match, Profile, Rip, ValueType, Watch};
+pub use profile::{Contract, ContractVersion, Match, Profile, Rip, ValueType, Watch};
 
 #[cfg(target_os = "linux")]
 pub use backend::linux::LinuxBackend;

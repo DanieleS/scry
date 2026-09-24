@@ -45,6 +45,7 @@ fn collection_reads_an_enemy_hp_list_from_the_cavia() {
 
     let profile = Profile {
         label: Some("cavia (collection)".to_string()),
+        contract: None,
         contract_version: None,
         match_: ident(&ready.exe),
         watches: vec![Watch::Collection {
@@ -108,6 +109,7 @@ fn collection_reads_records_per_enemy_from_the_cavia() {
 
     let profile = Profile {
         label: Some("cavia (record collection)".to_string()),
+        contract: None,
         contract_version: None,
         match_: ident(&ready.exe),
         watches: vec![Watch::Collection {
@@ -153,6 +155,7 @@ fn collection_reads_the_ordered_party_roster_as_strings() {
 
     let profile = Profile {
         label: Some("cavia (roster)".to_string()),
+        contract: None,
         contract_version: None,
         match_: ident(&ready.exe),
         watches: vec![Watch::Collection {
@@ -197,6 +200,7 @@ fn scalar_string_watch_reads_a_character_identity() {
 
     let profile = Profile {
         label: Some("cavia (string)".to_string()),
+        contract: None,
         contract_version: None,
         match_: ident(&ready.exe),
         watches: vec![Watch::Tier1 {

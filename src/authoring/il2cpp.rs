@@ -70,7 +70,7 @@ use std::fmt;
 use serde::Deserialize;
 
 use crate::aob;
-use crate::profile::{Base, Expr, Match, Profile, Rip, ValueType, Watch};
+use crate::profile::{Base, Contract, Expr, Match, Profile, Rip, ValueType, Watch};
 
 // ---- the dump.cs symbol table ---------------------------------------------
 
@@ -80,9 +80,11 @@ pub struct Field {
     /// Byte offset of the field: from the instance base for an instance field,
     /// or within the type's static storage for a `static` field.
     pub offset: i64,
-    /// Whether the field is declared `static`. Informational — a static field's
-    /// offset is relative to the class's static storage, not an instance, so the
-    /// chain that reaches it is a different (author-supplied) shape.
+    /// Whether the field is declared `static`. A static field's offset is
+    /// relative to the class's static storage, not to an instance, so the
+    /// converter refuses one where a chain needs an instance offset (see
+    /// [`ConvertError::StaticField`]) rather than emit an offset that reads
+    /// the wrong object.
     pub is_static: bool,
 }
 
@@ -162,8 +164,10 @@ impl Symbols {
 
             // Track braces so we always know which type body we're inside: a
             // pending decl's `{` opens it, and a matching `}` closes the
-            // innermost open type.
-            for b in line.bytes() {
+            // innermost open type. Only braces in code count: one inside a
+            // string or char literal (`const string OPEN = "{";`) or a
+            // trailing comment would otherwise shift every type after it.
+            for b in code_bytes(line) {
                 match b {
                     b'{' => {
                         depth += 1;
@@ -210,6 +214,45 @@ impl Symbols {
     pub fn is_empty(&self) -> bool {
         self.by_full.is_empty()
     }
+}
+
+/// The bytes of `line` that are code: outside string and char literals, and
+/// before a `//` comment. C# escapes inside literals with a backslash, and a
+/// verbatim string (`@"…"`) doubles its quotes instead; both keep the scan in
+/// the literal until it really ends, which is all brace counting needs.
+fn code_bytes(line: &str) -> impl Iterator<Item = u8> + '_ {
+    #[derive(Clone, Copy, PartialEq)]
+    enum In {
+        Code,
+        Str { verbatim: bool },
+        Char,
+        Comment,
+    }
+    let bytes = line.as_bytes();
+    let mut state = In::Code;
+    let mut i = 0;
+    std::iter::from_fn(move || loop {
+        let b = *bytes.get(i)?;
+        let next = bytes.get(i + 1).copied();
+        i += 1;
+        match state {
+            In::Comment => return None,
+            In::Code => match b {
+                b'/' if next == Some(b'/') => state = In::Comment,
+                b'"' => {
+                    let verbatim = i >= 2 && bytes[i - 2] == b'@';
+                    state = In::Str { verbatim };
+                }
+                b'\'' => state = In::Char,
+                _ => return Some(b),
+            },
+            In::Str { verbatim: false } | In::Char if b == b'\\' => i += 1,
+            In::Str { verbatim: true } if b == b'"' && next == Some(b'"') => i += 1,
+            In::Str { .. } if b == b'"' => state = In::Code,
+            In::Char if b == b'\'' => state = In::Code,
+            In::Str { .. } | In::Char => {}
+        }
+    })
 }
 
 /// The simple class name of a fully-qualified type: everything after the last `.`.
@@ -288,11 +331,17 @@ pub struct ConvertSpec {
     /// Optional human-readable label, copied verbatim into the profile.
     #[serde(default)]
     pub label: Option<String>,
-    /// Optional contract version, copied verbatim into the profile's
-    /// `contractVersion`. This is the field an author bumps when a re-conversion
-    /// changes the *shape* of the output (a watch renamed, retyped, added, or
-    /// dropped) — not when a new game build merely moves the offsets, which is
-    /// the common case and the whole point of keeping the two apart.
+    /// Optional contract (`{"id": …, "version": "<major>.<minor>"}`), copied
+    /// verbatim into the profile's `contract`. This is the field an author bumps
+    /// when a re-conversion changes the *shape* of the output (a watch renamed,
+    /// retyped, added, or dropped) — not when a new game build merely moves the
+    /// offsets, which is the common case and the whole point of keeping the two
+    /// apart.
+    #[serde(default)]
+    pub contract: Option<Contract>,
+    /// **Deprecated** integer form of the contract version, copied verbatim
+    /// into the profile's `contractVersion`. Write `contract` instead; see
+    /// [`Profile::contract_version`].
     #[serde(default, rename = "contractVersion")]
     pub contract_version: Option<u32>,
     /// Executable name for the profile's `match.process`.
@@ -551,6 +600,19 @@ pub enum ConvertError {
         /// The offending entry.
         entry: String,
     },
+    /// A `Class::field` reference names a `static` field. Every chain entry is
+    /// an offset from the object the previous hop reached, and a static field's
+    /// offset is not: it is relative to the class's static storage, so used as
+    /// an instance offset it reads some other field of whatever object is there.
+    StaticField {
+        /// Watch that referenced it.
+        watch: String,
+        /// The static field reference.
+        field: String,
+        /// Its offset within the static storage, for an author who has reached
+        /// that storage by other means and wants to write it as a literal.
+        offset: i64,
+    },
     /// A `Class::field` reference the dump does not contain.
     UnknownField {
         /// Watch that referenced it.
@@ -590,6 +652,17 @@ impl fmt::Display for ConvertError {
                 f,
                 "watch {watch:?}: chain entry {entry:?} is neither a `Class::field` \
                  reference nor a numeric offset"
+            ),
+            ConvertError::StaticField {
+                watch,
+                field,
+                offset,
+            } => write!(
+                f,
+                "watch {watch:?}: field {field:?} is static, so its offset is relative to the \
+                 class's static storage, not to an instance; a chain entry cannot name it. \
+                 If the chain really reaches the static storage, write the offset as a \
+                 literal: \"{offset:#x}\""
             ),
             ConvertError::UnknownField { watch, field } => {
                 write!(f, "watch {watch:?}: field {field:?} not found in the dump")
@@ -633,6 +706,7 @@ pub fn convert(spec: &ConvertSpec, symbols: &Symbols) -> Result<Profile, Convert
 
     let profile = Profile {
         label: spec.label.clone(),
+        contract: spec.contract.clone(),
         contract_version: spec.contract_version,
         match_: Match {
             process: spec.process.clone(),
@@ -827,8 +901,14 @@ fn resolve_entry(watch: &str, entry: &ChainEntry, symbols: &Symbols) -> Result<i
     match entry {
         ChainEntry::Num(n) => Ok(*n),
         // A `::` marks a field reference; anything else is a numeric literal.
-        ChainEntry::Sym(s) if s.contains("::") => {
-            symbols.lookup(s).map(|f| f.offset).map_err(|e| match e {
+        ChainEntry::Sym(s) if s.contains("::") => match symbols.lookup(s) {
+            Ok(field) if field.is_static => Err(ConvertError::StaticField {
+                watch: watch.to_string(),
+                field: s.clone(),
+                offset: field.offset,
+            }),
+            Ok(field) => Ok(field.offset),
+            Err(e) => Err(match e {
                 LookupError::Unknown => ConvertError::UnknownField {
                     watch: watch.to_string(),
                     field: s.clone(),
@@ -838,8 +918,8 @@ fn resolve_entry(watch: &str, entry: &ChainEntry, symbols: &Symbols) -> Result<i
                     field: s.clone(),
                     candidates,
                 },
-            })
-        }
+            }),
+        },
         ChainEntry::Sym(s) => parse_int(s).ok_or_else(|| ConvertError::BadChainEntry {
             watch: watch.to_string(),
             entry: s.clone(),
@@ -847,18 +927,11 @@ fn resolve_entry(watch: &str, entry: &ChainEntry, symbols: &Symbols) -> Result<i
     }
 }
 
-/// Parse a signed integer literal, decimal or `0x`-prefixed hex.
+/// Parse a signed integer literal, decimal or `0x`-prefixed hex — by the same
+/// rule the runtime applies to a profile's offsets, so a literal the converter
+/// accepts is one the profile it emits can express.
 fn parse_int(s: &str) -> Option<i64> {
-    let s = s.trim();
-    let (neg, rest) = match s.strip_prefix('-') {
-        Some(r) => (true, r.trim_start()),
-        None => (false, s),
-    };
-    let magnitude = match rest.strip_prefix("0x").or_else(|| rest.strip_prefix("0X")) {
-        Some(hex) => i64::from_str_radix(hex, 16).ok()?,
-        None => rest.parse::<i64>().ok()?,
-    };
-    Some(if neg { -magnitude } else { magnitude })
+    crate::profile::hexnum::parse(s)
 }
 
 fn resolve_probe(spec: &ProbeSpec) -> String {
@@ -1010,6 +1083,44 @@ public class PartyMember
         assert_eq!(s.lookup("Ui.PartyMember::currentHp").unwrap().offset, 0x44);
     }
 
+    /// A brace inside a string or char literal is not code. Counted, it opened
+    /// a phantom scope, and every field after it was filed under no type — or
+    /// under the wrong one.
+    #[test]
+    fn braces_inside_literals_do_not_count() {
+        let dump = r#"
+// Namespace:
+public class Strings
+{
+	public const string OPEN = "{"; // not an offset
+	public const string ESCAPED = "\"{"; // an escaped quote, then a brace
+	public const string VERBATIM = @"a "" { b"; // a verbatim string
+	public const char BRACE = '{';
+	public int after; // 0x10
+}
+
+// Namespace: Other
+public class Next
+{
+	public int value; // 0x18
+}
+"#;
+        let s = Symbols::parse(dump);
+        assert_eq!(s.lookup("Strings::after").unwrap().offset, 0x10);
+        // Only a top-level `Next` has this fully-qualified key: one left nested
+        // inside `Strings` by phantom scopes would be `Strings.Next`.
+        assert_eq!(s.lookup("Other.Next::value").unwrap().offset, 0x18);
+        assert_eq!(s.len(), 2);
+    }
+
+    #[test]
+    fn code_bytes_skips_literals_and_comments() {
+        let code = |line: &str| String::from_utf8(code_bytes(line).collect()).unwrap();
+        assert_eq!(code(r#"a "{" b"#), "a  b");
+        assert_eq!(code(r#"x '\'' { // }"#), "x  { ");
+        assert_eq!(code(r#"@"q""{" }"#), "@ }");
+    }
+
     #[test]
     fn nested_type_does_not_leak_into_parent_stack() {
         // After the nested enum closes, the second class's fields must still be
@@ -1140,6 +1251,35 @@ public class PartyMember
             }
             other => panic!("expected UnknownField, got {other:?}"),
         }
+    }
+
+    /// A static field's offset is relative to the class's static storage, so
+    /// used as an instance offset it silently reads the wrong field. Refuse it,
+    /// and hand the author the offset for when they really mean it.
+    #[test]
+    fn a_static_field_in_a_chain_is_rejected() {
+        let map = r#"{
+          "process": "g.exe", "module": "GameAssembly.dll",
+          "probe": "90 90",
+          "watches": [
+            { "name": "gm", "tier": "tier1", "chain": ["0x100", "GameManager::_instance"],
+              "type": "u64" }
+          ]
+        }"#;
+        let err = convert_files(DUMP, map).unwrap_err();
+        match &err {
+            ConvertError::StaticField {
+                watch,
+                field,
+                offset,
+            } => {
+                assert_eq!(watch, "gm");
+                assert_eq!(field, "GameManager::_instance");
+                assert_eq!(*offset, 0);
+            }
+            other => panic!("expected StaticField, got {other:?}"),
+        }
+        assert!(err.to_string().contains("is static"), "{err}");
     }
 
     #[test]

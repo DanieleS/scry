@@ -105,7 +105,9 @@ plain offsets/signatures, engine-agnostic, exactly as today.
 2. **[#13] IL2CPP → profile converter** — first real profile: Sea of Stars.
 3. **[#15] Data-driven collection watch** — party/enemy lists, no scripting VM.
 4. **[#6] `.CT` importer** — read-only subset, scoped by #12.
-5. **[#7] Versioned JSON Schema** — the community contract.
+5. **[#7] Versioned JSON Schema** — the community contract. Shaped by
+   [contracts-and-views.md](contracts-and-views.md): contracts and profiles
+   live apart from scry, and clients key their views on the contract.
 6. **[#14] Runtime by-name reflection resolver** — the resilient endgame.
 7. **[#5] Vibepollo integration** — adapter + control-channel `0x3003`.
 

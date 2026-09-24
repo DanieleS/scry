@@ -40,22 +40,42 @@ above all in its `probe`.
 
 ### The contract — what a profile *emits*
 
-A profile can also declare an optional `"contractVersion": 1`. It versions the
-**shape** of the output — the watch names and their types — and it is orthogonal
-to `match.version`, which pins the *build* the offsets were authored against:
+A profile can also declare which **contract** it implements:
+
+```json
+"contract": { "id": "sea-of-stars", "version": "2.1" }
+```
+
+A contract is the **shape** of the output — the watch names and their types —
+and it is orthogonal to `match.version`, which pins the *build* the offsets were
+authored against:
 
 ```text
 build 1.4.2 -> profile 1.4.2 -\
-build 1.5.0 -> profile 1.5.0 --+-> contract 1
-build 2.0.0 -> profile 2.0.0 ---> contract 2
+build 1.5.0 -> profile 1.5.0 --+-> contract sea-of-stars 1.0
+build 2.0.0 -> profile 2.0.0 ---> contract sea-of-stars 2.0
 ```
 
 Offsets move every patch; names outlive them. So the usual patch costs one new
 profile sharing the old contract, and a consumer that renders `hp` and `party`
-keeps working untouched. The engine **never reads this field** — it parses it and
-hands it back on the `attached` event, for whoever is rendering the values. An
-engine that acted on it would be forming an opinion about what a value *means*,
-which is exactly the line this one doesn't cross.
+keeps working untouched. The version is `major.minor`: a minor only adds watches
+or record fields, a major is anything else. The id is a lowercase slug, and it —
+not the `label`, which stays purely descriptive — is what a renderer keys on.
+
+The engine **never reads this field** — it parses it and hands it back on the
+`attached` event, for whoever is rendering the values. An engine that acted on
+it would be forming an opinion about what a value *means*, which is exactly the
+line this one doesn't cross.
+
+The integer `"contractVersion": 2` of earlier releases is still accepted but
+**deprecated**: it reads as version `2.0` with no id. A profile may carry both
+while migrating, as long as they agree on the major. See
+[`docs/contracts-and-views.md`](docs/contracts-and-views.md) for how contracts,
+profiles and the things that draw them fit together.
+
+`scry schema <profile.json>` prints the JSON Schema of the `values` a profile
+produces — one nullable property per watch, typed from its value type — which is
+how a contract's schema is generated rather than written by hand.
 
 ### Two tiers of watch
 
@@ -97,8 +117,8 @@ stays structurally read-only. It reads the C# `List<T>` shape (a `count`, an
 `items` backing-array pointer, a `first` header offset) or a bare pointer array,
 and with `type: string` a single watch yields an ordered party roster like
 `["VALERE", "ZALE", "GARL"]`. A garbage count can't run away — it's clamped to a
-required `max` — and a broken element is `unavailable` in place without sinking
-the list. See [`docs/authoring-profiles.md`](docs/authoring-profiles.md).
+required `max`, itself at most 4096 — and a broken element is `unavailable` in
+place without sinking the list. See [`docs/authoring-profiles.md`](docs/authoring-profiles.md).
 
 ### Records — one shallow level of structure
 
@@ -184,13 +204,19 @@ memory shape. A name match alone would happily point telemetry at the wrong one.
 The resolver refuses to guess, narrowing in three steps, cheapest first:
 
 1. **Process bucket** — keep profiles whose `match.process` equals the running
-   executable's name.
+   executable's name, ignoring ASCII case (as Windows file names do).
 2. **Version discriminant** — if the backend can report a build version, drop
    profiles pinned to a *different* one. Profiles that don't pin a version, and
    backends that can't report one (the honest answer on Linux), are unaffected.
 3. **Probe test** — the authoritative step. Scan the target for each candidate's
    `probe` signature. The profile whose probe *actually resolves in that memory*
    wins.
+
+If several probes resolve, the choice is still deterministic: a profile whose
+`match.version` the backend confirmed beats one that pins no version, and
+otherwise the earlier profile wins. The CLI loads `--profile` files in the order
+given, then a `--profiles` folder sorted by file name, and warns on stderr
+naming every profile that fit.
 
 If no probe resolves, selection returns `None`. No telemetry, never a wrong
 match. That is why emulators and unknown builds simply get nothing, at zero
@@ -267,11 +293,78 @@ stays silent, and a value that can't be read surfaces as `unavailable` — never
 guess. If no profile's probe resolves in the target, nothing is read (the
 fail-safe), and `scry` says so.
 
-Two more commands help author and verify:
+For a host driving `scry` as a subprocess, `--format json` writes JSON Lines, one
+event per line. The first says what was attached, including the contract the
+winning profile declares (`null` when it declares none):
+
+```json
+{"event":"attached","scry":"0.1.0","pid":1234,"process":"game.exe",
+ "profile":"Sea of Stars (Steam 1.3)","profile_file":"profiles/steam-1.3.json",
+ "contract":{"id":"sea-of-stars","version":"2.1"},"contract_version":2,
+ "watches":43,"pointer_bits":64}
+{"event":"values","t_ms":5,"values":{"hp":42}}
+{"event":"detached","t_ms":9000,"reason":"duration"}
+```
+
+`detached` ends the stream and says why: `once` or `duration` when the watch
+ran out as asked (`--once`, `--for`), `target_exited` when the game went away —
+`scry` asks the OS, since to its reads a closed game looks just like one on a
+loading screen, and then exits with status 5. A host that restarts `scry`
+when the game relaunches can rely on that end rather than on watches going
+`null`.
+
+`contract_version` is the same contract's major as a bare integer, kept only for
+hosts that predate `contract`; it is deprecated and goes once hosts read
+`contract`. A reader must ignore event types and fields it does not know.
+
+Every `values` event is one line, and the first carries every readable watch at
+once, collections and records in full. A host that caps its line length (a
+1 MiB cap is common) should keep its profiles' collections well under their
+4096-element ceiling: a few thousand records of a handful of strings each can
+exceed it.
+
+When `watch` fails in a way it knows about, the JSON stream ends with an `error`
+event before `scry` exits, so a host can tell "no profile fits" from "could not
+open the game" from a crash without parsing stderr (which says the same thing,
+for a person, unchanged):
+
+```json
+{"event":"error","code":"no_profile_fits","message":"no profile fits 'game.exe' (pid 1234)","exit_code":3}
+```
+
+| `code` | Exit | Meaning |
+|---|---|---|
+| `usage` | 1 | The command line is wrong (a missing value, an unknown flag, a bad `--for`). |
+| `no_such_process` | 2 | No running process has the `--process` name. |
+| `profiles_unreadable` | 1 | A `--profile` file, or the `--profiles` folder, could not be read or parsed. A single bad file *inside* a folder is skipped with a warning instead. |
+| `attach_failed` | 1 | The target could not be opened (often: it needs an elevated `scry`), or its executable name could not be read. |
+| `no_profile_fits` | 3 | No profile's probe resolved in the target — the fail-safe. Nothing was read. |
+| `resolver_failed` | 1 | Scanning the target for the probes failed. |
+| `internal` | 101 | `scry` crashed. A bug; the panic is on stderr. |
+
+`code` is stable; `message` is for logs and may change. `exit_code` repeats the
+exit status that follows.
+
+`scry`'s exit status, in every format:
+
+| Exit | Meaning |
+|---|---|
+| 0 | Success; for `watch`, the watch ended as asked (`--once`, `--for`). |
+| 1 | A usage error, an unreadable profile, a target that cannot be opened, a resolver error, a failed `selftest`, or any other error without a code of its own. |
+| 2 | No running process has the `--process` name. |
+| 3 | No profile fits the target. |
+| 4 | `scan` found no match for the signature. |
+| 5 | `watch` stopped because the target process exited. |
+| 101 | A crash. |
+
+Three more commands help author and verify:
 
 ```sh
 # Find an AOB signature in a live process (for writing a profile's probe/anchor):
 scry scan --process game.exe --signature "48 8B 05 ?? ?? ?? ?? 48 8B 88"
+
+# Print the JSON Schema of the values a profile produces (any platform, no game):
+scry schema game.json
 
 # Prove the backend works on this machine — no game needed. Spawns the bundled
 # cavia and checks the full read path (module base, pointer chain, AOB,
@@ -316,7 +409,10 @@ manual (Cheat Engine) route the converter builds on.
 
 ## Status
 
-Early — version `0.0.0`, API not yet stable. What works today:
+Pre-release: `0.1.0` alpha builds are published from `main` (see
+[`release_notes/`](release_notes/)), and the library API and profile format may
+still change between alphas. The JSON event stream and the exit statuses are
+kept backward compatible for hosts. What works today:
 
 - `MemoryBackend` trait with typed reads and pointer-chain resolution
 - Linux backend (`process_vm_readv`, `/proc/<pid>/maps`)
@@ -330,9 +426,13 @@ Early — version `0.0.0`, API not yet stable. What works today:
   structure, both expressed as data rather than as a script
 - `derived` watches — arithmetic over what the other watches read, touching no
   memory of their own and so engine-agnostic by construction
-- Probe-based resolver with the fail-safe property
-- `scry` host CLI — attach to a running game and stream telemetry (`watch`),
-  find signatures (`scan`), and prove the backend end-to-end (`selftest`)
+- Probe-based resolver with the fail-safe property, deterministic when several
+  profiles fit
+- Contract identity (`{ id, version }`) carried from the profile to the
+  `attached` event, and `scry schema` to generate a contract's JSON Schema
+- `scry` host CLI — attach to a running game and stream telemetry (`watch`,
+  human or JSON Lines, ending on its own when the game exits), find signatures
+  (`scan`), and prove the backend end-to-end (`selftest`)
 - IL2CPP profile authoring: offline `il2cpp2scry` converter (Il2CppDumper
   `dump.cs` + a name map → a profile with resolved offsets), behind a non-default
   `authoring` feature so the runtime stays engine-agnostic

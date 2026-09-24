@@ -29,7 +29,12 @@ struct Scratch(PathBuf);
 
 impl Scratch {
     fn new() -> Self {
-        let dir = std::env::temp_dir().join(format!("scry-json-{}", std::process::id()));
+        // One directory per instance, not per process: tests in one binary run in
+        // parallel, and a shared directory let one test's files be overwritten, or
+        // removed by another test's drop, while it was still reading them.
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("scry-json-{}-{n}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("create scratch dir");
         Scratch(dir)
     }
@@ -53,7 +58,7 @@ fn cavia_profile_json(exe: &str, player_offset: i64) -> String {
     format!(
         r#"{{
           "label": "cavia",
-          "contractVersion": 3,
+          "contract": {{ "id": "cavia", "version": "3.1" }},
           "match": {{
             "process": "{exe}",
             "module": "{exe}",
@@ -133,7 +138,12 @@ fn stdout_is_a_stream_of_json_events() {
     );
     // Which profile won, and what shape it emits: the host can't derive either
     // on its own, so both travel with the attach. The contract is passed through
-    // verbatim from the file — 3 here precisely because nothing defaults to it.
+    // verbatim from the file — 3.1 here precisely because nothing defaults to it.
+    assert_eq!(
+        attached["contract"],
+        serde_json::json!({ "id": "cavia", "version": "3.1" })
+    );
+    // The deprecated integer still carries the major, for hosts that read only it.
     assert_eq!(attached["contract_version"], 3);
     assert!(
         attached["profile_file"]
@@ -144,6 +154,7 @@ fn stdout_is_a_stream_of_json_events() {
 
     let last = events.last().unwrap();
     assert_eq!(last["event"], "detached");
+    assert_eq!(last["reason"], "duration", "`--for` ran out: {last}");
 
     // Every event is self-describing and time-stamped past the attach line, so a
     // host never has to infer what a line is from its position in the stream.
@@ -189,4 +200,77 @@ fn values_events_carry_the_first_picture_then_only_changes() {
             "a later event must carry the watch that moved: {later}"
         );
     }
+}
+
+/// A game that closes ends the stream: scry notices the target has exited,
+/// says so with `detached` / `target_exited`, and exits 5, rather than running
+/// on and reporting every watch `null` forever. `--for` is only a safety net
+/// here, far longer than the test waits.
+#[test]
+fn a_target_that_exits_ends_the_stream() {
+    use std::io::Read;
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+
+    let (cavia, ready) = spawn_cavia();
+    let scratch = Scratch::new();
+    let profile = scratch.write(
+        "cavia.json",
+        &cavia_profile_json(&ready.exe, (ready.player - ready.base) as i64),
+    );
+    let mut scry = Command::new(env!("CARGO_BIN_EXE_scry"))
+        .args(["watch", "--pid"])
+        .arg(ready.pid.to_string())
+        .arg("--profile")
+        .arg(&profile)
+        .args([
+            "--no-resolve",
+            "--format",
+            "json",
+            "--tick",
+            "20",
+            "--for",
+            "60",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn scry watch");
+
+    std::thread::sleep(Duration::from_millis(300));
+    // Kills and reaps the cavia, so it is gone rather than a zombie.
+    drop(cavia);
+
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let status = loop {
+        if let Some(status) = scry.try_wait().expect("poll scry") {
+            break status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "scry kept running after its target exited"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let mut stdout = String::new();
+    scry.stdout
+        .take()
+        .unwrap()
+        .read_to_string(&mut stdout)
+        .expect("read stdout");
+    let mut stderr = String::new();
+    scry.stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut stderr)
+        .expect("read stderr");
+    assert_eq!(
+        status.code(),
+        Some(5),
+        "exit status for a target that exited\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    let last: serde_json::Value =
+        serde_json::from_str(stdout.lines().last().expect("some output")).expect("JSON line");
+    assert_eq!(last["event"], "detached", "{stdout}");
+    assert_eq!(last["reason"], "target_exited", "{stdout}");
 }

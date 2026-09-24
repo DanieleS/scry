@@ -26,7 +26,7 @@ use crate::error::{Error, Result};
 /// `i64`; input is where the flexibility matters, so a profile authored from a
 /// Cheat Engine session can paste `"0x58"` verbatim instead of hand-converting
 /// it to `88`. (Serialization stays canonical decimal.)
-mod hexnum {
+pub(crate) mod hexnum {
     use serde::de::{self, Deserializer};
     use serde::Deserialize;
 
@@ -44,19 +44,31 @@ mod hexnum {
         Text(String),
     }
 
-    /// Parse a signed decimal or `0x`-prefixed hex integer. Returns `None` on
-    /// anything else, which the callers turn into a serde error.
-    fn parse(text: &str) -> Option<i64> {
+    /// Parse a signed decimal or `0x`-prefixed hex integer: at most one sign,
+    /// in front, then bare digits. Returns `None` on anything else, which the
+    /// callers turn into a serde error.
+    ///
+    /// The digits are checked by hand because the standard parsers accept a
+    /// sign of their own: left to them, `"0x-5"` read as `-5` and `"--5"` as
+    /// `5`, neither of which is a number anyone meant to write.
+    pub(crate) fn parse(text: &str) -> Option<i64> {
         let s = text.trim();
-        let (sign, body) = match s.strip_prefix('-') {
-            Some(rest) => (-1i64, rest.trim_start()),
-            None => (1, s.strip_prefix('+').map(str::trim_start).unwrap_or(s)),
+        let (negative, body) = match s.as_bytes().first() {
+            Some(b'-') => (true, s[1..].trim_start()),
+            Some(b'+') => (false, s[1..].trim_start()),
+            _ => (false, s),
         };
-        let magnitude = match body.strip_prefix("0x").or_else(|| body.strip_prefix("0X")) {
-            Some(hex) => i64::from_str_radix(hex, 16).ok()?,
-            None => body.parse::<i64>().ok()?,
+        let (digits, radix) = match body.strip_prefix("0x").or_else(|| body.strip_prefix("0X")) {
+            Some(hex) => (hex, 16),
+            None => (body, 10),
         };
-        Some(sign * magnitude)
+        if digits.is_empty() || !digits.chars().all(|c| c.is_digit(radix)) {
+            return None;
+        }
+        // Parsed unsigned and negated in a wider type, so the full `i64` range
+        // (down to `-0x8000000000000000`) is reachable and nothing overflows.
+        let magnitude = i128::from(u64::from_str_radix(digits, radix).ok()?);
+        i64::try_from(if negative { -magnitude } else { magnitude }).ok()
     }
 
     fn one<E: de::Error>(repr: Repr) -> Result<i64, E> {
@@ -283,8 +295,9 @@ pub struct Rip {
 /// just a label — everything a resolver needs to *claim* a process lives here.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Match {
-    /// Coarse bucket: the executable name (e.g. `"game.exe"`). The first, cheap
-    /// filter — never sufficient on its own to claim a process.
+    /// Coarse bucket: the executable name (e.g. `"game.exe"`), compared ASCII
+    /// case-insensitively. The first, cheap filter — never sufficient on its
+    /// own to claim a process.
     pub process: String,
 
     /// The module that anchors static (Tier-1) addresses. Often the same as the
@@ -381,9 +394,11 @@ pub struct Field {
 /// what makes the tier engine-agnostic by construction: no offset, no signature
 /// and no [`StringLayout`] appears anywhere below.
 ///
-/// Deserialized `#[serde(untagged)]` and discriminated by each node's unique
-/// key, so the JSON reads as the arithmetic it denotes.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// Discriminated by each node's unique key, so the JSON reads as the arithmetic
+/// it denotes. Parsing is **strict**: a node must carry exactly one operator
+/// key and nothing its operator does not take — see the [`Deserialize`] impl.
+/// Serialized untagged, which writes exactly that shape back.
+#[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(untagged)]
 pub enum Expr {
     /// A literal number: `{"const": 6}`. Accepts the hex form every other number
@@ -472,6 +487,120 @@ pub enum Expr {
     },
 }
 
+/// Every key that names an expression node's operator, paired with the other
+/// keys that operator accepts next to it.
+const EXPR_OPERATORS: &[(&str, &[&str])] = &[
+    ("const", &[]),
+    ("watch", &["index", "field"]),
+    ("item", &[]),
+    ("add", &[]),
+    ("mul", &[]),
+    ("sub", &[]),
+    ("div", &[]),
+    ("min", &[]),
+    ("max", &[]),
+    ("sum", &[]),
+    ("count", &[]),
+];
+
+/// Parse an expression node strictly.
+///
+/// A derived untagged parse takes the first variant that fits and ignores
+/// whatever else the object holds. For an expression that is a hole, not
+/// leniency: `{"watch": "nope", "const": 1}` parsed as the constant 1, skipping
+/// the check that `nope` is declared earlier, and a typo like `{"watch": "hp",
+/// "feild": "max"}` silently read the whole of `hp`. So the node must name
+/// exactly one operator and carry only the keys that operator takes, and the
+/// operator then picks the variant directly — which also lets an error inside
+/// a fold or an operand say what was wrong instead of "matched no variant".
+impl<'de> Deserialize<'de> for Expr {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        use serde::de::Error as _;
+        let node = serde_json::Value::deserialize(d)?;
+        let serde_json::Value::Object(mut object) = node else {
+            return Err(D::Error::custom("an expression node must be a JSON object"));
+        };
+        let operators: Vec<&(&str, &[&str])> = EXPR_OPERATORS
+            .iter()
+            .filter(|(key, _)| object.contains_key(*key))
+            .collect();
+        let (operator, extra) = match operators.as_slice() {
+            [one] => **one,
+            [] => {
+                let names: Vec<&str> = EXPR_OPERATORS.iter().map(|(k, _)| *k).collect();
+                return Err(D::Error::custom(format!(
+                    "an expression node needs one of the keys {}",
+                    names.join(", ")
+                )));
+            }
+            many => {
+                let names: Vec<&str> = many.iter().map(|(k, _)| *k).collect();
+                return Err(D::Error::custom(format!(
+                    "an expression node names more than one operator ({}); nest them instead",
+                    names.join(", ")
+                )));
+            }
+        };
+        if let Some(unknown) = object
+            .keys()
+            .find(|k| k.as_str() != operator && !extra.contains(&k.as_str()))
+        {
+            return Err(D::Error::custom(format!(
+                "unknown key {unknown:?} in a `{operator}` expression node"
+            )));
+        }
+
+        // Each operand is parsed with its own type's rules; an error is
+        // prefixed with the operator so a nested mistake can be found.
+        let mut take = |key: &str| object.remove(key).unwrap_or(serde_json::Value::Null);
+        fn parse<T, E: serde::de::Error>(
+            operator: &str,
+            f: impl FnOnce() -> std::result::Result<T, serde_json::Error>,
+        ) -> std::result::Result<T, E> {
+            f().map_err(|e| E::custom(format!("in `{operator}`: {e}")))
+        }
+        use serde_json::from_value;
+        Ok(match operator {
+            "const" => Expr::Const {
+                value: parse(operator, || hexnum::de_f64(take("const")))?,
+            },
+            "watch" => Expr::Ref {
+                watch: parse(operator, || from_value(take("watch")))?,
+                index: parse(operator, || hexnum::de_opt_i64(take("index")))?,
+                field: parse(operator, || from_value(take("field")))?,
+            },
+            "item" => Expr::Item {
+                item: parse(operator, || from_value(take("item")))?,
+            },
+            "add" => Expr::Add {
+                add: parse(operator, || from_value(take("add")))?,
+            },
+            "mul" => Expr::Mul {
+                mul: parse(operator, || from_value(take("mul")))?,
+            },
+            "sub" => Expr::Sub {
+                sub: parse(operator, || from_value(take("sub")))?,
+            },
+            "div" => Expr::Div {
+                div: parse(operator, || from_value(take("div")))?,
+            },
+            "min" => Expr::Min {
+                min: parse(operator, || from_value(take("min")))?,
+            },
+            "max" => Expr::Max {
+                max: parse(operator, || from_value(take("max")))?,
+            },
+            "sum" => Expr::Sum {
+                sum: parse(operator, || from_value(take("sum")))?,
+            },
+            "count" => Expr::Count {
+                count: parse(operator, || from_value(take("count")))?,
+            },
+            _ => unreachable!("every key in EXPR_OPERATORS has an arm"),
+        })
+    }
+}
+
 /// The two shapes `min`/`max` accept, discriminated by JSON type.
 ///
 /// Both are common and the two JSON types can never collide, so one key carries
@@ -479,7 +608,10 @@ pub enum Expr {
 /// remember: an **array** is n-ary over operands
 /// (`{"max": [{"const": 0}, {"watch": "hp"}]}` clamps at zero), an **object** is
 /// a fold over a list (`{"max": {"watch": "enemies", "field": "hp"}}`).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+///
+/// Parsed by JSON type rather than by trying each variant, so an error inside
+/// either form reports itself instead of "matched no variant".
+#[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(untagged)]
 pub enum Extremum {
     /// The n-ary form: the extremum of these operands. At least one.
@@ -490,13 +622,34 @@ pub enum Extremum {
     Fold(Fold),
 }
 
+impl<'de> Deserialize<'de> for Extremum {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        use serde::de::Error as _;
+        let value = serde_json::Value::deserialize(d)?;
+        match value {
+            serde_json::Value::Array(_) => serde_json::from_value(value).map(Extremum::Nary),
+            serde_json::Value::Object(_) => serde_json::from_value(value).map(Extremum::Fold),
+            _ => {
+                return Err(D::Error::custom(
+                    "`min`/`max` takes an array of operands or a fold object",
+                ))
+            }
+        }
+        .map_err(D::Error::custom)
+    }
+}
+
 /// A fold over a list-valued watch: which list, which field of each element,
 /// how many elements, and which of them count.
 ///
 /// [`field`](Fold::field), [`take`](Fold::take) and [`clauses`](Fold::clauses)
 /// are each optional; `field` is required when the elements are records and
 /// omitted when they are scalars.
+///
+/// Unknown keys are rejected: a misspelt `where` or `field` would otherwise be
+/// dropped, and the fold would quietly run over everything.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Fold {
     /// Name of the list-valued watch to fold, declared **earlier in the array**
     /// exactly like any other [`Ref`](Expr::Ref).
@@ -527,7 +680,10 @@ pub struct Fold {
 /// Deliberately flat — no nesting, no boolean algebra, no `or`. A profile that
 /// genuinely needs `or` is a signal to reconsider the profile, not to grow the
 /// language.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+///
+/// Parsed strictly (see the [`Deserialize`] impl): exactly one comparison, and
+/// no key a clause does not take.
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Clause {
     /// Field of the element to test.
     pub field: String,
@@ -535,6 +691,53 @@ pub struct Clause {
     /// rather than nesting an operator object.
     #[serde(flatten)]
     pub test: Compare,
+}
+
+/// The wire shape of a [`Clause`], with every comparison optional so the parse
+/// can say how many were given. A flattened enum cannot be combined with
+/// `deny_unknown_fields`, which is why the clause is not derived directly.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ClauseRepr {
+    field: String,
+    eq: Option<Literal>,
+    ne: Option<Literal>,
+    lt: Option<Literal>,
+    le: Option<Literal>,
+    gt: Option<Literal>,
+    ge: Option<Literal>,
+}
+
+/// Parse a clause strictly: a typo'd comparison key must fail rather than be
+/// dropped, and `{"field": "hp", "gt": 0, "lt": 9}` must not quietly test only
+/// one of the two bounds.
+impl<'de> Deserialize<'de> for Clause {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        use serde::de::Error as _;
+        let repr = ClauseRepr::deserialize(d)?;
+        let tests: Vec<Compare> = [
+            repr.eq.map(Compare::Eq),
+            repr.ne.map(Compare::Ne),
+            repr.lt.map(Compare::Lt),
+            repr.le.map(Compare::Le),
+            repr.gt.map(Compare::Gt),
+            repr.ge.map(Compare::Ge),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        match <[Compare; 1]>::try_from(tests) {
+            Ok([test]) => Ok(Clause {
+                field: repr.field,
+                test,
+            }),
+            Err(tests) => Err(D::Error::custom(format!(
+                "a `where` clause on {:?} needs exactly one of eq, ne, lt, le, gt, ge; got {}",
+                repr.field,
+                tests.len()
+            ))),
+        }
+    }
 }
 
 /// The comparison a [`Clause`] applies, named by its JSON key.
@@ -704,7 +907,8 @@ pub enum Watch {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         fields: Option<BTreeMap<String, Field>>,
         /// Hard cap on the element count — a garbage count can neither allocate
-        /// nor loop unboundedly.
+        /// nor loop unboundedly. Itself capped at [`MAX_COLLECTION_LEN`] when
+        /// the profile is validated, since a cap of `u64::MAX` caps nothing.
         max: usize,
         /// Per-watch sample rate in hertz; see [`Watch::Tier1::rate_hz`].
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -787,6 +991,109 @@ pub enum Watch {
     },
 }
 
+/// Which **contract** a profile implements: the shape of the values it emits,
+/// named by an [`id`](Contract::id) and a [`version`](Contract::version).
+///
+/// A contract is not a profile. Many profiles implement one contract — one per
+/// build, one per storefront — and a new profile for a new build normally keeps
+/// it, so nothing that renders the values has to change when a game patches.
+/// Carrying the id alongside the version is what lets a consumer find the right
+/// renderer without keying on the [`label`](Profile::label), which stays purely
+/// descriptive: renaming a profile must never unbind the thing that draws it.
+///
+/// The engine never reads either half. See [`Profile::contract`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Contract {
+    /// Stable identifier of the contract, a lowercase slug (`"sea-of-stars"`).
+    /// Restricted to `[a-z0-9]` and single inner dashes because it ends up in
+    /// file names, URLs and cache keys on every consumer, and each of those has
+    /// its own ideas about what else is safe.
+    pub id: String,
+    /// Semver-style `major.minor` of the contract. A minor adds; a major is
+    /// anything else. See [`ContractVersion`].
+    pub version: ContractVersion,
+}
+
+/// A contract's `major.minor`, written as a string (`"2.1"`) on the wire.
+///
+/// Only two components, on purpose. A contract describes a shape, and a shape
+/// either gained something (minor) or changed in a way a reader has to know
+/// about (major); there is no "patch" to a shape that leaves every reader
+/// exactly where it was. A string rather than a JSON number because `2.10` and
+/// `2.1` are different versions, and a float cannot tell them apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ContractVersion {
+    /// Bumped by any change a reader of the previous version could trip over: a
+    /// rename, a retype, a removal, or a value whose meaning changes.
+    pub major: u32,
+    /// Bumped by additions only: new watches, new fields inside records.
+    pub minor: u32,
+}
+
+impl ContractVersion {
+    /// Parse `"<major>.<minor>"`. Both parts are plain decimal digits: no sign,
+    /// no whitespace and no third component, so a version reads the same to
+    /// every tool that has to compare it.
+    pub fn parse(text: &str) -> Option<Self> {
+        let (major, minor) = text.split_once('.')?;
+        let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+        if !digits(major) || !digits(minor) {
+            return None;
+        }
+        Some(ContractVersion {
+            major: major.parse().ok()?,
+            minor: minor.parse().ok()?,
+        })
+    }
+}
+
+impl std::fmt::Display for ContractVersion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}.{}", self.major, self.minor)
+    }
+}
+
+impl Serialize for ContractVersion {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        s.collect_str(self)
+    }
+}
+
+impl<'de> Deserialize<'de> for ContractVersion {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        let text = String::deserialize(d)?;
+        ContractVersion::parse(&text).ok_or_else(|| {
+            serde::de::Error::custom(format!(
+                "contract version must be \"<major>.<minor>\", got {text:?}"
+            ))
+        })
+    }
+}
+
+/// Whether `id` is a contract slug: lowercase ASCII letters and digits in
+/// dash-separated runs, with no leading, trailing or doubled dash.
+fn is_slug(id: &str) -> bool {
+    !id.is_empty()
+        && id.split('-').all(|run| {
+            !run.is_empty()
+                && run
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+        })
+}
+
+/// The contract a profile declares, after reconciling [`Profile::contract`]
+/// with the deprecated [`Profile::contract_version`]. See
+/// [`Profile::declared_contract`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeclaredContract<'a> {
+    /// The contract id, or `None` when only the deprecated integer was given —
+    /// which names a version of *some* shape but not which one.
+    pub id: Option<&'a str>,
+    /// The contract version. From the deprecated integer `n` this is `n.0`.
+    pub version: ContractVersion,
+}
+
 /// A complete per-game profile: identity plus the values to read.
 ///
 /// Not `Eq` because a [`Watch`] carries a float `rate_hz`; `PartialEq` is all
@@ -798,7 +1105,7 @@ pub struct Profile {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
 
-    /// The **contract**: an opaque version for the *shape* of what this profile
+    /// The **contract** this profile implements: which shape of values it
     /// emits — the set of watch names and their types — as opposed to
     /// [`Match::version`], which pins the game build the offsets were authored
     /// against. The two are orthogonal, and deliberately so: offsets move every
@@ -811,6 +1118,20 @@ pub struct Profile {
     /// not by the caller, so which contract came out is news only the engine can
     /// report. Carried through untouched, never acted on — reading it would be
     /// the engine forming an opinion about what a value *means*.
+    ///
+    /// Optional: a profile with no contract is still a valid profile for
+    /// ad-hoc use at a terminal. It just has nothing a renderer could key on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contract: Option<Contract>,
+
+    /// **Deprecated** — write [`contract`](Profile::contract) instead.
+    ///
+    /// The integer that versioned the contract before contracts had an id.
+    /// Still accepted so profiles written against 0.1.0-alpha.2 and alpha.3 keep
+    /// loading, and read as `{"version": "<n>.0"}` with no id. Setting it next
+    /// to `contract` is allowed only when the two agree on the major (the only
+    /// thing the integer ever carried); anything else is rejected rather than
+    /// guessed at, because a host would otherwise be told two different shapes.
     #[serde(
         rename = "contractVersion",
         default,
@@ -854,7 +1175,13 @@ impl Profile {
     ///   **earlier in the array**, must not declare a string `type`, may use
     ///   [`Item`](Expr::Item) only under an `each` naming an earlier collection,
     ///   and must give each operator the arity it takes.
+    /// - A collection's `max` is at most [`MAX_COLLECTION_LEN`].
+    /// - No two watches share a `name`, across every tier.
+    /// - A `rate_hz`, when given, lies within [`MIN_RATE_HZ`]..=[`MAX_RATE_HZ`].
+    /// - A declared [`contract`](Profile::contract) has a slug id, and agrees
+    ///   with the deprecated `contractVersion` when both are given.
     pub fn validate(&self) -> Result<()> {
+        self.check_contract()?;
         // The watches declared *before* the one being checked, grown as the loop
         // walks the array — because that ordering *is* the cycle-prevention story
         // for derived watches. A reference can only point upwards, so there is no
@@ -862,7 +1189,25 @@ impl Profile {
         // evaluation order falls out of declaration order.
         let mut earlier: Vec<&Watch> = Vec::with_capacity(self.watches.len());
         for w in &self.watches {
+            // A name is the key a value is emitted under, and the key a derived
+            // watch reads it back by. Two watches sharing one would overwrite
+            // each other in the snapshot every tick, so the diff would never
+            // settle, and a derived watch would read whichever ran last.
+            let name = watch_name(w);
+            check_rate(name, watch_rate(w))?;
+            if declared_earlier(&earlier, name) {
+                return Err(Error::BadProfile(format!(
+                    "watch {name:?} is declared more than once; every watch needs its own name, \
+                     whatever its tier"
+                )));
+            }
             match w {
+                Watch::Collection { max, .. } if *max > MAX_COLLECTION_LEN => {
+                    return Err(Error::BadProfile(format!(
+                        "collection {name:?}: `max` {max} is above the ceiling of \
+                         {MAX_COLLECTION_LEN}; a count that large is garbage memory, not a list"
+                    )));
+                }
                 Watch::Collection {
                     name, ty, fields, ..
                 } => match (ty, fields) {
@@ -905,9 +1250,104 @@ impl Profile {
         Ok(())
     }
 
+    /// The contract this profile declares, reconciling the current
+    /// [`contract`](Profile::contract) object with the deprecated integer
+    /// [`contract_version`](Profile::contract_version). `None` when it declares
+    /// neither.
+    ///
+    /// Assumes a [validated](Profile::validate) profile, where the two cannot
+    /// disagree; given both, the object wins because it is the richer of the two.
+    pub fn declared_contract(&self) -> Option<DeclaredContract<'_>> {
+        match (&self.contract, self.contract_version) {
+            (Some(c), _) => Some(DeclaredContract {
+                id: Some(&c.id),
+                version: c.version,
+            }),
+            (None, Some(n)) => Some(DeclaredContract {
+                id: None,
+                version: ContractVersion { major: n, minor: 0 },
+            }),
+            (None, None) => None,
+        }
+    }
+
+    /// The contract half of [`validate`](Profile::validate).
+    fn check_contract(&self) -> Result<()> {
+        if let Some(c) = &self.contract {
+            if !is_slug(&c.id) {
+                return Err(Error::BadProfile(format!(
+                    "contract id {:?} is not a slug: use lowercase letters, digits and single \
+                     dashes, e.g. \"sea-of-stars\"",
+                    c.id
+                )));
+            }
+            if let Some(n) = self.contract_version {
+                if n != c.version.major {
+                    return Err(Error::BadProfile(format!(
+                        "`contractVersion` {n} disagrees with `contract.version` {}; drop the \
+                         deprecated `contractVersion`",
+                        c.version
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Serialize this profile to a pretty-printed JSON document.
     pub fn to_json(&self) -> Result<String> {
         serde_json::to_string_pretty(self).map_err(|e| Error::BadProfile(e.to_string()))
+    }
+}
+
+/// The largest `max` a [collection](Watch::Collection) may declare.
+///
+/// `max` exists so that a garbage count read out of a game mid-transition can
+/// neither allocate nor loop without bound, and that only holds if `max` is
+/// itself bounded: `18446744073709551615` would have been accepted, and then a
+/// garbage count meant millions of reads a tick. 4096 is far above any party,
+/// enemy list or inventory page seen in practice. It also keeps one `values`
+/// line within reach of a host's line limit, since the first line carries every
+/// element of every collection at once.
+pub const MAX_COLLECTION_LEN: usize = 4096;
+
+/// The slowest `rate_hz` a watch may ask for: one sample every 100 seconds.
+///
+/// Anything slower is indistinguishable from "read once" for a telemetry
+/// stream, and the bound is what keeps `1 / rate_hz` a period a [`Duration`]
+/// can hold: a rate like `1e-300` passed the old "is it positive" test and then
+/// overflowed the conversion, taking the whole process down.
+///
+/// [`Duration`]: std::time::Duration
+pub const MIN_RATE_HZ: f64 = 0.01;
+
+/// The fastest `rate_hz` a watch may ask for. The loop never samples faster than
+/// its own base tick anyway, so a higher rate could only ever be a typo.
+pub const MAX_RATE_HZ: f64 = 1000.0;
+
+/// A watch's `rate_hz`, whichever kind it is.
+fn watch_rate(w: &Watch) -> Option<f64> {
+    match w {
+        Watch::Tier1 { rate_hz, .. }
+        | Watch::Tier2 { rate_hz, .. }
+        | Watch::Collection { rate_hz, .. }
+        | Watch::Record { rate_hz, .. }
+        | Watch::Derived { rate_hz, .. } => *rate_hz,
+    }
+}
+
+/// A rate is either absent (every base tick) or a finite number of hertz inside
+/// the documented range. Zero and negative rates are rejected rather than read
+/// as "every tick", because that is what leaving the field out already says, and
+/// a profile should not have two spellings of one thing, one of them a typo.
+fn check_rate(name: &str, rate_hz: Option<f64>) -> Result<()> {
+    match rate_hz {
+        None => Ok(()),
+        Some(hz) if (MIN_RATE_HZ..=MAX_RATE_HZ).contains(&hz) => Ok(()),
+        Some(hz) => Err(Error::BadProfile(format!(
+            "watch {name:?}: `rate_hz` {hz} is outside {MIN_RATE_HZ}..={MAX_RATE_HZ}; omit it to \
+             sample every base tick"
+        ))),
     }
 }
 
@@ -1079,6 +1519,7 @@ mod tests {
     fn sample() -> Profile {
         Profile {
             label: Some("Example Game (Steam)".to_string()),
+            contract: None,
             contract_version: None,
             match_: Match {
                 process: "game.exe".to_string(),
@@ -1243,6 +1684,141 @@ mod tests {
     }
 
     #[test]
+    fn contract_is_an_id_and_a_major_minor_version() {
+        let json = r#"
+        {
+          "label": "Example (Steam 1.3)",
+          "contract": { "id": "sea-of-stars", "version": "2.10" },
+          "match": { "process": "g.exe", "module": "g.exe", "probe": "90 90" },
+          "watches": []
+        }
+        "#;
+        let p = Profile::from_json(json).expect("parse");
+        let c = p.contract.as_ref().expect("contract");
+        assert_eq!(c.id, "sea-of-stars");
+        // `2.10` is not `2.1`: the reason the version is a string, not a float.
+        assert_eq!(
+            c.version,
+            ContractVersion {
+                major: 2,
+                minor: 10
+            }
+        );
+        assert_eq!(
+            p.declared_contract(),
+            Some(DeclaredContract {
+                id: Some("sea-of-stars"),
+                version: ContractVersion {
+                    major: 2,
+                    minor: 10
+                },
+            })
+        );
+
+        // It round-trips in the same written form, and the deprecated integer
+        // does not appear out of nowhere.
+        let out = p.to_json().expect("serialize");
+        assert!(out.contains(r#""version": "2.10""#), "{out}");
+        assert!(!out.contains("contractVersion"));
+        assert_eq!(Profile::from_json(&out).expect("re-parse"), p);
+    }
+
+    #[test]
+    fn contract_version_must_be_major_dot_minor() {
+        for bad in [
+            "2", "2.1.0", "v2.1", "2.x", "-2.1", " 2.1", "2.", ".1", "2.1 ",
+        ] {
+            assert_eq!(ContractVersion::parse(bad), None, "{bad:?} must not parse");
+            let json = format!(
+                r#"{{ "contract": {{ "id": "x", "version": "{bad}" }},
+                     "match": {{ "process": "g.exe", "module": "g.exe", "probe": "90" }},
+                     "watches": [] }}"#
+            );
+            assert!(
+                Profile::from_json(&json).is_err(),
+                "{bad:?} must be rejected"
+            );
+        }
+        // A number is not accepted either, however natural `2.1` looks.
+        let numeric = r#"{ "contract": { "id": "x", "version": 2.1 },
+            "match": { "process": "g.exe", "module": "g.exe", "probe": "90" },
+            "watches": [] }"#;
+        assert!(Profile::from_json(numeric).is_err());
+        assert_eq!(
+            ContractVersion::parse("0.0"),
+            Some(ContractVersion { major: 0, minor: 0 })
+        );
+    }
+
+    #[test]
+    fn contract_id_must_be_a_slug() {
+        for bad in [
+            "",
+            "Sea-of-Stars",
+            "sea of stars",
+            "sea_of_stars",
+            "-sea",
+            "sea-",
+            "sea--of",
+        ] {
+            let json = format!(
+                r#"{{ "contract": {{ "id": "{bad}", "version": "1.0" }},
+                     "match": {{ "process": "g.exe", "module": "g.exe", "probe": "90" }},
+                     "watches": [] }}"#
+            );
+            let err = Profile::from_json(&json).expect_err(bad).to_string();
+            assert!(err.contains("slug"), "{bad:?}: {err}");
+        }
+        for good in ["a", "sea-of-stars", "ff7-remake", "2064"] {
+            let json = format!(
+                r#"{{ "contract": {{ "id": "{good}", "version": "1.0" }},
+                     "match": {{ "process": "g.exe", "module": "g.exe", "probe": "90" }},
+                     "watches": [] }}"#
+            );
+            Profile::from_json(&json).expect(good);
+        }
+    }
+
+    #[test]
+    fn deprecated_contract_version_reads_as_major_dot_zero_with_no_id() {
+        let json = r#"
+        { "contractVersion": 2,
+          "match": { "process": "g.exe", "module": "g.exe", "probe": "90" },
+          "watches": [] }
+        "#;
+        let p = Profile::from_json(json).expect("parse");
+        assert_eq!(p.contract, None);
+        assert_eq!(
+            p.declared_contract(),
+            Some(DeclaredContract {
+                id: None,
+                version: ContractVersion { major: 2, minor: 0 },
+            })
+        );
+    }
+
+    #[test]
+    fn both_contract_forms_must_agree_on_the_major() {
+        let with = |legacy: u32, version: &str| {
+            format!(
+                r#"{{ "contractVersion": {legacy},
+                     "contract": {{ "id": "x", "version": "{version}" }},
+                     "match": {{ "process": "g.exe", "module": "g.exe", "probe": "90" }},
+                     "watches": [] }}"#
+            )
+        };
+        // The integer only ever carried the major, so it agrees with any minor
+        // of it — which is what a profile migrating from one form to the other
+        // naturally writes.
+        let p = Profile::from_json(&with(2, "2.0")).expect("same major");
+        assert_eq!(p.declared_contract().unwrap().id, Some("x"));
+        Profile::from_json(&with(2, "2.3")).expect("same major, later minor");
+
+        let err = Profile::from_json(&with(3, "2.0")).expect_err("different major");
+        assert!(err.to_string().contains("disagrees"), "{err}");
+    }
+
+    #[test]
     fn offsets_accept_hex_or_decimal_interchangeably() {
         // The shape a profile pasted straight out of a disassembler takes: hex
         // strings for the numbers that were hex on screen, plain numbers where
@@ -1270,6 +1846,22 @@ mod tests {
             }
             other => panic!("expected tier2, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn an_offset_has_at_most_one_sign_and_it_comes_first() {
+        use super::hexnum::parse;
+        assert_eq!(parse("0x10"), Some(16));
+        assert_eq!(parse("-0x10"), Some(-16));
+        assert_eq!(parse("+16"), Some(16));
+        assert_eq!(parse(" - 16 "), Some(-16));
+        assert_eq!(parse("-0x8000000000000000"), Some(i64::MIN));
+        for bad in [
+            "0x-5", "0x+5", "--5", "+-5", "-+5", "0x", "-", "", "5-", "0x1g", "1_000",
+        ] {
+            assert_eq!(parse(bad), None, "{bad:?} must not parse");
+        }
+        assert_eq!(parse("0x8000000000000000"), None, "out of range");
     }
 
     #[test]
@@ -1818,6 +2410,130 @@ mod tests {
             err.contains("type"),
             "…and say the output type is the problem: {err}"
         );
+    }
+
+    /// The two holes a lenient untagged parse left open: a second operator key
+    /// silently winning over the first, and a misspelt key silently dropped.
+    #[test]
+    fn expressions_parse_strictly() {
+        let hp =
+            r#"{ "tier": "tier1", "name": "hp", "module": "g", "offsets": [0], "type": "i32" }"#;
+        let with_value = |value: &str| {
+            derived_profile(&format!(
+                r#"{hp}, {{ "tier": "derived", "name": "d", "type": "i32", "value": {value} }}"#
+            ))
+        };
+
+        // Once parsed as `const 1`, skipping the check that `nope` exists.
+        let err = with_value(r#"{ "watch": "nope", "const": 1 }"#)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("more than one operator"), "{err}");
+
+        // Once parsed as the whole of `hp`, the misspelt `field` dropped.
+        let err = with_value(r#"{ "watch": "hp", "feild": "max" }"#)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("unknown key \"feild\""), "{err}");
+
+        let err = with_value(r#"{ "nothing": 1 }"#).unwrap_err().to_string();
+        assert!(err.contains("needs one of the keys"), "{err}");
+
+        // A fold and a clause are strict too.
+        let err = with_value(r#"{ "sum": { "watch": "hp", "wehre": [] } }"#)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("wehre"), "{err}");
+        let err = with_value(
+            r#"{ "count": { "watch": "hp", "where": [{ "field": "x", "gt": 0, "lt": 9 }] } }"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("exactly one of eq"), "{err}");
+        let err =
+            with_value(r#"{ "count": { "watch": "hp", "where": [{ "field": "x", "eqq": 0 }] } }"#)
+                .unwrap_err()
+                .to_string();
+        assert!(err.contains("eqq"), "{err}");
+
+        // And the legitimate shapes still parse.
+        assert!(with_value(r#"{ "watch": "hp", "index": 0, "field": "x" }"#).is_ok());
+        assert!(with_value(
+            r#"{ "count": { "watch": "hp", "where": [{ "field": "x", "ge": 1 }] } }"#
+        )
+        .is_ok());
+        assert!(with_value(r#"{ "max": [{ "const": "0x10" }, { "watch": "hp" }] }"#).is_ok());
+
+        // An error inside `min`/`max` reports itself in either form.
+        let err = with_value(r#"{ "max": { "watch": "hp", "fied": "x" } }"#)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("fied"), "{err}");
+    }
+
+    #[test]
+    fn collection_max_is_capped() {
+        let with_max = |max: &str| {
+            derived_profile(&format!(
+                r#"{{ "tier": "collection", "name": "party",
+                      "base": {{ "tier": "tier1", "module": "g", "offsets": [0] }},
+                      "count": [0], "stride": 8, "type": "i32", "max": {max} }}"#
+            ))
+        };
+        assert!(with_max("4096").is_ok());
+        // 4294967295 is the largest `max` a 32-bit reader can even parse, so it
+        // reaches the ceiling check on every target.
+        for bad in ["4097", "4294967295"] {
+            let err = with_max(bad).unwrap_err().to_string();
+            assert!(
+                err.contains("above the ceiling of 4096"),
+                "max {bad}: {err}"
+            );
+        }
+        // Wider than usize on a 32-bit reader, where it fails to parse at all
+        // instead of reaching the ceiling check. Rejected either way.
+        assert!(with_max("18446744073709551615").is_err());
+    }
+
+    #[test]
+    fn rate_hz_must_lie_in_the_documented_range() {
+        let with_rate = |rate: &str| {
+            derived_profile(&format!(
+                r#"{{ "tier": "tier1", "name": "hp", "module": "g.exe", "offsets": [0],
+                      "type": "i32", "rate_hz": {rate} }}"#
+            ))
+        };
+        for ok in ["0.01", "1", "20.5", "1000"] {
+            assert!(with_rate(ok).is_ok(), "rate {ok} should be accepted");
+        }
+        // 1e-300 once passed validation and then overflowed `1 / rate` into a
+        // panic; zero and negatives are what omitting the field already says.
+        for bad in ["1e-300", "0.001", "0", "-5", "1000.5", "1e300"] {
+            let err = with_rate(bad).unwrap_err().to_string();
+            assert!(err.contains("`rate_hz`"), "rate {bad}: {err}");
+        }
+    }
+
+    #[test]
+    fn rejects_two_watches_with_one_name_whatever_their_tier() {
+        // Two memory watches.
+        let err = derived_profile(
+            r#"{ "tier": "tier1", "name": "hp", "module": "g.exe", "offsets": [0], "type": "i32" },
+               { "tier": "tier1", "name": "hp", "module": "g.exe", "offsets": [4], "type": "i32" }"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("\"hp\" is declared more than once"), "{err}");
+
+        // A derived watch reusing a memory watch's name is just as ambiguous:
+        // a later reference could not say which one it meant.
+        let err = derived_profile(
+            r#"{ "tier": "tier1", "name": "hp", "module": "g.exe", "offsets": [0], "type": "i32" },
+               { "tier": "derived", "name": "hp", "type": "i32", "value": { "const": 1 } }"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("declared more than once"), "{err}");
     }
 
     #[test]

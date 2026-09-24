@@ -18,18 +18,124 @@
 //! and the two platform lookups (find a pid by name, name a pid) are hand-rolled
 //! against the same OS surface the backends already use.
 
-// Everything here needs a memory backend for the host OS. On a platform that has
-// none (e.g. macOS) the binary still builds, but every command is a no-op that
-// says so, rather than failing to compile.
-#[cfg(any(target_os = "linux", target_os = "windows"))]
+// `schema` reads a file and writes a file, and needs no process to read, so it
+// works on every platform — including the macOS or CI box a profile repository
+// is checked on. It is dispatched before anything that needs a backend.
 fn main() {
-    std::process::exit(imp::main());
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().map(String::as_str) == Some("schema") {
+        std::process::exit(schema_cmd::run(&args[1..]));
+    }
+    std::process::exit(platform_main());
+}
+
+// Everything else needs a memory backend for the host OS. On a platform that has
+// none (e.g. macOS) the binary still builds, but every other command is a no-op
+// that says so, rather than failing to compile.
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+fn platform_main() -> i32 {
+    imp::main()
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "windows")))]
-fn main() {
-    eprintln!("scry: no memory backend is built for this platform (Windows and Linux only)");
-    std::process::exit(1);
+fn platform_main() -> i32 {
+    eprintln!(
+        "scry: no memory backend is built for this platform (Windows and Linux only); \
+         only `scry schema` works here"
+    );
+    1
+}
+
+/// Parse a `--for` value: a finite, non-negative number of seconds that a
+/// `Duration` can hold. The error completes the sentence "--for …".
+///
+/// Outside the platform module so its tests run on every platform, the Mac a
+/// profile repository is checked on included.
+#[cfg_attr(not(any(target_os = "linux", target_os = "windows")), allow(dead_code))]
+fn parse_seconds(text: &str) -> Result<std::time::Duration, String> {
+    let secs: f64 = text
+        .parse()
+        .map_err(|_| format!("needs a number of seconds, got '{text}'"))?;
+    if !secs.is_finite() || secs < 0.0 {
+        return Err(format!(
+            "needs a non-negative number of seconds, got '{text}'"
+        ));
+    }
+    std::time::Duration::try_from_secs_f64(secs).map_err(|_| format!("is too large: '{text}'"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_seconds;
+    use std::time::Duration;
+
+    #[test]
+    fn for_accepts_a_non_negative_number_of_seconds() {
+        assert_eq!(parse_seconds("10"), Ok(Duration::from_secs(10)));
+        assert_eq!(parse_seconds("0.5"), Ok(Duration::from_millis(500)));
+        assert_eq!(parse_seconds("0"), Ok(Duration::ZERO));
+    }
+
+    /// Each of these once meant "run forever" (unparseable) or a panic
+    /// (negative, or too large for a `Duration`).
+    #[test]
+    fn for_refuses_what_it_cannot_honour() {
+        for bad in ["ten", "", "-1", "NaN", "inf", "1e30"] {
+            assert!(parse_seconds(bad).is_err(), "{bad:?} must be refused");
+        }
+    }
+}
+
+/// `scry schema <profile.json>`: print the JSON Schema of the `values` object
+/// the profile produces. See [`scry::schema`].
+mod schema_cmd {
+    const USAGE: &str = "\
+scry schema — print the JSON Schema of the values a profile produces.
+
+USAGE:
+    scry schema <profile.json>
+
+The schema (draft 2020-12) describes the `values` object of the JSON stream:
+one property per watch, typed from the watch's value type, every one nullable.
+When the profile declares a `contract`, its id and version name the schema.
+Output is deterministic, so it can be committed and diffed. Works on every
+platform: it reads the profile file and nothing else.
+";
+
+    pub fn run(args: &[String]) -> i32 {
+        let path = match args {
+            [flag] if flag == "-h" || flag == "--help" => {
+                print!("{USAGE}");
+                return 0;
+            }
+            [path] => path,
+            _ => {
+                eprintln!("scry: schema takes exactly one profile path\n");
+                eprint!("{USAGE}");
+                return 1;
+            }
+        };
+        let text = match std::fs::read_to_string(path) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("scry: {path}: {e}");
+                return 1;
+            }
+        };
+        match scry::Profile::from_json(&text) {
+            Ok(profile) => {
+                print!(
+                    "{}",
+                    scry::schema::to_pretty(&scry::schema::values_schema(&profile))
+                );
+                0
+            }
+            Err(e) => {
+                eprintln!("scry: {path}: {e}");
+                1
+            }
+        }
+    }
 }
 
 #[cfg(any(target_os = "linux", target_os = "windows"))]
@@ -49,11 +155,21 @@ USAGE:
 COMMANDS:
     watch       Attach to a game and stream its values as they change.
     scan        Find an AOB signature in a running process (profile authoring).
+    schema      Print the JSON Schema of the values a profile produces.
     selftest    Prove the engine end-to-end against a bundled test process.
     help        Show this message.
     version     Print the version.
 
 Run `scry <command> --help` for command-specific options.
+
+EXIT STATUS:
+    0    success
+    1    usage error, unreadable profile, target cannot be opened, other error
+    2    no running process has the --process name
+    3    no profile fits the target (the fail-safe)
+    4    scan: signature not found
+    5    watch: the target process exited
+    101  crash (a bug; please report it)
 ";
 
     const WATCH_USAGE: &str = "\
@@ -75,12 +191,18 @@ PROFILES (at least one source):
     target's memory — so you can point it at a whole folder of community profiles
     and let the memory decide. If none fits, nothing is read (the fail-safe).
 
+    If several fit, a warning on stderr names them all, and the winner is the
+    one whose `match.version` the target confirmed, otherwise the first in load
+    order: --profile files in the order given, then --profiles files sorted by
+    file name.
+
 OPTIONS:
     --format <fmt>      `human` (default) for a readable stream, or `json` for
                         JSON Lines — one self-describing event object per line,
                         for a host program that consumes this as a subprocess.
     --once              Print one snapshot of all values, then exit.
-    --for <secs>        Stop after this many seconds (default: run until killed).
+    --for <secs>        Stop after this many seconds (default: run until killed
+                        or until the target exits).
     --tick <ms>         Base polling cadence in milliseconds (default: 50).
     --no-resolve        Skip the probe test and attach the single given profile
                         directly (only valid with exactly one profile).
@@ -92,19 +214,42 @@ JSON OUTPUT:
 
         {\"event\":\"attached\",\"pid\":1234,\"process\":\"game.exe\", ... }
         {\"event\":\"values\",\"t_ms\":123,\"values\":{\"hp\":42}}
-        {\"event\":\"detached\",\"t_ms\":9000}
+        {\"event\":\"detached\",\"t_ms\":9000,\"reason\":\"duration\"}
 
     The `attached` event names *which* profile won the probe test — the choice
     was made by the target's memory, not by the caller, so it is the one thing a
-    host cannot know on its own. `profile` is the label, `profile_file` the file
-    it was read from, and `contract_version` the profile's `contractVersion`
-    (`null` when it declares none): the shape of the values that follow, which is
-    what a renderer downstream needs in order to know how to read them.
+    host cannot know on its own. `profile` is the label (descriptive only),
+    `profile_file` the file it was read from, and `contract` the contract the
+    profile implements, as {\"id\":\"sea-of-stars\",\"version\":\"2.1\"} (`null`
+    when it declares none): the shape of the values that follow, which is what a
+    renderer downstream needs in order to know how to read them.
+    `contract_version` is the same version's major as an integer, kept for hosts
+    that predate `contract`; it is deprecated and will be removed.
+
+    `detached` closes the stream, with a `reason`: `once` or `duration` when
+    the watch ran out as asked, `target_exited` when the game went away.
 
     `values` carries only what *changed* this tick (the first one carries
     everything readable). Readings are untagged — a number is a number, a list an
     array, a record an object, and an unreadable watch is `null`; the consumer
     already knows each watch's type from the profile.
+
+    A known failure ends the stream with an `error` event before scry exits
+    non-zero (the stderr text is unchanged):
+
+        {\"event\":\"error\",\"code\":\"no_profile_fits\",\"message\":\"...\",\"exit_code\":3}
+
+    `code` is one of `usage`, `no_such_process`, `profiles_unreadable`,
+    `attach_failed`, `no_profile_fits`, `resolver_failed`, or `internal` (a
+    crash, exit 101); `message` is for logs and may change.
+
+EXIT STATUS:
+    0    the watch ended as asked (--once, --for)
+    1    usage error, unreadable profile, target cannot be opened, resolver error
+    2    no running process has the --process name
+    3    no profile fits the target (the fail-safe)
+    5    the target process exited
+    101  crash (a bug; please report it)
 ";
 
     pub fn main() -> i32 {
@@ -151,12 +296,20 @@ JSON OUTPUT:
     }
 
     fn watch(args: &[String]) -> i32 {
+        // Known before the arguments are parsed, so that even a usage error
+        // reaches a host that asked for JSON as an `error` event.
+        let json = args
+            .windows(2)
+            .any(|w| w[0] == "--format" && w[1] == "json");
+        if json {
+            report_panics_as_json();
+        }
         let mut process: Option<String> = None;
         let mut pid: Option<u32> = None;
         let mut profile_files: Vec<String> = Vec::new();
         let mut profiles_dir: Option<String> = None;
         let mut once = false;
-        let mut for_secs: Option<f64> = None;
+        let mut for_secs: Option<Duration> = None;
         let mut tick_ms: u64 = 50;
         let mut no_resolve = false;
         let mut format = Format::Human;
@@ -164,39 +317,52 @@ JSON OUTPUT:
         let mut it = args.iter();
         while let Some(a) = it.next() {
             match a.as_str() {
-                "--process" | "-p" => process = it.next().cloned(),
+                "--process" | "-p" => match it.next() {
+                    Some(name) => process = Some(name.clone()),
+                    None => return usage(json, "--process needs an executable name"),
+                },
                 "--pid" => match it.next().and_then(|s| s.parse().ok()) {
                     Some(n) => pid = Some(n),
-                    None => return usage_err(WATCH_USAGE, "--pid needs a numeric process id"),
+                    None => return usage(json, "--pid needs a numeric process id"),
                 },
                 "--profile" => match it.next() {
                     Some(f) => profile_files.push(f.clone()),
-                    None => return usage_err(WATCH_USAGE, "--profile needs a path"),
+                    None => return usage(json, "--profile needs a path"),
                 },
-                "--profiles" => profiles_dir = it.next().cloned(),
+                "--profiles" => match it.next() {
+                    Some(dir) => profiles_dir = Some(dir.clone()),
+                    None => return usage(json, "--profiles needs a directory"),
+                },
                 "--once" => once = true,
-                "--for" => for_secs = it.next().and_then(|s| s.parse().ok()),
+                // Refused rather than ignored: an unreadable `--for` used to
+                // mean "run forever", the opposite of what was asked, and a
+                // negative one panicked on its way into a `Duration`.
+                "--for" => match it.next().map(|s| super::parse_seconds(s)) {
+                    Some(Ok(secs)) => for_secs = Some(secs),
+                    Some(Err(why)) => return usage(json, &format!("--for {why}")),
+                    None => return usage(json, "--for needs a number of seconds"),
+                },
                 "--tick" => match it.next().and_then(|s| s.parse().ok()) {
                     Some(n) => tick_ms = n,
-                    None => return usage_err(WATCH_USAGE, "--tick needs a millisecond count"),
+                    None => return usage(json, "--tick needs a millisecond count"),
                 },
                 "--format" => match it.next().map(String::as_str) {
                     Some("human") => format = Format::Human,
                     Some("json") => format = Format::Json,
                     Some(other) => {
-                        return usage_err(
-                            WATCH_USAGE,
+                        return usage(
+                            json,
                             &format!("unknown --format '{other}' (expected `human` or `json`)"),
                         )
                     }
-                    None => return usage_err(WATCH_USAGE, "--format needs `human` or `json`"),
+                    None => return usage(json, "--format needs `human` or `json`"),
                 },
                 "--no-resolve" => no_resolve = true,
                 "-h" | "--help" => {
                     print!("{WATCH_USAGE}");
                     return 0;
                 }
-                other => return usage_err(WATCH_USAGE, &format!("unexpected argument '{other}'")),
+                other => return usage(json, &format!("unexpected argument '{other}'")),
             }
         }
 
@@ -205,8 +371,9 @@ JSON OUTPUT:
             (Some(name), _) => match plat::find_pid(name) {
                 Some(p) => (p, name.to_string()),
                 None => {
-                    eprintln!("scry: no running process named '{name}'");
-                    return 2;
+                    let message = format!("no running process named '{name}'");
+                    eprintln!("scry: {message}");
+                    return fail(json, exit::NO_PROCESS, "no_such_process", &message);
                 }
             },
             (None, Some(p)) => {
@@ -214,10 +381,7 @@ JSON OUTPUT:
                 (p, name)
             }
             (None, None) => {
-                return usage_err(
-                    WATCH_USAGE,
-                    "a target is required: --process <name> or --pid <n>",
-                )
+                return usage(json, "a target is required: --process <name> or --pid <n>")
             }
         };
 
@@ -234,7 +398,12 @@ JSON OUTPUT:
                 }
                 Err(e) => {
                     eprintln!("scry: {f}: {e}");
-                    return 1;
+                    return fail(
+                        json,
+                        exit::ERROR,
+                        "profiles_unreadable",
+                        &format!("{f}: {e}"),
+                    );
                 }
             }
         }
@@ -248,15 +417,17 @@ JSON OUTPUT:
                 }
                 Err(e) => {
                     eprintln!("scry: {dir}: {e}");
-                    return 1;
+                    return fail(
+                        json,
+                        exit::ERROR,
+                        "profiles_unreadable",
+                        &format!("{dir}: {e}"),
+                    );
                 }
             }
         }
         if profiles.is_empty() {
-            return usage_err(
-                WATCH_USAGE,
-                "at least one --profile or --profiles is required",
-            );
+            return usage(json, "at least one --profile or --profiles is required");
         }
 
         // Open the target.
@@ -265,7 +436,8 @@ JSON OUTPUT:
             Err(e) => {
                 eprintln!("scry: cannot open pid {pid}: {e}");
                 eprintln!("      (a game may need this run elevated / as administrator)");
-                return 1;
+                let message = format!("cannot open pid {pid}: {e}");
+                return fail(json, exit::ERROR, "attach_failed", &message);
             }
         };
 
@@ -273,30 +445,53 @@ JSON OUTPUT:
         // caller; otherwise the memory decides, exactly as a host would in prod.
         let chosen: &Profile = if no_resolve {
             if profiles.len() != 1 {
-                return usage_err(WATCH_USAGE, "--no-resolve needs exactly one --profile");
+                return usage(json, "--no-resolve needs exactly one --profile");
             }
             &profiles[0]
         } else {
             if name.is_empty() {
-                eprintln!(
-                    "scry: could not read the executable name for pid {pid}; \
+                let message = format!(
+                    "could not read the executable name for pid {pid}; \
                      pass --process <name>, or --no-resolve with a single profile"
                 );
-                return 1;
+                eprintln!("scry: {message}");
+                return fail(json, exit::ERROR, "attach_failed", &message);
             }
-            match resolver::select(&backend, &name, &profiles) {
-                Ok(Some(p)) => p,
-                Ok(None) => {
+            match resolver::fitting(&backend, &name, &profiles) {
+                Ok(fits) if !fits.is_empty() => {
+                    if fits.len() > 1 {
+                        // Two profiles claiming one game usually means one of
+                        // them was written for another build and its probe is
+                        // too broad. Say so, and say which one won and why, so
+                        // the choice never looks arbitrary.
+                        let names: Vec<String> = fits
+                            .iter()
+                            .map(|p| describe(p, &profiles, &sources))
+                            .collect();
+                        eprintln!(
+                            "scry: warning: {} profiles fit '{name}': {}; using {} \
+                             (a profile whose match.version the target confirmed wins, \
+                             otherwise the first in load order)",
+                            fits.len(),
+                            names.join(", "),
+                            names[0],
+                        );
+                    }
+                    fits[0]
+                }
+                Ok(_) => {
                     eprintln!(
                         "scry: no profile fits '{name}' (pid {pid}) — nothing read.\n\
                          This is the fail-safe: a profile's probe must resolve in \
                          the target's memory to claim it."
                     );
-                    return 3;
+                    let message = format!("no profile fits '{name}' (pid {pid})");
+                    return fail(json, exit::NO_PROFILE_FITS, "no_profile_fits", &message);
                 }
                 Err(e) => {
                     eprintln!("scry: resolver failed: {e}");
-                    return 1;
+                    let message = format!("resolver failed: {e}");
+                    return fail(json, exit::ERROR, "resolver_failed", &message);
                 }
             }
         };
@@ -321,9 +516,15 @@ JSON OUTPUT:
         // The identity of what we attached to, announced once. A host needs this
         // to confirm it is reading the game it meant to — the profile is chosen
         // by the target's *memory*, not by the caller, so which one won is news.
-        // `contract_version` travels with it because the values that follow are
-        // only interpretable against the shape the profile declares.
+        // The contract travels with it because the values that follow are only
+        // interpretable against the shape the profile declares.
         if format == Format::Json {
+            let declared = chosen.declared_contract();
+            // Only a contract with an id is worth announcing as one: a bare
+            // deprecated integer says which version, but not of what.
+            let contract = declared.and_then(|c| {
+                c.id.map(|id| serde_json::json!({ "id": id, "version": c.version.to_string() }))
+            });
             emit(&serde_json::json!({
                 "event": "attached",
                 "scry": env!("CARGO_PKG_VERSION"),
@@ -331,7 +532,10 @@ JSON OUTPUT:
                 "process": name,
                 "profile": label,
                 "profile_file": source,
-                "contract_version": chosen.contract_version,
+                "contract": contract,
+                // Deprecated: the major alone, for hosts that read only this
+                // (Vibepollo's parser, today). Remove once hosts read `contract`.
+                "contract_version": declared.map(|c| c.version.major),
                 "watches": chosen.watches.len(),
                 "pointer_bits": pointer_bits,
             }));
@@ -348,21 +552,116 @@ JSON OUTPUT:
         // First poll always reports every value it can read — the initial picture.
         print_diff(session.poll(Duration::ZERO), start.elapsed(), format);
         if once {
-            print_detached(start.elapsed(), format);
+            print_detached(start.elapsed(), format, "once");
             return 0;
         }
 
-        let deadline = for_secs.map(|s| start + Duration::from_secs_f64(s));
+        // `parse_seconds` guarantees a representable duration; an `Instant` that
+        // far out is still not a deadline this process will live to see, so an
+        // overflow here just means "no deadline".
+        let deadline = for_secs.and_then(|s| start.checked_add(s));
         loop {
             if let Some(d) = deadline {
                 if Instant::now() >= d {
-                    print_detached(start.elapsed(), format);
+                    print_detached(start.elapsed(), format, "duration");
                     return 0;
                 }
             }
             std::thread::sleep(config.base_tick);
+            // Asked before polling, since a dead target would only produce a
+            // last tick of nulls. Without this a closed game left scry running
+            // forever, reporting every watch unavailable; a host that restarts
+            // scry when the game relaunches needs it to end instead.
+            if session.target_exited() {
+                eprintln!("scry: {name} (pid {pid}) has exited; stopping");
+                print_detached(start.elapsed(), format, "target_exited");
+                return exit::TARGET_EXITED;
+            }
             print_diff(session.poll(start.elapsed()), start.elapsed(), format);
         }
+    }
+
+    /// The exit status of `scry`, part of what a host driving it may rely on.
+    /// Documented under EXIT STATUS in `--help` and in the README; a new code
+    /// may be added, an existing one never changes meaning.
+    mod exit {
+        /// A usage error, an unreadable profile, a target that cannot be
+        /// opened, a failed resolver or selftest: anything with no code of its
+        /// own.
+        pub const ERROR: i32 = 1;
+        /// No running process has the `--process` name.
+        pub const NO_PROCESS: i32 = 2;
+        /// No profile's probe resolved in the target: the fail-safe.
+        pub const NO_PROFILE_FITS: i32 = 3;
+        /// `scry scan` found no match for the signature.
+        pub const NOT_FOUND: i32 = 4;
+        /// `scry watch` stopped because the target process exited.
+        pub const TARGET_EXITED: i32 = 5;
+    }
+
+    /// End `watch` with a known failure: in JSON mode, say so on stdout first.
+    ///
+    /// The stderr line each caller prints stays as it was, for a person. This is
+    /// the machine-readable twin, because a host only sees an exit status
+    /// otherwise, and "no profile fits" (a verdict on the game, worth backing
+    /// off from), "cannot open the process" (worth retrying elevated) and a
+    /// crash all looked alike to it. `code` is a stable identifier; `message`
+    /// is for logs and may change.
+    fn fail(json: bool, exit_code: i32, code: &str, message: &str) -> i32 {
+        if json {
+            emit(&serde_json::json!({
+                "event": "error",
+                "code": code,
+                "message": message,
+                "exit_code": exit_code,
+            }));
+        }
+        exit_code
+    }
+
+    /// A `watch` usage error: the usual stderr text, and an `error` event with
+    /// code `usage` in JSON mode.
+    fn usage(json: bool, message: &str) -> i32 {
+        usage_err(WATCH_USAGE, message);
+        fail(json, exit::ERROR, "usage", message)
+    }
+
+    /// In JSON mode, turn a panic into a last `error` event (code `internal`)
+    /// before the process exits with 101, so a host reading only stdout can
+    /// tell a crash from a clean end. The default hook still prints the panic
+    /// to stderr. The write ignores errors: a hook that panicked itself would
+    /// abort instead of exiting.
+    fn report_panics_as_json() {
+        let default = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            default(info);
+            use std::io::Write;
+            let event = serde_json::json!({
+                "event": "error",
+                "code": "internal",
+                "message": info.to_string(),
+                "exit_code": 101,
+            });
+            let mut out = std::io::stdout().lock();
+            let _ = writeln!(out, "{event}");
+            let _ = out.flush();
+        }));
+    }
+
+    /// How to name a profile in a diagnostic: the file it came from when there
+    /// is one, else its label.
+    fn describe(profile: &Profile, profiles: &[Profile], sources: &[PathBuf]) -> String {
+        profiles
+            .iter()
+            .position(|p| std::ptr::eq(p, profile))
+            .and_then(|i| sources.get(i))
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| {
+                profile
+                    .label
+                    .clone()
+                    .unwrap_or_else(|| "(unlabeled profile)".to_string())
+            })
     }
 
     /// Write one JSON event as a line on stdout, flushed.
@@ -376,13 +675,17 @@ JSON OUTPUT:
     }
 
     /// Close the stream deliberately, so a consumer can tell "the watch ended"
-    /// (`--once`/`--for` ran out) from "the process died under me".
-    ///
-    /// Note this is *our* end, not the game's: nothing here detects the target
-    /// exiting — a dead target shows up as watches going `null`.
-    fn print_detached(at: Duration, format: Format) {
+    /// from "scry died under me", and say why it ended: `once` and `duration`
+    /// are the watch running out as asked, `target_exited` is the game going
+    /// away. The `reason` field is newer than the event; a host that predates it
+    /// ignores it and still sees the end.
+    fn print_detached(at: Duration, format: Format, reason: &str) {
         if format == Format::Json {
-            emit(&serde_json::json!({ "event": "detached", "t_ms": at.as_millis() as u64 }));
+            emit(&serde_json::json!({
+                "event": "detached",
+                "t_ms": at.as_millis() as u64,
+                "reason": reason,
+            }));
         }
     }
 
@@ -462,9 +765,18 @@ USAGE:
         let mut it = args.iter();
         while let Some(a) = it.next() {
             match a.as_str() {
-                "--process" | "-p" => process = it.next().cloned(),
-                "--pid" => pid = it.next().and_then(|s| s.parse().ok()),
-                "--signature" | "--sig" => sig = it.next().cloned(),
+                "--process" | "-p" => match it.next() {
+                    Some(name) => process = Some(name.clone()),
+                    None => return usage_err(SCAN_USAGE, "--process needs an executable name"),
+                },
+                "--pid" => match it.next().and_then(|s| s.parse().ok()) {
+                    Some(n) => pid = Some(n),
+                    None => return usage_err(SCAN_USAGE, "--pid needs a numeric process id"),
+                },
+                "--signature" | "--sig" => match it.next() {
+                    Some(text) => sig = Some(text.clone()),
+                    None => return usage_err(SCAN_USAGE, "--signature needs a byte pattern"),
+                },
                 "-h" | "--help" => {
                     print!("{SCAN_USAGE}");
                     return 0;
@@ -490,7 +802,7 @@ USAGE:
                 Some(p) => (p, name.to_string()),
                 None => {
                     eprintln!("scry: no running process named '{name}'");
-                    return 2;
+                    return exit::NO_PROCESS;
                 }
             },
             (None, Some(p)) => (p, plat::process_name(p).unwrap_or_default()),
@@ -512,7 +824,7 @@ USAGE:
             }
             Ok(None) => {
                 eprintln!("scry: signature not found in {name} (pid {pid})");
-                4
+                exit::NOT_FOUND
             }
             Err(e) => {
                 eprintln!("scry: scan failed: {e}");
@@ -541,7 +853,10 @@ USAGE:
         let mut it = args.iter();
         while let Some(a) = it.next() {
             match a.as_str() {
-                "--cavia" => cavia_override = it.next().cloned(),
+                "--cavia" => match it.next() {
+                    Some(path) => cavia_override = Some(path.clone()),
+                    None => return usage_err(SELFTEST_USAGE, "--cavia needs a path"),
+                },
                 "-h" | "--help" => {
                     print!("{SELFTEST_USAGE}");
                     return 0;
@@ -681,14 +996,24 @@ USAGE:
     /// from. A file that fails to parse is skipped with a warning rather than
     /// sinking the batch — one broken community profile must not deny telemetry
     /// to the valid ones.
+    ///
+    /// Sorted by file name, because the order is the resolver's last tie-break
+    /// and `read_dir` promises no order at all: without the sort, which of two
+    /// fitting profiles won could change from one machine, or one run, to the
+    /// next.
     fn load_profiles_dir(dir: &Path) -> Result<Vec<(PathBuf, Profile)>, String> {
-        let mut out = Vec::new();
+        let mut paths = Vec::new();
         for entry in std::fs::read_dir(dir).map_err(|e| e.to_string())? {
             let entry = entry.map_err(|e| e.to_string())?;
             let path = entry.path();
             if path.extension().and_then(|e| e.to_str()) != Some("json") {
                 continue;
             }
+            paths.push(path);
+        }
+        paths.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
+        let mut out = Vec::new();
+        for path in paths {
             match load_profile(&path) {
                 Ok(p) => out.push((path, p)),
                 Err(e) => eprintln!("scry: skipping {}: {e}", path.display()),

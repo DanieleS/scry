@@ -30,10 +30,16 @@ type Dword = u32;
 const PROCESS_QUERY_INFORMATION: Dword = 0x0400;
 const PROCESS_VM_READ: Dword = 0x0010;
 
+const STILL_ACTIVE: Dword = 259;
+
 const MEM_COMMIT: Dword = 0x1000;
 const PAGE_GUARD: Dword = 0x100;
 
 const MAX_PATH: usize = 260;
+
+// `dwFilterFlag` values for `EnumProcessModulesEx` (psapi.h).
+const LIST_MODULES_32BIT: Dword = 0x01;
+const LIST_MODULES_ALL: Dword = 0x03;
 
 #[allow(dead_code)] // fields mirror the OS struct; only `base_of_dll` is read.
 #[repr(C)]
@@ -79,6 +85,7 @@ extern "system" {
     fn OpenProcess(access: Dword, inherit: Bool, pid: Dword) -> Handle;
     fn CloseHandle(handle: Handle) -> Bool;
     fn IsWow64Process(handle: Handle, wow64: *mut Bool) -> Bool;
+    fn GetExitCodeProcess(handle: Handle, exit_code: *mut Dword) -> Bool;
     fn ReadProcessMemory(
         handle: Handle,
         base: *const c_void,
@@ -92,11 +99,12 @@ extern "system" {
         info: *mut MemoryBasicInformation,
         length: usize,
     ) -> usize;
-    fn K32EnumProcessModules(
+    fn K32EnumProcessModulesEx(
         handle: Handle,
         modules: *mut Handle,
         cb: Dword,
         needed: *mut Dword,
+        filter: Dword,
     ) -> Bool;
     fn K32GetModuleBaseNameW(
         handle: Handle,
@@ -140,15 +148,30 @@ impl WindowsBackend {
 
     /// Find the module handle whose base name matches `name`, compared ASCII
     /// case-insensitively as the Windows filesystem does.
+    ///
+    /// Enumerated with `EnumProcessModulesEx`, not `EnumProcessModules`: from a
+    /// 64-bit reader the plain call lists only the 64-bit modules of a 32-bit
+    /// (WOW64) target — its emulation layer — so a 32-bit game's own
+    /// `GameAssembly.dll` was never found. For such a target the filter asks
+    /// for the 32-bit modules alone, because those are the ones its code runs
+    /// in, and some names (`ntdll.dll`) exist in both sets. For any other
+    /// target it asks for everything. (A 32-bit reader running under WOW64
+    /// gets the plain behaviour whatever the flag says, which is right there:
+    /// it can only open 32-bit targets anyway.)
     fn find_module(&self, name: &str) -> Result<Handle> {
         let slot = std::mem::size_of::<Handle>();
+        let filter = if self.ptr_size == 4 {
+            LIST_MODULES_32BIT
+        } else {
+            LIST_MODULES_ALL
+        };
         // Enumerate, growing the buffer if the OS reports it needs more room.
         let mut modules: Vec<Handle> = vec![ptr::null_mut(); 256];
         loop {
             let mut needed: Dword = 0;
             let cb = (modules.len() * slot) as Dword;
             let ok = unsafe {
-                K32EnumProcessModules(self.handle, modules.as_mut_ptr(), cb, &mut needed)
+                K32EnumProcessModulesEx(self.handle, modules.as_mut_ptr(), cb, &mut needed, filter)
             };
             if ok == 0 {
                 return Err(Error::Io(io::Error::last_os_error()));
@@ -282,6 +305,20 @@ impl MemoryBackend for WindowsBackend {
 
     fn pointer_size(&self) -> usize {
         self.ptr_size
+    }
+
+    /// Asked of the handle scry already holds, which keeps the process object
+    /// alive, so the pid cannot be reused under it. `GetExitCodeProcess` needs
+    /// only the `PROCESS_QUERY_INFORMATION` right the backend opened with.
+    ///
+    /// A process that is running reports `STILL_ACTIVE` (259). One that exited
+    /// *with* code 259 is indistinguishable from a running one and is taken as
+    /// running, which only means scry keeps watching a dead game, as before.
+    /// A failed query is "cannot tell", not "exited".
+    fn has_exited(&self) -> bool {
+        let mut code: Dword = 0;
+        let ok = unsafe { GetExitCodeProcess(self.handle, &mut code) };
+        ok != 0 && code != STILL_ACTIVE
     }
 }
 

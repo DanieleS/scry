@@ -18,7 +18,15 @@
 //! garbage number — it surfaces as [`Value::Unavailable`]; and if every due read
 //! fails for [`Config::reattach_after`] consecutive ticks, the session
 //! re-resolves its anchors, the recovery path for a process that has moved out
-//! from under it.
+//! from under it. While nothing reads, further re-attaches back off from one
+//! second to eight, so a long menu does not rescan the process twice a second.
+//!
+//! A re-attach only re-resolves anchors on the same target; it cannot bring
+//! back a process that has **exited**, and a dead process looks, to reads,
+//! exactly like a live one on a loading screen. So the session never decides
+//! on its own that the target is gone. A host asks
+//! [`Session::target_exited`] (the backend asks the OS) and ends the watch
+//! itself; the `scry` CLI does so every tick.
 //!
 //! # Driving it
 //!
@@ -55,7 +63,7 @@ use crate::aob;
 use crate::backend::MemoryBackend;
 use crate::profile::{
     Base, Clause, Compare, Expr, Extremum, Field, Fold, Literal, Profile, Rip, StringEncoding,
-    StringLayout, ValueType, Watch,
+    StringLayout, ValueType, Watch, MAX_COLLECTION_LEN,
 };
 
 /// A single sampled value — or the honest absence of one.
@@ -67,7 +75,10 @@ use crate::profile::{
 /// Not `Copy`: [`Str`](Value::Str) and [`List`](Value::List) own heap data. The
 /// engine clones a value only when it actually changes, so the cost lands on
 /// real diffs, not on every quiet tick.
-#[derive(Debug, Clone, PartialEq)]
+///
+/// Equality is what the diff runs on, so it is defined by hand rather than
+/// derived: see the [`PartialEq`] impl for how floats compare.
+#[derive(Debug, Clone)]
 pub enum Value {
     I32(i32),
     U32(u32),
@@ -93,6 +104,39 @@ pub enum Value {
     /// state — never a stale or garbage number passed off as a live reading.
     Unavailable,
 }
+
+/// Equality as the diff needs it: "would a consumer see the same reading".
+///
+/// A derived `PartialEq` compares an [`F32`](Value::F32) with IEEE `==`, under
+/// which `NaN != NaN`. A torn or uninitialised float in a game's memory is very
+/// often a NaN, and with IEEE equality the diff would call it changed on every
+/// single tick and resend it — together with the whole list or record that
+/// holds it. So floats compare by their bits instead, with every NaN equal to
+/// every other (they all reach the wire as the same `null`). The one visible
+/// consequence is that `0.0` and `-0.0` now differ, which is honest: they
+/// serialise differently too.
+///
+/// Comparing bits also makes the relation reflexive, which is what lets
+/// `Value` be [`Eq`].
+impl PartialEq for Value {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Value::I32(a), Value::I32(b)) => a == b,
+            (Value::U32(a), Value::U32(b)) => a == b,
+            (Value::F32(a), Value::F32(b)) => {
+                a.to_bits() == b.to_bits() || (a.is_nan() && b.is_nan())
+            }
+            (Value::U64(a), Value::U64(b)) => a == b,
+            (Value::Str(a), Value::Str(b)) => a == b,
+            (Value::List(a), Value::List(b)) => a == b,
+            (Value::Map(a), Value::Map(b)) => a == b,
+            (Value::Unavailable, Value::Unavailable) => true,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for Value {}
 
 /// The **wire form** of a value: the shape a host outside this process sees.
 ///
@@ -143,7 +187,8 @@ pub struct Config {
     /// Consecutive fully-failed ticks — every *due* watch unreadable — after
     /// which the session re-resolves module bases and re-scans anchors. Must be
     /// at least 1; the default is deliberately forgiving so a brief hiccup
-    /// doesn't trigger a needless rescan.
+    /// doesn't trigger a needless rescan. If that re-attach brings nothing back,
+    /// the next ones wait 1, 2, 4 and then 8 seconds apart, until a tick reads.
     pub reattach_after: u32,
 }
 
@@ -284,9 +329,16 @@ fn anchor_from_base(base: &Base) -> (AnchorKind, Vec<i64>) {
 
 /// Convert an optional rate into a minimum sampling period. A missing or
 /// non-positive rate collapses to "every tick".
+///
+/// A validated profile keeps the rate inside
+/// [`MIN_RATE_HZ`](crate::profile::MIN_RATE_HZ)..=[`MAX_RATE_HZ`](crate::profile::MAX_RATE_HZ),
+/// but a [`Profile`] can also be built by hand, and `Duration::from_secs_f64`
+/// panics on a period it cannot hold. So the conversion is the fallible one: a
+/// rate too small to express as a period means "as rarely as can be said",
+/// which is [`Duration::MAX`], not a crash.
 fn period_of(rate_hz: Option<f64>) -> Duration {
     match rate_hz {
-        Some(hz) if hz > 0.0 => Duration::from_secs_f64(1.0 / hz),
+        Some(hz) if hz > 0.0 => Duration::try_from_secs_f64(1.0 / hz).unwrap_or(Duration::MAX),
         _ => Duration::ZERO,
     }
 }
@@ -393,8 +445,10 @@ fn read_string<B: MemoryBackend + ?Sized>(
         StringEncoding::Utf8 => String::from_utf8_lossy(&bytes).into_owned(),
         StringEncoding::Utf16 => {
             let wide: Vec<u16> = bytes
-                .chunks_exact(2)
-                .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|c| u16::from_le_bytes(*c))
                 .collect();
             String::from_utf16_lossy(&wide)
         }
@@ -415,7 +469,17 @@ fn read_until_nul<B: MemoryBackend + ?Sized>(
     while out.len() < STRING_MAX_BYTES {
         let take = BLOCK.min(STRING_MAX_BYTES - out.len());
         let mut buf = vec![0u8; take];
-        if let Err(e) = backend.read_bytes(start + out.len() as u64, &mut buf) {
+        // `start` comes out of the target's memory, so it can sit at the very
+        // top of the address space. Running off the end is a failed read like
+        // any other, not an arithmetic overflow.
+        let read = match start.checked_add(out.len() as u64) {
+            Some(addr) => backend.read_bytes(addr, &mut buf),
+            None => Err(crate::Error::ShortRead {
+                expected: take,
+                got: 0,
+            }),
+        };
+        if let Err(e) = read {
             if out.is_empty() {
                 return Err(e);
             }
@@ -832,7 +896,10 @@ fn sample_one<B: MemoryBackend + ?Sized>(
                 .resolve(container, count)
                 .and_then(|a| backend.read_i32(a))
             {
-                Ok(raw) => (raw.max(0) as usize).min(*max),
+                // Clamped to the ceiling as well as to `max`: a validated profile
+                // cannot exceed it, but a hand-built one can, and `n` is about to
+                // size an allocation from a number read out of untrusted memory.
+                Ok(raw) => (raw.max(0) as usize).min(*max).min(MAX_COLLECTION_LEN),
                 Err(_) => return Value::Unavailable,
             };
             // Find the element region: the backing array an `items` chain points
@@ -870,6 +937,16 @@ fn sample_one<B: MemoryBackend + ?Sized>(
     }
 }
 
+/// The wait after a re-attach that did not bring anything back, before the
+/// next one may run. Doubled on each further attempt, up to
+/// [`REATTACH_BACKOFF_MAX`].
+const REATTACH_BACKOFF_FIRST: Duration = Duration::from_secs(1);
+
+/// The longest wait between re-attaches while nothing reads: a recovered game
+/// is picked up again within this long, and a long menu costs one rescan per
+/// this long rather than two a second.
+const REATTACH_BACKOFF_MAX: Duration = Duration::from_secs(8);
+
 /// A live watch over a target process: attach once, poll repeatedly.
 pub struct Session<B: MemoryBackend> {
     backend: B,
@@ -879,6 +956,11 @@ pub struct Session<B: MemoryBackend> {
     last: BTreeMap<String, Value>,
     /// Consecutive fully-failed ticks; drives the re-attach decision.
     fail_streak: u32,
+    /// The wait imposed after the last re-attach; zero until one has run
+    /// without a successful read since. See [`Session::back_off`].
+    reattach_delay: Duration,
+    /// Elapsed time before which no further re-attach runs.
+    next_reattach: Duration,
 }
 
 impl<B: MemoryBackend> Session<B> {
@@ -1020,6 +1102,8 @@ impl<B: MemoryBackend> Session<B> {
             watches,
             last: BTreeMap::new(),
             fail_streak: 0,
+            reattach_delay: Duration::ZERO,
+            next_reattach: Duration::ZERO,
         }
     }
 
@@ -1053,13 +1137,20 @@ impl<B: MemoryBackend> Session<B> {
         // something: a quiet tick (nothing due) is neither success nor failure.
         if sampled > 0 {
             if failed == sampled {
-                self.fail_streak += 1;
-                if self.fail_streak >= self.config.reattach_after.max(1) {
+                self.fail_streak = self.fail_streak.saturating_add(1);
+                if self.fail_streak >= self.config.reattach_after.max(1)
+                    && elapsed >= self.next_reattach
+                {
                     self.reattach();
                     self.fail_streak = 0;
+                    self.back_off(elapsed);
                 }
             } else {
                 self.fail_streak = 0;
+                // Something read: whatever was wrong is over, so the next
+                // outage gets a prompt first re-attach again.
+                self.reattach_delay = Duration::ZERO;
+                self.next_reattach = Duration::ZERO;
             }
         }
 
@@ -1086,7 +1177,9 @@ impl<B: MemoryBackend> Session<B> {
                 continue;
             }
             sampled += 1;
-            w.next_due = elapsed + w.period;
+            // Saturating, because a period of `Duration::MAX` (see `period_of`)
+            // would otherwise overflow the addition.
+            w.next_due = elapsed.saturating_add(w.period);
 
             let value = sample_one(&self.backend, w, &self.last);
             if value == Value::Unavailable {
@@ -1109,6 +1202,23 @@ impl<B: MemoryBackend> Session<B> {
         (sampled, failed)
     }
 
+    /// Push the next re-attach out after one that has just run.
+    ///
+    /// A re-attach re-runs every Tier-2 watch's AOB scan over the whole
+    /// process, and a target where nothing reads — a loading screen, a menu, a
+    /// game on its way out — would otherwise pay for that every
+    /// `reattach_after` ticks (half a second at the defaults) for as long as it
+    /// lasts. The delay doubles from [`REATTACH_BACKOFF_FIRST`] up to
+    /// [`REATTACH_BACKOFF_MAX`], and a tick that reads anything resets it.
+    fn back_off(&mut self, elapsed: Duration) {
+        self.reattach_delay = if self.reattach_delay.is_zero() {
+            REATTACH_BACKOFF_FIRST
+        } else {
+            (self.reattach_delay * 2).min(REATTACH_BACKOFF_MAX)
+        };
+        self.next_reattach = elapsed.saturating_add(self.reattach_delay);
+    }
+
     /// Re-resolve every watch's anchor against the live target. Called when a
     /// run of fully-failed ticks suggests the process moved (relocated module,
     /// freed region) — the same resolution attach did, repeated. A derived watch
@@ -1120,6 +1230,17 @@ impl<B: MemoryBackend> Session<B> {
                 w.anchor = resolve_anchor(&self.backend, kind);
             }
         }
+    }
+
+    /// Whether the target process has exited, as far as the backend can tell
+    /// (see [`MemoryBackend::has_exited`]).
+    ///
+    /// Nothing in [`poll`](Session::poll) acts on this: it is the host's call
+    /// whether a gone target ends the watch, and one that polls for a process
+    /// that will be restarted may want to keep going. [`Session::run`] does not
+    /// stop on it either.
+    pub fn target_exited(&self) -> bool {
+        self.backend.has_exited()
     }
 
     /// The last known value of every label sampled so far — the full state a
@@ -1313,6 +1434,7 @@ mod tests {
         reads_at: RefCell<HashMap<u64, u32>>,
         base_calls: Cell<u32>,
         fail: Cell<bool>,
+        exited: Cell<bool>,
     }
 
     impl Fake {
@@ -1323,6 +1445,7 @@ mod tests {
                 reads_at: RefCell::new(HashMap::new()),
                 base_calls: Cell::new(0),
                 fail: Cell::new(false),
+                exited: Cell::new(false),
             }
         }
 
@@ -1382,6 +1505,10 @@ mod tests {
                 len: self.mem.borrow().len() as u64,
             }])
         }
+
+        fn has_exited(&self) -> bool {
+            self.exited.get()
+        }
     }
 
     /// A minimal profile identity — the polling tests attach directly, so the
@@ -1413,6 +1540,7 @@ mod tests {
         fake.write_i32(0, 100);
         let profile = Profile {
             label: None,
+            contract: None,
             contract_version: None,
             match_: ident(),
             watches: vec![tier1("hp", 0, None)],
@@ -1433,11 +1561,83 @@ mod tests {
         assert!(s.poll(Duration::from_millis(150)).is_empty());
     }
 
+    /// A torn float is usually a NaN, and IEEE says `NaN != NaN`. The diff must
+    /// not take that literally, or the value — and any list holding it — would
+    /// be resent on every tick for as long as the game leaves it torn.
+    #[test]
+    fn a_nan_reading_is_reported_once_not_every_tick() {
+        let fake = Rc::new(Fake::new(0x600));
+        let nan_bits = f32::NAN.to_bits() as i32;
+        fake.write_i32(0, nan_bits);
+        // A collection of floats whose middle element is a NaN.
+        plant_collection(&fake, &[0, nan_bits, 0]);
+        let mut floats = i32_collection_watch("speeds", 8);
+        if let Watch::Collection { ty, .. } = &mut floats {
+            *ty = Some(ValueType::F32);
+        }
+        let profile = Profile {
+            label: None,
+            contract: None,
+            contract_version: None,
+            match_: ident(),
+            watches: vec![
+                Watch::Tier1 {
+                    name: "speed".to_string(),
+                    module: "fake".to_string(),
+                    offsets: vec![0],
+                    ty: ValueType::F32,
+                    rate_hz: None,
+                },
+                floats,
+            ],
+        };
+        let mut s = Session::attach(Rc::clone(&fake), &profile, Config::default());
+
+        let first = s.poll(Duration::ZERO);
+        assert!(matches!(first.get("speed"), Some(Value::F32(x)) if x.is_nan()));
+        assert!(first.contains_key("speeds"));
+        assert!(
+            s.poll(Duration::from_millis(50)).is_empty(),
+            "an unchanged NaN must not count as a change"
+        );
+
+        // A NaN with a different payload is still "no reading", so still quiet.
+        fake.write_i32(0, (f32::NAN.to_bits() | 1) as i32);
+        assert!(s.poll(Duration::from_millis(100)).is_empty());
+
+        // A real value arriving is a change, as ever.
+        fake.write_i32(0, 1.5f32.to_bits() as i32);
+        assert_eq!(
+            s.poll(Duration::from_millis(150)).get("speed"),
+            Some(&Value::F32(1.5))
+        );
+    }
+
+    /// A hand-built profile skips validation, so the engine must survive a rate
+    /// whose period no `Duration` can hold: sample once, then never again.
+    #[test]
+    fn a_vanishingly_small_rate_samples_once_instead_of_panicking() {
+        assert_eq!(period_of(Some(1e-300)), Duration::MAX);
+        let fake = Rc::new(Fake::new(64));
+        let profile = Profile {
+            label: None,
+            contract: None,
+            contract_version: None,
+            match_: ident(),
+            watches: vec![tier1("hp", 0, Some(1e-300))],
+        };
+        let mut s = Session::attach(Rc::clone(&fake), &profile, Config::default());
+        assert!(s.poll(Duration::ZERO).contains_key("hp"));
+        fake.write_i32(0, 5);
+        assert!(s.poll(Duration::from_secs(3600)).is_empty());
+    }
+
     #[test]
     fn per_watch_rate_throttles_sampling() {
         let fake = Rc::new(Fake::new(64));
         let profile = Profile {
             label: None,
+            contract: None,
             contract_version: None,
             match_: ident(),
             watches: vec![
@@ -1472,6 +1672,7 @@ mod tests {
         fake.write_i32(0, 7);
         let profile = Profile {
             label: None,
+            contract: None,
             contract_version: None,
             match_: ident(),
             watches: vec![tier1("hp", 0, None)],
@@ -1516,6 +1717,7 @@ mod tests {
         fake.write_i32(0, 1);
         let profile = Profile {
             label: None,
+            contract: None,
             contract_version: None,
             match_: ident(),
             watches: vec![tier1("hp", 0, None)],
@@ -1550,6 +1752,74 @@ mod tests {
         );
     }
 
+    /// A long outage — a menu, a loading screen — must not trigger a full
+    /// rescan every `reattach_after` ticks for as long as it lasts: the waits
+    /// between re-attaches grow, and a good read resets them.
+    #[test]
+    fn repeated_reattaches_back_off() {
+        let fake = Rc::new(Fake::new(64));
+        let profile = Profile {
+            label: None,
+            contract: None,
+            contract_version: None,
+            match_: ident(),
+            watches: vec![tier1("hp", 0, None)],
+        };
+        let config = Config {
+            base_tick: Duration::from_millis(50),
+            reattach_after: 2,
+        };
+        let mut s = Session::attach(Rc::clone(&fake), &profile, config);
+        let reattaches = |fake: &Fake| fake.base_calls.get() - 1;
+
+        // Twenty seconds of total failure at 50 ms ticks. Without a backoff that
+        // is a re-attach every other tick: 200 of them.
+        fake.fail.set(true);
+        let mut t = 0u64;
+        while t < 20_000 {
+            s.poll(Duration::from_millis(t));
+            t += 50;
+        }
+        // The first comes as promptly as ever (at the second failed tick), then
+        // after 1, 2, 4, 8 and 8 seconds.
+        let during = reattaches(&fake);
+        assert!((5..=7).contains(&during), "got {during} re-attaches");
+
+        // Once reads succeed the backoff is forgotten: the next outage gets its
+        // first re-attach after `reattach_after` ticks again.
+        // (Recovery itself waits for the next re-attach, since the anchor was
+        // lost while everything failed.)
+        fake.fail.set(false);
+        while !s.poll(Duration::from_millis(t)).contains_key("hp") {
+            t += 50;
+            assert!(t < 40_000, "never recovered");
+        }
+        fake.fail.set(true);
+        let before = fake.base_calls.get();
+        s.poll(Duration::from_millis(t + 50));
+        s.poll(Duration::from_millis(t + 100));
+        assert_eq!(fake.base_calls.get(), before + 1);
+    }
+
+    /// The session reports what the backend knows about the target's exit and
+    /// leaves the decision to the host; polling carries on regardless.
+    #[test]
+    fn target_exit_is_reported_not_acted_on() {
+        let fake = Rc::new(Fake::new(64));
+        let profile = Profile {
+            label: None,
+            contract: None,
+            contract_version: None,
+            match_: ident(),
+            watches: vec![tier1("hp", 0, None)],
+        };
+        let mut s = Session::attach(Rc::clone(&fake), &profile, Config::default());
+        assert!(!s.target_exited());
+        fake.exited.set(true);
+        assert!(s.target_exited());
+        assert!(s.poll(Duration::ZERO).contains_key("hp"));
+    }
+
     #[test]
     fn quiet_ticks_do_not_count_toward_reattach() {
         // A watch that is not due contributes neither success nor failure, so a
@@ -1557,6 +1827,7 @@ mod tests {
         let fake = Rc::new(Fake::new(64));
         let profile = Profile {
             label: None,
+            contract: None,
             contract_version: None,
             match_: ident(),
             watches: vec![tier1("slow", 0, Some(1.0))], // 1 s period
@@ -1611,6 +1882,7 @@ mod tests {
 
         let profile = Profile {
             label: None,
+            contract: None,
             contract_version: None,
             match_: ident(),
             watches: vec![Watch::Tier2 {
@@ -1643,6 +1915,7 @@ mod tests {
 
         let profile = Profile {
             label: None,
+            contract: None,
             contract_version: None,
             match_: ident(),
             watches: vec![Watch::Tier2 {
@@ -1703,6 +1976,7 @@ mod tests {
         plant_collection(&fake, &[11, 22, 33]);
         let profile = Profile {
             label: None,
+            contract: None,
             contract_version: None,
             match_: ident(),
             watches: vec![i32_collection_watch("enemy_hp", 64)],
@@ -1743,6 +2017,7 @@ mod tests {
         plant_collection(&fake, &[11, 22, 33]);
         let profile = Profile {
             label: None,
+            contract: None,
             contract_version: None,
             match_: ident(),
             watches: vec![i32_collection_watch("capped", 2)],
@@ -1755,6 +2030,27 @@ mod tests {
         );
     }
 
+    /// A hand-built profile is not validated, so the engine clamps a garbage
+    /// count to the ceiling itself rather than trusting an unbounded `max`.
+    #[test]
+    fn a_garbage_count_is_clamped_to_the_ceiling_even_with_an_unbounded_max() {
+        let fake = Rc::new(Fake::new(0x600));
+        plant_collection(&fake, &[1]);
+        fake.write_i32(0x108, i32::MAX); // a garbage count
+        let profile = Profile {
+            label: None,
+            contract: None,
+            contract_version: None,
+            match_: ident(),
+            watches: vec![i32_collection_watch("enemy_hp", usize::MAX)],
+        };
+        let mut s = Session::attach(Rc::clone(&fake), &profile, Config::default());
+        match s.poll(Duration::ZERO).get("enemy_hp") {
+            Some(Value::List(items)) => assert_eq!(items.len(), MAX_COLLECTION_LEN),
+            other => panic!("expected a clamped list, got {other:?}"),
+        }
+    }
+
     #[test]
     fn collection_element_fails_soft_without_sinking_the_list() {
         let fake = Rc::new(Fake::new(0x600));
@@ -1764,6 +2060,7 @@ mod tests {
         fake.write_u64(0x228, 0xdead_0000);
         let profile = Profile {
             label: None,
+            contract: None,
             contract_version: None,
             match_: ident(),
             watches: vec![i32_collection_watch("enemy_hp", 64)],
@@ -1787,6 +2084,7 @@ mod tests {
         let fake = Rc::new(Fake::new(0x10));
         let profile = Profile {
             label: None,
+            contract: None,
             contract_version: None,
             match_: ident(),
             watches: vec![i32_collection_watch("enemy_hp", 64)],
@@ -1835,6 +2133,7 @@ mod tests {
 
         let profile = Profile {
             label: None,
+            contract: None,
             contract_version: None,
             match_: ident(),
             watches: vec![Watch::Record {
@@ -1876,6 +2175,7 @@ mod tests {
 
         let profile = Profile {
             label: None,
+            contract: None,
             contract_version: None,
             match_: ident(),
             watches: vec![Watch::Collection {
@@ -1919,6 +2219,7 @@ mod tests {
 
         let profile = Profile {
             label: None,
+            contract: None,
             contract_version: None,
             match_: ident(),
             watches: vec![Watch::Record {
@@ -1949,6 +2250,7 @@ mod tests {
         let fake = Rc::new(Fake::new(0x40));
         let profile = Profile {
             label: None,
+            contract: None,
             contract_version: None,
             match_: ident(),
             watches: vec![Watch::Record {
@@ -1981,6 +2283,7 @@ mod tests {
 
         let profile = Profile {
             label: None,
+            contract: None,
             contract_version: None,
             match_: ident(),
             watches: vec![Watch::Tier1 {
@@ -2015,6 +2318,7 @@ mod tests {
         };
         let profile = Profile {
             label: None,
+            contract: None,
             contract_version: None,
             match_: ident(),
             watches: vec![Watch::Tier1 {
@@ -2033,12 +2337,43 @@ mod tests {
         );
     }
 
+    /// A NUL-terminated string near the top of the address space must stop at
+    /// the end of it, not overflow the next block's address (a panic in a debug
+    /// build). What was read before the edge is kept, as for any later failure.
+    #[test]
+    fn a_string_at_the_top_of_the_address_space_stops_instead_of_overflowing() {
+        /// Every read succeeds with non-zero bytes, so the scan never finds a
+        /// terminator and has to walk until something stops it.
+        struct NoTerminator;
+        impl MemoryBackend for NoTerminator {
+            fn read_bytes(&self, _addr: u64, buf: &mut [u8]) -> Result<()> {
+                buf.fill(b'a');
+                Ok(())
+            }
+            fn module_base(&self, _name: &str) -> Result<u64> {
+                Ok(0)
+            }
+            fn readable_regions(&self) -> Result<Vec<Region>> {
+                Ok(vec![])
+            }
+        }
+        let layout = StringLayout {
+            encoding: StringEncoding::Utf8,
+            len_at: None,
+            chars_at: 0,
+            deref: false,
+        };
+        let text = read_string(&NoTerminator, u64::MAX - 3, layout).expect("first block read");
+        assert_eq!(text.len(), 64, "only the block before the edge");
+    }
+
     #[test]
     fn null_string_reference_reads_empty_not_unavailable() {
         let fake = Rc::new(Fake::new(0x100));
         // Slot at 0x10 holds a null reference (zeroed memory).
         let profile = Profile {
             label: None,
+            contract: None,
             contract_version: None,
             match_: ident(),
             watches: vec![Watch::Tier1 {
@@ -2064,6 +2399,7 @@ mod tests {
     fn profile(watches: Vec<Watch>) -> Profile {
         Profile {
             label: None,
+            contract: None,
             contract_version: None,
             match_: ident(),
             watches,
@@ -2612,6 +2948,7 @@ mod tests {
         let fake = Rc::new(Fake::new(64));
         let profile = Profile {
             label: None,
+            contract: None,
             contract_version: None,
             match_: ident(),
             watches: vec![Watch::Tier2 {
