@@ -37,14 +37,21 @@ pub fn build_id<B: MemoryBackend + ?Sized>(be: &B, module_base: u64) -> Result<S
         return Err(not_a_pe(module_base, "no MZ header"));
     }
 
-    let e_lfanew = be.read_u32(module_base + DOS_E_LFANEW)? as u64;
-    let pe = module_base + e_lfanew;
+    // Every address below is computed from bytes read out of the target, so a
+    // garbage `e_lfanew` can put it past the top of the address space. That is
+    // a module that is not a PE image, not an arithmetic overflow.
+    let at = |base: u64, offset: u64| {
+        base.checked_add(offset)
+            .ok_or_else(|| not_a_pe(module_base, "header offset out of range"))
+    };
+    let e_lfanew = be.read_u32(at(module_base, DOS_E_LFANEW)?)? as u64;
+    let pe = at(module_base, e_lfanew)?;
     if be.read_u32(pe)? != PE_SIGNATURE {
         return Err(not_a_pe(module_base, "no PE signature"));
     }
 
-    let timestamp = be.read_u32(pe + FILE_HEADER_TIMEDATESTAMP)?;
-    let size_of_image = be.read_u32(pe + OPTIONAL_SIZEOFIMAGE)?;
+    let timestamp = be.read_u32(at(pe, FILE_HEADER_TIMEDATESTAMP)?)?;
+    let size_of_image = be.read_u32(at(pe, OPTIONAL_SIZEOFIMAGE)?)?;
     Ok(format!("pe:{timestamp:08x}:{size_of_image:08x}"))
 }
 
@@ -135,6 +142,21 @@ mod tests {
             mem: vec![0u8; 0x200],
         };
         assert!(build_id(&be, be.base).is_err());
+    }
+
+    /// A garbage `e_lfanew` near the top of the address space must reject the
+    /// module, not overflow the header address (a panic in a debug build).
+    #[test]
+    fn rejects_an_e_lfanew_that_runs_off_the_address_space() {
+        let mut mem = vec![0u8; 0x200];
+        mem[0..2].copy_from_slice(&DOS_MAGIC.to_le_bytes());
+        mem[0x3C..0x40].copy_from_slice(&u32::MAX.to_le_bytes());
+        let be = Fake {
+            base: u64::MAX - 0x1FF,
+            mem,
+        };
+        let err = build_id(&be, be.base).unwrap_err().to_string();
+        assert!(err.contains("out of range"), "{err}");
     }
 
     #[test]

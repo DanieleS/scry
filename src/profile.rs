@@ -26,7 +26,7 @@ use crate::error::{Error, Result};
 /// `i64`; input is where the flexibility matters, so a profile authored from a
 /// Cheat Engine session can paste `"0x58"` verbatim instead of hand-converting
 /// it to `88`. (Serialization stays canonical decimal.)
-mod hexnum {
+pub(crate) mod hexnum {
     use serde::de::{self, Deserializer};
     use serde::Deserialize;
 
@@ -44,19 +44,31 @@ mod hexnum {
         Text(String),
     }
 
-    /// Parse a signed decimal or `0x`-prefixed hex integer. Returns `None` on
-    /// anything else, which the callers turn into a serde error.
-    fn parse(text: &str) -> Option<i64> {
+    /// Parse a signed decimal or `0x`-prefixed hex integer: at most one sign,
+    /// in front, then bare digits. Returns `None` on anything else, which the
+    /// callers turn into a serde error.
+    ///
+    /// The digits are checked by hand because the standard parsers accept a
+    /// sign of their own: left to them, `"0x-5"` read as `-5` and `"--5"` as
+    /// `5`, neither of which is a number anyone meant to write.
+    pub(crate) fn parse(text: &str) -> Option<i64> {
         let s = text.trim();
-        let (sign, body) = match s.strip_prefix('-') {
-            Some(rest) => (-1i64, rest.trim_start()),
-            None => (1, s.strip_prefix('+').map(str::trim_start).unwrap_or(s)),
+        let (negative, body) = match s.as_bytes().first() {
+            Some(b'-') => (true, s[1..].trim_start()),
+            Some(b'+') => (false, s[1..].trim_start()),
+            _ => (false, s),
         };
-        let magnitude = match body.strip_prefix("0x").or_else(|| body.strip_prefix("0X")) {
-            Some(hex) => i64::from_str_radix(hex, 16).ok()?,
-            None => body.parse::<i64>().ok()?,
+        let (digits, radix) = match body.strip_prefix("0x").or_else(|| body.strip_prefix("0X")) {
+            Some(hex) => (hex, 16),
+            None => (body, 10),
         };
-        Some(sign * magnitude)
+        if digits.is_empty() || !digits.chars().all(|c| c.is_digit(radix)) {
+            return None;
+        }
+        // Parsed unsigned and negated in a wider type, so the full `i64` range
+        // (down to `-0x8000000000000000`) is reachable and nothing overflows.
+        let magnitude = i128::from(u64::from_str_radix(digits, radix).ok()?);
+        i64::try_from(if negative { -magnitude } else { magnitude }).ok()
     }
 
     fn one<E: de::Error>(repr: Repr) -> Result<i64, E> {
@@ -1833,6 +1845,22 @@ mod tests {
             }
             other => panic!("expected tier2, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn an_offset_has_at_most_one_sign_and_it_comes_first() {
+        use super::hexnum::parse;
+        assert_eq!(parse("0x10"), Some(16));
+        assert_eq!(parse("-0x10"), Some(-16));
+        assert_eq!(parse("+16"), Some(16));
+        assert_eq!(parse(" - 16 "), Some(-16));
+        assert_eq!(parse("-0x8000000000000000"), Some(i64::MIN));
+        for bad in [
+            "0x-5", "0x+5", "--5", "+-5", "-+5", "0x", "-", "", "5-", "0x1g", "1_000",
+        ] {
+            assert_eq!(parse(bad), None, "{bad:?} must not parse");
+        }
+        assert_eq!(parse("0x8000000000000000"), None, "out of range");
     }
 
     #[test]

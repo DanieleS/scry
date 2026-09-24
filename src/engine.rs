@@ -458,7 +458,17 @@ fn read_until_nul<B: MemoryBackend + ?Sized>(
     while out.len() < STRING_MAX_BYTES {
         let take = BLOCK.min(STRING_MAX_BYTES - out.len());
         let mut buf = vec![0u8; take];
-        if let Err(e) = backend.read_bytes(start + out.len() as u64, &mut buf) {
+        // `start` comes out of the target's memory, so it can sit at the very
+        // top of the address space. Running off the end is a failed read like
+        // any other, not an arithmetic overflow.
+        let read = match start.checked_add(out.len() as u64) {
+            Some(addr) => backend.read_bytes(addr, &mut buf),
+            None => Err(crate::Error::ShortRead {
+                expected: take,
+                got: 0,
+            }),
+        };
+        if let Err(e) = read {
             if out.is_empty() {
                 return Err(e);
             }
@@ -2188,6 +2198,36 @@ mod tests {
             Some(&Value::Str("GARL".to_string())),
             "a NUL-terminated UTF-8 layout must read a native string"
         );
+    }
+
+    /// A NUL-terminated string near the top of the address space must stop at
+    /// the end of it, not overflow the next block's address (a panic in a debug
+    /// build). What was read before the edge is kept, as for any later failure.
+    #[test]
+    fn a_string_at_the_top_of_the_address_space_stops_instead_of_overflowing() {
+        /// Every read succeeds with non-zero bytes, so the scan never finds a
+        /// terminator and has to walk until something stops it.
+        struct NoTerminator;
+        impl MemoryBackend for NoTerminator {
+            fn read_bytes(&self, _addr: u64, buf: &mut [u8]) -> Result<()> {
+                buf.fill(b'a');
+                Ok(())
+            }
+            fn module_base(&self, _name: &str) -> Result<u64> {
+                Ok(0)
+            }
+            fn readable_regions(&self) -> Result<Vec<Region>> {
+                Ok(vec![])
+            }
+        }
+        let layout = StringLayout {
+            encoding: StringEncoding::Utf8,
+            len_at: None,
+            chars_at: 0,
+            deref: false,
+        };
+        let text = read_string(&NoTerminator, u64::MAX - 3, layout).expect("first block read");
+        assert_eq!(text.len(), 64, "only the block before the edge");
     }
 
     #[test]

@@ -854,18 +854,11 @@ fn resolve_entry(watch: &str, entry: &ChainEntry, symbols: &Symbols) -> Result<i
     }
 }
 
-/// Parse a signed integer literal, decimal or `0x`-prefixed hex.
+/// Parse a signed integer literal, decimal or `0x`-prefixed hex — by the same
+/// rule the runtime applies to a profile's offsets, so a literal the converter
+/// accepts is one the profile it emits can express.
 fn parse_int(s: &str) -> Option<i64> {
-    let s = s.trim();
-    let (neg, rest) = match s.strip_prefix('-') {
-        Some(r) => (true, r.trim_start()),
-        None => (false, s),
-    };
-    let magnitude = match rest.strip_prefix("0x").or_else(|| rest.strip_prefix("0X")) {
-        Some(hex) => i64::from_str_radix(hex, 16).ok()?,
-        None => rest.parse::<i64>().ok()?,
-    };
-    Some(if neg { -magnitude } else { magnitude })
+    crate::profile::hexnum::parse(s)
 }
 
 fn resolve_probe(spec: &ProbeSpec) -> String {
