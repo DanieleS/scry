@@ -18,7 +18,8 @@
 //! garbage number — it surfaces as [`Value::Unavailable`]; and if every due read
 //! fails for [`Config::reattach_after`] consecutive ticks, the session
 //! re-resolves its anchors, the recovery path for a process that has moved out
-//! from under it.
+//! from under it. While nothing reads, further re-attaches back off from one
+//! second to eight, so a long menu does not rescan the process twice a second.
 //!
 //! # Driving it
 //!
@@ -179,7 +180,8 @@ pub struct Config {
     /// Consecutive fully-failed ticks — every *due* watch unreadable — after
     /// which the session re-resolves module bases and re-scans anchors. Must be
     /// at least 1; the default is deliberately forgiving so a brief hiccup
-    /// doesn't trigger a needless rescan.
+    /// doesn't trigger a needless rescan. If that re-attach brings nothing back,
+    /// the next ones wait 1, 2, 4 and then 8 seconds apart, until a tick reads.
     pub reattach_after: u32,
 }
 
@@ -926,6 +928,16 @@ fn sample_one<B: MemoryBackend + ?Sized>(
     }
 }
 
+/// The wait after a re-attach that did not bring anything back, before the
+/// next one may run. Doubled on each further attempt, up to
+/// [`REATTACH_BACKOFF_MAX`].
+const REATTACH_BACKOFF_FIRST: Duration = Duration::from_secs(1);
+
+/// The longest wait between re-attaches while nothing reads: a recovered game
+/// is picked up again within this long, and a long menu costs one rescan per
+/// this long rather than two a second.
+const REATTACH_BACKOFF_MAX: Duration = Duration::from_secs(8);
+
 /// A live watch over a target process: attach once, poll repeatedly.
 pub struct Session<B: MemoryBackend> {
     backend: B,
@@ -935,6 +947,11 @@ pub struct Session<B: MemoryBackend> {
     last: BTreeMap<String, Value>,
     /// Consecutive fully-failed ticks; drives the re-attach decision.
     fail_streak: u32,
+    /// The wait imposed after the last re-attach; zero until one has run
+    /// without a successful read since. See [`Session::back_off`].
+    reattach_delay: Duration,
+    /// Elapsed time before which no further re-attach runs.
+    next_reattach: Duration,
 }
 
 impl<B: MemoryBackend> Session<B> {
@@ -1076,6 +1093,8 @@ impl<B: MemoryBackend> Session<B> {
             watches,
             last: BTreeMap::new(),
             fail_streak: 0,
+            reattach_delay: Duration::ZERO,
+            next_reattach: Duration::ZERO,
         }
     }
 
@@ -1109,13 +1128,20 @@ impl<B: MemoryBackend> Session<B> {
         // something: a quiet tick (nothing due) is neither success nor failure.
         if sampled > 0 {
             if failed == sampled {
-                self.fail_streak += 1;
-                if self.fail_streak >= self.config.reattach_after.max(1) {
+                self.fail_streak = self.fail_streak.saturating_add(1);
+                if self.fail_streak >= self.config.reattach_after.max(1)
+                    && elapsed >= self.next_reattach
+                {
                     self.reattach();
                     self.fail_streak = 0;
+                    self.back_off(elapsed);
                 }
             } else {
                 self.fail_streak = 0;
+                // Something read: whatever was wrong is over, so the next
+                // outage gets a prompt first re-attach again.
+                self.reattach_delay = Duration::ZERO;
+                self.next_reattach = Duration::ZERO;
             }
         }
 
@@ -1165,6 +1191,23 @@ impl<B: MemoryBackend> Session<B> {
             }
         }
         (sampled, failed)
+    }
+
+    /// Push the next re-attach out after one that has just run.
+    ///
+    /// A re-attach re-runs every Tier-2 watch's AOB scan over the whole
+    /// process, and a target where nothing reads — a loading screen, a menu, a
+    /// game on its way out — would otherwise pay for that every
+    /// `reattach_after` ticks (half a second at the defaults) for as long as it
+    /// lasts. The delay doubles from [`REATTACH_BACKOFF_FIRST`] up to
+    /// [`REATTACH_BACKOFF_MAX`], and a tick that reads anything resets it.
+    fn back_off(&mut self, elapsed: Duration) {
+        self.reattach_delay = if self.reattach_delay.is_zero() {
+            REATTACH_BACKOFF_FIRST
+        } else {
+            (self.reattach_delay * 2).min(REATTACH_BACKOFF_MAX)
+        };
+        self.next_reattach = elapsed.saturating_add(self.reattach_delay);
     }
 
     /// Re-resolve every watch's anchor against the live target. Called when a
@@ -1681,6 +1724,55 @@ mod tests {
             2,
             "the Nth fully-failed tick must re-resolve anchors"
         );
+    }
+
+    /// A long outage — a menu, a loading screen — must not trigger a full
+    /// rescan every `reattach_after` ticks for as long as it lasts: the waits
+    /// between re-attaches grow, and a good read resets them.
+    #[test]
+    fn repeated_reattaches_back_off() {
+        let fake = Rc::new(Fake::new(64));
+        let profile = Profile {
+            label: None,
+            contract: None,
+            contract_version: None,
+            match_: ident(),
+            watches: vec![tier1("hp", 0, None)],
+        };
+        let config = Config {
+            base_tick: Duration::from_millis(50),
+            reattach_after: 2,
+        };
+        let mut s = Session::attach(Rc::clone(&fake), &profile, config);
+        let reattaches = |fake: &Fake| fake.base_calls.get() - 1;
+
+        // Twenty seconds of total failure at 50 ms ticks. Without a backoff that
+        // is a re-attach every other tick: 200 of them.
+        fake.fail.set(true);
+        let mut t = 0u64;
+        while t < 20_000 {
+            s.poll(Duration::from_millis(t));
+            t += 50;
+        }
+        // The first comes as promptly as ever (at the second failed tick), then
+        // after 1, 2, 4, 8 and 8 seconds.
+        let during = reattaches(&fake);
+        assert!((5..=7).contains(&during), "got {during} re-attaches");
+
+        // Once reads succeed the backoff is forgotten: the next outage gets its
+        // first re-attach after `reattach_after` ticks again.
+        // (Recovery itself waits for the next re-attach, since the anchor was
+        // lost while everything failed.)
+        fake.fail.set(false);
+        while !s.poll(Duration::from_millis(t)).contains_key("hp") {
+            t += 50;
+            assert!(t < 40_000, "never recovered");
+        }
+        fake.fail.set(true);
+        let before = fake.base_calls.get();
+        s.poll(Duration::from_millis(t + 50));
+        s.poll(Duration::from_millis(t + 100));
+        assert_eq!(fake.base_calls.get(), before + 1);
     }
 
     #[test]
