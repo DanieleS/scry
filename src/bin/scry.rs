@@ -46,6 +46,46 @@ fn platform_main() -> i32 {
     1
 }
 
+/// Parse a `--for` value: a finite, non-negative number of seconds that a
+/// `Duration` can hold. The error completes the sentence "--for …".
+///
+/// Outside the platform module so its tests run on every platform, the Mac a
+/// profile repository is checked on included.
+#[cfg_attr(not(any(target_os = "linux", target_os = "windows")), allow(dead_code))]
+fn parse_seconds(text: &str) -> Result<std::time::Duration, String> {
+    let secs: f64 = text
+        .parse()
+        .map_err(|_| format!("needs a number of seconds, got '{text}'"))?;
+    if !secs.is_finite() || secs < 0.0 {
+        return Err(format!(
+            "needs a non-negative number of seconds, got '{text}'"
+        ));
+    }
+    std::time::Duration::try_from_secs_f64(secs).map_err(|_| format!("is too large: '{text}'"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_seconds;
+    use std::time::Duration;
+
+    #[test]
+    fn for_accepts_a_non_negative_number_of_seconds() {
+        assert_eq!(parse_seconds("10"), Ok(Duration::from_secs(10)));
+        assert_eq!(parse_seconds("0.5"), Ok(Duration::from_millis(500)));
+        assert_eq!(parse_seconds("0"), Ok(Duration::ZERO));
+    }
+
+    /// Each of these once meant "run forever" (unparseable) or a panic
+    /// (negative, or too large for a `Duration`).
+    #[test]
+    fn for_refuses_what_it_cannot_honour() {
+        for bad in ["ten", "", "-1", "NaN", "inf", "1e30"] {
+            assert!(parse_seconds(bad).is_err(), "{bad:?} must be refused");
+        }
+    }
+}
+
 /// `scry schema <profile.json>`: print the JSON Schema of the `values` object
 /// the profile produces. See [`scry::schema`].
 mod schema_cmd {
@@ -231,7 +271,7 @@ JSON OUTPUT:
         let mut profile_files: Vec<String> = Vec::new();
         let mut profiles_dir: Option<String> = None;
         let mut once = false;
-        let mut for_secs: Option<f64> = None;
+        let mut for_secs: Option<Duration> = None;
         let mut tick_ms: u64 = 50;
         let mut no_resolve = false;
         let mut format = Format::Human;
@@ -239,7 +279,10 @@ JSON OUTPUT:
         let mut it = args.iter();
         while let Some(a) = it.next() {
             match a.as_str() {
-                "--process" | "-p" => process = it.next().cloned(),
+                "--process" | "-p" => match it.next() {
+                    Some(name) => process = Some(name.clone()),
+                    None => return usage_err(WATCH_USAGE, "--process needs an executable name"),
+                },
                 "--pid" => match it.next().and_then(|s| s.parse().ok()) {
                     Some(n) => pid = Some(n),
                     None => return usage_err(WATCH_USAGE, "--pid needs a numeric process id"),
@@ -248,9 +291,19 @@ JSON OUTPUT:
                     Some(f) => profile_files.push(f.clone()),
                     None => return usage_err(WATCH_USAGE, "--profile needs a path"),
                 },
-                "--profiles" => profiles_dir = it.next().cloned(),
+                "--profiles" => match it.next() {
+                    Some(dir) => profiles_dir = Some(dir.clone()),
+                    None => return usage_err(WATCH_USAGE, "--profiles needs a directory"),
+                },
                 "--once" => once = true,
-                "--for" => for_secs = it.next().and_then(|s| s.parse().ok()),
+                // Refused rather than ignored: an unreadable `--for` used to
+                // mean "run forever", the opposite of what was asked, and a
+                // negative one panicked on its way into a `Duration`.
+                "--for" => match it.next().map(|s| super::parse_seconds(s)) {
+                    Some(Ok(secs)) => for_secs = Some(secs),
+                    Some(Err(why)) => return usage_err(WATCH_USAGE, &format!("--for {why}")),
+                    None => return usage_err(WATCH_USAGE, "--for needs a number of seconds"),
+                },
                 "--tick" => match it.next().and_then(|s| s.parse().ok()) {
                     Some(n) => tick_ms = n,
                     None => return usage_err(WATCH_USAGE, "--tick needs a millisecond count"),
@@ -456,7 +509,10 @@ JSON OUTPUT:
             return 0;
         }
 
-        let deadline = for_secs.map(|s| start + Duration::from_secs_f64(s));
+        // `parse_seconds` guarantees a representable duration; an `Instant` that
+        // far out is still not a deadline this process will live to see, so an
+        // overflow here just means "no deadline".
+        let deadline = for_secs.and_then(|s| start.checked_add(s));
         loop {
             if let Some(d) = deadline {
                 if Instant::now() >= d {
@@ -582,9 +638,18 @@ USAGE:
         let mut it = args.iter();
         while let Some(a) = it.next() {
             match a.as_str() {
-                "--process" | "-p" => process = it.next().cloned(),
-                "--pid" => pid = it.next().and_then(|s| s.parse().ok()),
-                "--signature" | "--sig" => sig = it.next().cloned(),
+                "--process" | "-p" => match it.next() {
+                    Some(name) => process = Some(name.clone()),
+                    None => return usage_err(SCAN_USAGE, "--process needs an executable name"),
+                },
+                "--pid" => match it.next().and_then(|s| s.parse().ok()) {
+                    Some(n) => pid = Some(n),
+                    None => return usage_err(SCAN_USAGE, "--pid needs a numeric process id"),
+                },
+                "--signature" | "--sig" => match it.next() {
+                    Some(text) => sig = Some(text.clone()),
+                    None => return usage_err(SCAN_USAGE, "--signature needs a byte pattern"),
+                },
                 "-h" | "--help" => {
                     print!("{SCAN_USAGE}");
                     return 0;
@@ -661,7 +726,10 @@ USAGE:
         let mut it = args.iter();
         while let Some(a) = it.next() {
             match a.as_str() {
-                "--cavia" => cavia_override = it.next().cloned(),
+                "--cavia" => match it.next() {
+                    Some(path) => cavia_override = Some(path.clone()),
+                    None => return usage_err(SELFTEST_USAGE, "--cavia needs a path"),
+                },
                 "-h" | "--help" => {
                     print!("{SELFTEST_USAGE}");
                     return 0;
