@@ -381,9 +381,11 @@ pub struct Field {
 /// what makes the tier engine-agnostic by construction: no offset, no signature
 /// and no [`StringLayout`] appears anywhere below.
 ///
-/// Deserialized `#[serde(untagged)]` and discriminated by each node's unique
-/// key, so the JSON reads as the arithmetic it denotes.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// Discriminated by each node's unique key, so the JSON reads as the arithmetic
+/// it denotes. Parsing is **strict**: a node must carry exactly one operator
+/// key and nothing its operator does not take — see the [`Deserialize`] impl.
+/// Serialized untagged, which writes exactly that shape back.
+#[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(untagged)]
 pub enum Expr {
     /// A literal number: `{"const": 6}`. Accepts the hex form every other number
@@ -472,6 +474,120 @@ pub enum Expr {
     },
 }
 
+/// Every key that names an expression node's operator, paired with the other
+/// keys that operator accepts next to it.
+const EXPR_OPERATORS: &[(&str, &[&str])] = &[
+    ("const", &[]),
+    ("watch", &["index", "field"]),
+    ("item", &[]),
+    ("add", &[]),
+    ("mul", &[]),
+    ("sub", &[]),
+    ("div", &[]),
+    ("min", &[]),
+    ("max", &[]),
+    ("sum", &[]),
+    ("count", &[]),
+];
+
+/// Parse an expression node strictly.
+///
+/// A derived untagged parse takes the first variant that fits and ignores
+/// whatever else the object holds. For an expression that is a hole, not
+/// leniency: `{"watch": "nope", "const": 1}` parsed as the constant 1, skipping
+/// the check that `nope` is declared earlier, and a typo like `{"watch": "hp",
+/// "feild": "max"}` silently read the whole of `hp`. So the node must name
+/// exactly one operator and carry only the keys that operator takes, and the
+/// operator then picks the variant directly — which also lets an error inside
+/// a fold or an operand say what was wrong instead of "matched no variant".
+impl<'de> Deserialize<'de> for Expr {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        use serde::de::Error as _;
+        let node = serde_json::Value::deserialize(d)?;
+        let serde_json::Value::Object(mut object) = node else {
+            return Err(D::Error::custom("an expression node must be a JSON object"));
+        };
+        let operators: Vec<&(&str, &[&str])> = EXPR_OPERATORS
+            .iter()
+            .filter(|(key, _)| object.contains_key(*key))
+            .collect();
+        let (operator, extra) = match operators.as_slice() {
+            [one] => **one,
+            [] => {
+                let names: Vec<&str> = EXPR_OPERATORS.iter().map(|(k, _)| *k).collect();
+                return Err(D::Error::custom(format!(
+                    "an expression node needs one of the keys {}",
+                    names.join(", ")
+                )));
+            }
+            many => {
+                let names: Vec<&str> = many.iter().map(|(k, _)| *k).collect();
+                return Err(D::Error::custom(format!(
+                    "an expression node names more than one operator ({}); nest them instead",
+                    names.join(", ")
+                )));
+            }
+        };
+        if let Some(unknown) = object
+            .keys()
+            .find(|k| k.as_str() != operator && !extra.contains(&k.as_str()))
+        {
+            return Err(D::Error::custom(format!(
+                "unknown key {unknown:?} in a `{operator}` expression node"
+            )));
+        }
+
+        // Each operand is parsed with its own type's rules; an error is
+        // prefixed with the operator so a nested mistake can be found.
+        let mut take = |key: &str| object.remove(key).unwrap_or(serde_json::Value::Null);
+        fn parse<T, E: serde::de::Error>(
+            operator: &str,
+            f: impl FnOnce() -> std::result::Result<T, serde_json::Error>,
+        ) -> std::result::Result<T, E> {
+            f().map_err(|e| E::custom(format!("in `{operator}`: {e}")))
+        }
+        use serde_json::from_value;
+        Ok(match operator {
+            "const" => Expr::Const {
+                value: parse(operator, || hexnum::de_f64(take("const")))?,
+            },
+            "watch" => Expr::Ref {
+                watch: parse(operator, || from_value(take("watch")))?,
+                index: parse(operator, || hexnum::de_opt_i64(take("index")))?,
+                field: parse(operator, || from_value(take("field")))?,
+            },
+            "item" => Expr::Item {
+                item: parse(operator, || from_value(take("item")))?,
+            },
+            "add" => Expr::Add {
+                add: parse(operator, || from_value(take("add")))?,
+            },
+            "mul" => Expr::Mul {
+                mul: parse(operator, || from_value(take("mul")))?,
+            },
+            "sub" => Expr::Sub {
+                sub: parse(operator, || from_value(take("sub")))?,
+            },
+            "div" => Expr::Div {
+                div: parse(operator, || from_value(take("div")))?,
+            },
+            "min" => Expr::Min {
+                min: parse(operator, || from_value(take("min")))?,
+            },
+            "max" => Expr::Max {
+                max: parse(operator, || from_value(take("max")))?,
+            },
+            "sum" => Expr::Sum {
+                sum: parse(operator, || from_value(take("sum")))?,
+            },
+            "count" => Expr::Count {
+                count: parse(operator, || from_value(take("count")))?,
+            },
+            _ => unreachable!("every key in EXPR_OPERATORS has an arm"),
+        })
+    }
+}
+
 /// The two shapes `min`/`max` accept, discriminated by JSON type.
 ///
 /// Both are common and the two JSON types can never collide, so one key carries
@@ -479,7 +595,10 @@ pub enum Expr {
 /// remember: an **array** is n-ary over operands
 /// (`{"max": [{"const": 0}, {"watch": "hp"}]}` clamps at zero), an **object** is
 /// a fold over a list (`{"max": {"watch": "enemies", "field": "hp"}}`).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+///
+/// Parsed by JSON type rather than by trying each variant, so an error inside
+/// either form reports itself instead of "matched no variant".
+#[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(untagged)]
 pub enum Extremum {
     /// The n-ary form: the extremum of these operands. At least one.
@@ -490,13 +609,34 @@ pub enum Extremum {
     Fold(Fold),
 }
 
+impl<'de> Deserialize<'de> for Extremum {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        use serde::de::Error as _;
+        let value = serde_json::Value::deserialize(d)?;
+        match value {
+            serde_json::Value::Array(_) => serde_json::from_value(value).map(Extremum::Nary),
+            serde_json::Value::Object(_) => serde_json::from_value(value).map(Extremum::Fold),
+            _ => {
+                return Err(D::Error::custom(
+                    "`min`/`max` takes an array of operands or a fold object",
+                ))
+            }
+        }
+        .map_err(D::Error::custom)
+    }
+}
+
 /// A fold over a list-valued watch: which list, which field of each element,
 /// how many elements, and which of them count.
 ///
 /// [`field`](Fold::field), [`take`](Fold::take) and [`clauses`](Fold::clauses)
 /// are each optional; `field` is required when the elements are records and
 /// omitted when they are scalars.
+///
+/// Unknown keys are rejected: a misspelt `where` or `field` would otherwise be
+/// dropped, and the fold would quietly run over everything.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Fold {
     /// Name of the list-valued watch to fold, declared **earlier in the array**
     /// exactly like any other [`Ref`](Expr::Ref).
@@ -527,7 +667,10 @@ pub struct Fold {
 /// Deliberately flat — no nesting, no boolean algebra, no `or`. A profile that
 /// genuinely needs `or` is a signal to reconsider the profile, not to grow the
 /// language.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+///
+/// Parsed strictly (see the [`Deserialize`] impl): exactly one comparison, and
+/// no key a clause does not take.
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Clause {
     /// Field of the element to test.
     pub field: String,
@@ -535,6 +678,53 @@ pub struct Clause {
     /// rather than nesting an operator object.
     #[serde(flatten)]
     pub test: Compare,
+}
+
+/// The wire shape of a [`Clause`], with every comparison optional so the parse
+/// can say how many were given. A flattened enum cannot be combined with
+/// `deny_unknown_fields`, which is why the clause is not derived directly.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ClauseRepr {
+    field: String,
+    eq: Option<Literal>,
+    ne: Option<Literal>,
+    lt: Option<Literal>,
+    le: Option<Literal>,
+    gt: Option<Literal>,
+    ge: Option<Literal>,
+}
+
+/// Parse a clause strictly: a typo'd comparison key must fail rather than be
+/// dropped, and `{"field": "hp", "gt": 0, "lt": 9}` must not quietly test only
+/// one of the two bounds.
+impl<'de> Deserialize<'de> for Clause {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        use serde::de::Error as _;
+        let repr = ClauseRepr::deserialize(d)?;
+        let tests: Vec<Compare> = [
+            repr.eq.map(Compare::Eq),
+            repr.ne.map(Compare::Ne),
+            repr.lt.map(Compare::Lt),
+            repr.le.map(Compare::Le),
+            repr.gt.map(Compare::Gt),
+            repr.ge.map(Compare::Ge),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        match <[Compare; 1]>::try_from(tests) {
+            Ok([test]) => Ok(Clause {
+                field: repr.field,
+                test,
+            }),
+            Err(tests) => Err(D::Error::custom(format!(
+                "a `where` clause on {:?} needs exactly one of eq, ne, lt, le, gt, ge; got {}",
+                repr.field,
+                tests.len()
+            ))),
+        }
+    }
 }
 
 /// The comparison a [`Clause`] applies, named by its JSON key.
@@ -2191,6 +2381,65 @@ mod tests {
             err.contains("type"),
             "…and say the output type is the problem: {err}"
         );
+    }
+
+    /// The two holes a lenient untagged parse left open: a second operator key
+    /// silently winning over the first, and a misspelt key silently dropped.
+    #[test]
+    fn expressions_parse_strictly() {
+        let hp =
+            r#"{ "tier": "tier1", "name": "hp", "module": "g", "offsets": [0], "type": "i32" }"#;
+        let with_value = |value: &str| {
+            derived_profile(&format!(
+                r#"{hp}, {{ "tier": "derived", "name": "d", "type": "i32", "value": {value} }}"#
+            ))
+        };
+
+        // Once parsed as `const 1`, skipping the check that `nope` exists.
+        let err = with_value(r#"{ "watch": "nope", "const": 1 }"#)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("more than one operator"), "{err}");
+
+        // Once parsed as the whole of `hp`, the misspelt `field` dropped.
+        let err = with_value(r#"{ "watch": "hp", "feild": "max" }"#)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("unknown key \"feild\""), "{err}");
+
+        let err = with_value(r#"{ "nothing": 1 }"#).unwrap_err().to_string();
+        assert!(err.contains("needs one of the keys"), "{err}");
+
+        // A fold and a clause are strict too.
+        let err = with_value(r#"{ "sum": { "watch": "hp", "wehre": [] } }"#)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("wehre"), "{err}");
+        let err = with_value(
+            r#"{ "count": { "watch": "hp", "where": [{ "field": "x", "gt": 0, "lt": 9 }] } }"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("exactly one of eq"), "{err}");
+        let err =
+            with_value(r#"{ "count": { "watch": "hp", "where": [{ "field": "x", "eqq": 0 }] } }"#)
+                .unwrap_err()
+                .to_string();
+        assert!(err.contains("eqq"), "{err}");
+
+        // And the legitimate shapes still parse.
+        assert!(with_value(r#"{ "watch": "hp", "index": 0, "field": "x" }"#).is_ok());
+        assert!(with_value(
+            r#"{ "count": { "watch": "hp", "where": [{ "field": "x", "ge": 1 }] } }"#
+        )
+        .is_ok());
+        assert!(with_value(r#"{ "max": [{ "const": "0x10" }, { "watch": "hp" }] }"#).is_ok());
+
+        // An error inside `min`/`max` reports itself in either form.
+        let err = with_value(r#"{ "max": { "watch": "hp", "fied": "x" } }"#)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("fied"), "{err}");
     }
 
     #[test]
