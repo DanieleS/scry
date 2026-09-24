@@ -409,7 +409,10 @@ manual (Cheat Engine) route the converter builds on.
 
 ## Status
 
-Early — version `0.0.0`, API not yet stable. What works today:
+Pre-release: `0.1.0` alpha builds are published from `main` (see
+[`release_notes/`](release_notes/)), and the library API and profile format may
+still change between alphas. The JSON event stream and the exit statuses are
+kept backward compatible for hosts. What works today:
 
 - `MemoryBackend` trait with typed reads and pointer-chain resolution
 - Linux backend (`process_vm_readv`, `/proc/<pid>/maps`)
@@ -423,9 +426,13 @@ Early — version `0.0.0`, API not yet stable. What works today:
   structure, both expressed as data rather than as a script
 - `derived` watches — arithmetic over what the other watches read, touching no
   memory of their own and so engine-agnostic by construction
-- Probe-based resolver with the fail-safe property
-- `scry` host CLI — attach to a running game and stream telemetry (`watch`),
-  find signatures (`scan`), and prove the backend end-to-end (`selftest`)
+- Probe-based resolver with the fail-safe property, deterministic when several
+  profiles fit
+- Contract identity (`{ id, version }`) carried from the profile to the
+  `attached` event, and `scry schema` to generate a contract's JSON Schema
+- `scry` host CLI — attach to a running game and stream telemetry (`watch`,
+  human or JSON Lines, ending on its own when the game exits), find signatures
+  (`scan`), and prove the backend end-to-end (`selftest`)
 - IL2CPP profile authoring: offline `il2cpp2scry` converter (Il2CppDumper
   `dump.cs` + a name map → a profile with resolved offsets), behind a non-default
   `authoring` feature so the runtime stays engine-agnostic
