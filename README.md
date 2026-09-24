@@ -310,6 +310,45 @@ winning profile declares (`null` when it declares none):
 hosts that predate `contract`; it is deprecated and goes once hosts read
 `contract`. A reader must ignore event types and fields it does not know.
 
+Every `values` event is one line, and the first carries every readable watch at
+once, collections and records in full. A host that caps its line length (a
+1 MiB cap is common) should keep its profiles' collections well under their
+4096-element ceiling: a few thousand records of a handful of strings each can
+exceed it.
+
+When `watch` fails in a way it knows about, the JSON stream ends with an `error`
+event before `scry` exits, so a host can tell "no profile fits" from "could not
+open the game" from a crash without parsing stderr (which says the same thing,
+for a person, unchanged):
+
+```json
+{"event":"error","code":"no_profile_fits","message":"no profile fits 'game.exe' (pid 1234)","exit_code":3}
+```
+
+| `code` | Exit | Meaning |
+|---|---|---|
+| `usage` | 1 | The command line is wrong (a missing value, an unknown flag, a bad `--for`). |
+| `no_such_process` | 2 | No running process has the `--process` name. |
+| `profiles_unreadable` | 1 | A `--profile` file, or the `--profiles` folder, could not be read or parsed. A single bad file *inside* a folder is skipped with a warning instead. |
+| `attach_failed` | 1 | The target could not be opened (often: it needs an elevated `scry`), or its executable name could not be read. |
+| `no_profile_fits` | 3 | No profile's probe resolved in the target — the fail-safe. Nothing was read. |
+| `resolver_failed` | 1 | Scanning the target for the probes failed. |
+| `internal` | 101 | `scry` crashed. A bug; the panic is on stderr. |
+
+`code` is stable; `message` is for logs and may change. `exit_code` repeats the
+exit status that follows.
+
+`scry`'s exit status, in every format:
+
+| Exit | Meaning |
+|---|---|
+| 0 | Success; for `watch`, the watch ended as asked (`--once`, `--for`). |
+| 1 | A usage error, an unreadable profile, a target that cannot be opened, a resolver error, a failed `selftest`, or any other error without a code of its own. |
+| 2 | No running process has the `--process` name. |
+| 3 | No profile fits the target. |
+| 4 | `scan` found no match for the signature. |
+| 101 | A crash. |
+
 Three more commands help author and verify:
 
 ```sh

@@ -161,6 +161,14 @@ COMMANDS:
     version     Print the version.
 
 Run `scry <command> --help` for command-specific options.
+
+EXIT STATUS:
+    0    success
+    1    usage error, unreadable profile, target cannot be opened, other error
+    2    no running process has the --process name
+    3    no profile fits the target (the fail-safe)
+    4    scan: signature not found
+    101  crash (a bug; please report it)
 ";
 
     const WATCH_USAGE: &str = "\
@@ -220,6 +228,22 @@ JSON OUTPUT:
     everything readable). Readings are untagged — a number is a number, a list an
     array, a record an object, and an unreadable watch is `null`; the consumer
     already knows each watch's type from the profile.
+
+    A known failure ends the stream with an `error` event before scry exits
+    non-zero (the stderr text is unchanged):
+
+        {\"event\":\"error\",\"code\":\"no_profile_fits\",\"message\":\"...\",\"exit_code\":3}
+
+    `code` is one of `usage`, `no_such_process`, `profiles_unreadable`,
+    `attach_failed`, `no_profile_fits`, `resolver_failed`, or `internal` (a
+    crash, exit 101); `message` is for logs and may change.
+
+EXIT STATUS:
+    0    the watch ended as asked (--once, --for)
+    1    usage error, unreadable profile, target cannot be opened, resolver error
+    2    no running process has the --process name
+    3    no profile fits the target (the fail-safe)
+    101  crash (a bug; please report it)
 ";
 
     pub fn main() -> i32 {
@@ -266,6 +290,14 @@ JSON OUTPUT:
     }
 
     fn watch(args: &[String]) -> i32 {
+        // Known before the arguments are parsed, so that even a usage error
+        // reaches a host that asked for JSON as an `error` event.
+        let json = args
+            .windows(2)
+            .any(|w| w[0] == "--format" && w[1] == "json");
+        if json {
+            report_panics_as_json();
+        }
         let mut process: Option<String> = None;
         let mut pid: Option<u32> = None;
         let mut profile_files: Vec<String> = Vec::new();
@@ -281,19 +313,19 @@ JSON OUTPUT:
             match a.as_str() {
                 "--process" | "-p" => match it.next() {
                     Some(name) => process = Some(name.clone()),
-                    None => return usage_err(WATCH_USAGE, "--process needs an executable name"),
+                    None => return usage(json, "--process needs an executable name"),
                 },
                 "--pid" => match it.next().and_then(|s| s.parse().ok()) {
                     Some(n) => pid = Some(n),
-                    None => return usage_err(WATCH_USAGE, "--pid needs a numeric process id"),
+                    None => return usage(json, "--pid needs a numeric process id"),
                 },
                 "--profile" => match it.next() {
                     Some(f) => profile_files.push(f.clone()),
-                    None => return usage_err(WATCH_USAGE, "--profile needs a path"),
+                    None => return usage(json, "--profile needs a path"),
                 },
                 "--profiles" => match it.next() {
                     Some(dir) => profiles_dir = Some(dir.clone()),
-                    None => return usage_err(WATCH_USAGE, "--profiles needs a directory"),
+                    None => return usage(json, "--profiles needs a directory"),
                 },
                 "--once" => once = true,
                 // Refused rather than ignored: an unreadable `--for` used to
@@ -301,30 +333,30 @@ JSON OUTPUT:
                 // negative one panicked on its way into a `Duration`.
                 "--for" => match it.next().map(|s| super::parse_seconds(s)) {
                     Some(Ok(secs)) => for_secs = Some(secs),
-                    Some(Err(why)) => return usage_err(WATCH_USAGE, &format!("--for {why}")),
-                    None => return usage_err(WATCH_USAGE, "--for needs a number of seconds"),
+                    Some(Err(why)) => return usage(json, &format!("--for {why}")),
+                    None => return usage(json, "--for needs a number of seconds"),
                 },
                 "--tick" => match it.next().and_then(|s| s.parse().ok()) {
                     Some(n) => tick_ms = n,
-                    None => return usage_err(WATCH_USAGE, "--tick needs a millisecond count"),
+                    None => return usage(json, "--tick needs a millisecond count"),
                 },
                 "--format" => match it.next().map(String::as_str) {
                     Some("human") => format = Format::Human,
                     Some("json") => format = Format::Json,
                     Some(other) => {
-                        return usage_err(
-                            WATCH_USAGE,
+                        return usage(
+                            json,
                             &format!("unknown --format '{other}' (expected `human` or `json`)"),
                         )
                     }
-                    None => return usage_err(WATCH_USAGE, "--format needs `human` or `json`"),
+                    None => return usage(json, "--format needs `human` or `json`"),
                 },
                 "--no-resolve" => no_resolve = true,
                 "-h" | "--help" => {
                     print!("{WATCH_USAGE}");
                     return 0;
                 }
-                other => return usage_err(WATCH_USAGE, &format!("unexpected argument '{other}'")),
+                other => return usage(json, &format!("unexpected argument '{other}'")),
             }
         }
 
@@ -333,8 +365,9 @@ JSON OUTPUT:
             (Some(name), _) => match plat::find_pid(name) {
                 Some(p) => (p, name.to_string()),
                 None => {
-                    eprintln!("scry: no running process named '{name}'");
-                    return 2;
+                    let message = format!("no running process named '{name}'");
+                    eprintln!("scry: {message}");
+                    return fail(json, exit::NO_PROCESS, "no_such_process", &message);
                 }
             },
             (None, Some(p)) => {
@@ -342,10 +375,7 @@ JSON OUTPUT:
                 (p, name)
             }
             (None, None) => {
-                return usage_err(
-                    WATCH_USAGE,
-                    "a target is required: --process <name> or --pid <n>",
-                )
+                return usage(json, "a target is required: --process <name> or --pid <n>")
             }
         };
 
@@ -362,7 +392,12 @@ JSON OUTPUT:
                 }
                 Err(e) => {
                     eprintln!("scry: {f}: {e}");
-                    return 1;
+                    return fail(
+                        json,
+                        exit::ERROR,
+                        "profiles_unreadable",
+                        &format!("{f}: {e}"),
+                    );
                 }
             }
         }
@@ -376,15 +411,17 @@ JSON OUTPUT:
                 }
                 Err(e) => {
                     eprintln!("scry: {dir}: {e}");
-                    return 1;
+                    return fail(
+                        json,
+                        exit::ERROR,
+                        "profiles_unreadable",
+                        &format!("{dir}: {e}"),
+                    );
                 }
             }
         }
         if profiles.is_empty() {
-            return usage_err(
-                WATCH_USAGE,
-                "at least one --profile or --profiles is required",
-            );
+            return usage(json, "at least one --profile or --profiles is required");
         }
 
         // Open the target.
@@ -393,7 +430,8 @@ JSON OUTPUT:
             Err(e) => {
                 eprintln!("scry: cannot open pid {pid}: {e}");
                 eprintln!("      (a game may need this run elevated / as administrator)");
-                return 1;
+                let message = format!("cannot open pid {pid}: {e}");
+                return fail(json, exit::ERROR, "attach_failed", &message);
             }
         };
 
@@ -401,16 +439,17 @@ JSON OUTPUT:
         // caller; otherwise the memory decides, exactly as a host would in prod.
         let chosen: &Profile = if no_resolve {
             if profiles.len() != 1 {
-                return usage_err(WATCH_USAGE, "--no-resolve needs exactly one --profile");
+                return usage(json, "--no-resolve needs exactly one --profile");
             }
             &profiles[0]
         } else {
             if name.is_empty() {
-                eprintln!(
-                    "scry: could not read the executable name for pid {pid}; \
+                let message = format!(
+                    "could not read the executable name for pid {pid}; \
                      pass --process <name>, or --no-resolve with a single profile"
                 );
-                return 1;
+                eprintln!("scry: {message}");
+                return fail(json, exit::ERROR, "attach_failed", &message);
             }
             match resolver::fitting(&backend, &name, &profiles) {
                 Ok(fits) if !fits.is_empty() => {
@@ -440,11 +479,13 @@ JSON OUTPUT:
                          This is the fail-safe: a profile's probe must resolve in \
                          the target's memory to claim it."
                     );
-                    return 3;
+                    let message = format!("no profile fits '{name}' (pid {pid})");
+                    return fail(json, exit::NO_PROFILE_FITS, "no_profile_fits", &message);
                 }
                 Err(e) => {
                     eprintln!("scry: resolver failed: {e}");
-                    return 1;
+                    let message = format!("resolver failed: {e}");
+                    return fail(json, exit::ERROR, "resolver_failed", &message);
                 }
             }
         };
@@ -523,6 +564,71 @@ JSON OUTPUT:
             std::thread::sleep(config.base_tick);
             print_diff(session.poll(start.elapsed()), start.elapsed(), format);
         }
+    }
+
+    /// The exit status of `scry`, part of what a host driving it may rely on.
+    /// Documented under EXIT STATUS in `--help` and in the README; a new code
+    /// may be added, an existing one never changes meaning.
+    mod exit {
+        /// A usage error, an unreadable profile, a target that cannot be
+        /// opened, a failed resolver or selftest: anything with no code of its
+        /// own.
+        pub const ERROR: i32 = 1;
+        /// No running process has the `--process` name.
+        pub const NO_PROCESS: i32 = 2;
+        /// No profile's probe resolved in the target: the fail-safe.
+        pub const NO_PROFILE_FITS: i32 = 3;
+        /// `scry scan` found no match for the signature.
+        pub const NOT_FOUND: i32 = 4;
+    }
+
+    /// End `watch` with a known failure: in JSON mode, say so on stdout first.
+    ///
+    /// The stderr line each caller prints stays as it was, for a person. This is
+    /// the machine-readable twin, because a host only sees an exit status
+    /// otherwise, and "no profile fits" (a verdict on the game, worth backing
+    /// off from), "cannot open the process" (worth retrying elevated) and a
+    /// crash all looked alike to it. `code` is a stable identifier; `message`
+    /// is for logs and may change.
+    fn fail(json: bool, exit_code: i32, code: &str, message: &str) -> i32 {
+        if json {
+            emit(&serde_json::json!({
+                "event": "error",
+                "code": code,
+                "message": message,
+                "exit_code": exit_code,
+            }));
+        }
+        exit_code
+    }
+
+    /// A `watch` usage error: the usual stderr text, and an `error` event with
+    /// code `usage` in JSON mode.
+    fn usage(json: bool, message: &str) -> i32 {
+        usage_err(WATCH_USAGE, message);
+        fail(json, exit::ERROR, "usage", message)
+    }
+
+    /// In JSON mode, turn a panic into a last `error` event (code `internal`)
+    /// before the process exits with 101, so a host reading only stdout can
+    /// tell a crash from a clean end. The default hook still prints the panic
+    /// to stderr. The write ignores errors: a hook that panicked itself would
+    /// abort instead of exiting.
+    fn report_panics_as_json() {
+        let default = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            default(info);
+            use std::io::Write;
+            let event = serde_json::json!({
+                "event": "error",
+                "code": "internal",
+                "message": info.to_string(),
+                "exit_code": 101,
+            });
+            let mut out = std::io::stdout().lock();
+            let _ = writeln!(out, "{event}");
+            let _ = out.flush();
+        }));
     }
 
     /// How to name a profile in a diagnostic: the file it came from when there
@@ -675,7 +781,7 @@ USAGE:
                 Some(p) => (p, name.to_string()),
                 None => {
                     eprintln!("scry: no running process named '{name}'");
-                    return 2;
+                    return exit::NO_PROCESS;
                 }
             },
             (None, Some(p)) => (p, plat::process_name(p).unwrap_or_default()),
@@ -697,7 +803,7 @@ USAGE:
             }
             Ok(None) => {
                 eprintln!("scry: signature not found in {name} (pid {pid})");
-                4
+                exit::NOT_FOUND
             }
             Err(e) => {
                 eprintln!("scry: scan failed: {e}");
