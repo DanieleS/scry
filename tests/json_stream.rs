@@ -228,7 +228,7 @@ fn a_target_that_exits_ends_the_stream() {
             "60",
         ])
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
         .expect("spawn scry watch");
 
@@ -247,18 +247,23 @@ fn a_target_that_exits_ends_the_stream() {
         );
         std::thread::sleep(Duration::from_millis(50));
     };
-    assert_eq!(
-        status.code(),
-        Some(5),
-        "exit status for a target that exited"
-    );
-
     let mut stdout = String::new();
     scry.stdout
         .take()
         .unwrap()
         .read_to_string(&mut stdout)
         .expect("read stdout");
+    let mut stderr = String::new();
+    scry.stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut stderr)
+        .expect("read stderr");
+    assert_eq!(
+        status.code(),
+        Some(5),
+        "exit status for a target that exited\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
     let last: serde_json::Value =
         serde_json::from_str(stdout.lines().last().expect("some output")).expect("JSON line");
     assert_eq!(last["event"], "detached", "{stdout}");
