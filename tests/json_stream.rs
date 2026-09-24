@@ -29,7 +29,12 @@ struct Scratch(PathBuf);
 
 impl Scratch {
     fn new() -> Self {
-        let dir = std::env::temp_dir().join(format!("scry-json-{}", std::process::id()));
+        // One directory per instance, not per process: tests in one binary run in
+        // parallel, and a shared directory let one test's files be overwritten, or
+        // removed by another test's drop, while it was still reading them.
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("scry-json-{}-{n}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("create scratch dir");
         Scratch(dir)
     }
