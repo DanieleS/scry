@@ -50,6 +50,7 @@ fn collection_reads_an_enemy_hp_list_from_the_cavia() {
         match_: ident(&ready.exe),
         watches: vec![Watch::Collection {
             name: "enemy_hp".to_string(),
+            emit: true,
             base: Base::Tier1 {
                 module: ready.exe.clone(),
                 offsets: vec![enemies_offset, 0],
@@ -115,6 +116,7 @@ fn collection_reads_records_per_enemy_from_the_cavia() {
         match_: ident(&ready.exe),
         watches: vec![Watch::Collection {
             name: "enemies".to_string(),
+            emit: true,
             base: Base::Tier1 {
                 module: ready.exe.clone(),
                 offsets: vec![enemies_offset, 0],
@@ -162,6 +164,7 @@ fn collection_reads_the_ordered_party_roster_as_strings() {
         match_: ident(&ready.exe),
         watches: vec![Watch::Collection {
             name: "party".to_string(),
+            emit: true,
             base: Base::Tier1 {
                 module: ready.exe.clone(),
                 offsets: vec![roster_offset, 0],
@@ -208,6 +211,7 @@ fn scalar_string_watch_reads_a_character_identity() {
         match_: ident(&ready.exe),
         watches: vec![Watch::Tier1 {
             name: "hero".to_string(),
+            emit: true,
             module: ready.exe.clone(),
             // Resolve to the reference slot; the string type derefs from there.
             offsets: vec![name_offset],

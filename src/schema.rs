@@ -28,20 +28,21 @@
 
 use serde_json::{json, Map, Value as Json};
 
-use crate::profile::{Field, Profile, ValueType, Watch};
+use crate::profile::{watch_emits, Field, Profile, ValueType, Watch};
 
 /// The dialect every schema produced here declares.
 pub const DIALECT: &str = "https://json-schema.org/draft/2020-12/schema";
 
 /// The JSON Schema of the `values` object `profile` produces: one optional,
-/// nullable property per watch.
+/// nullable property per emitted watch. An internal watch (`emit: false`) never
+/// reaches the stream, so it is no part of the contract either.
 ///
 /// When the profile declares a contract, its id and version are carried in
 /// `$id`, `title` and a machine-readable `x-contract` object, so a schema file
 /// that has been copied somewhere still says which contract it describes.
 pub fn values_schema(profile: &Profile) -> Json {
     let mut properties = Map::new();
-    for w in &profile.watches {
+    for w in profile.watches.iter().filter(|w| watch_emits(w)) {
         let (name, schema) = watch_schema(w, &profile.watches);
         properties.insert(name.to_string(), schema);
     }
@@ -241,6 +242,23 @@ mod tests {
                 "{name} must be nullable: an unreadable watch is null"
             );
         }
+    }
+
+    /// An internal watch never reaches the stream, so it has no place in the
+    /// contract; what is computed from it does.
+    #[test]
+    fn an_internal_watch_is_left_out_of_the_schema() {
+        let schema = values_schema(&profile(
+            r#"{ "match": { "process": "g", "module": "g", "probe": "90" },
+                 "watches": [
+                   { "tier": "tier1", "name": "hp", "module": "g", "offsets": [0],
+                     "type": "i32", "emit": false },
+                   { "tier": "derived", "name": "hp_percent", "type": "f32",
+                     "value": { "div": [{ "watch": "hp" }, { "const": 100 }] } }
+                 ] }"#,
+        ));
+        let props = schema["properties"].as_object().expect("properties");
+        assert_eq!(props.keys().collect::<Vec<_>>(), ["hp_percent"]);
     }
 
     #[test]

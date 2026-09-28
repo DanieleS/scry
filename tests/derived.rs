@@ -38,6 +38,7 @@ fn ident(exe: &str) -> Match {
 fn stat(name: &str, exe: &str, player_offset: i64, field: i64) -> Watch {
     Watch::Tier1 {
         name: name.to_string(),
+        emit: true,
         module: exe.to_string(),
         offsets: vec![player_offset, field],
         ty: ValueType::I32,
@@ -49,6 +50,7 @@ fn stat(name: &str, exe: &str, player_offset: i64, field: i64) -> Watch {
 fn derived(name: &str, ty: ValueType, value: &str) -> Watch {
     Watch::Derived {
         name: name.to_string(),
+        emit: true,
         ty,
         each: None,
         value: serde_json::from_str(value).expect("parse expression"),
@@ -60,6 +62,7 @@ fn derived(name: &str, ty: ValueType, value: &str) -> Watch {
 fn enemy_hp(exe: &str, enemies_offset: i64) -> Watch {
     Watch::Collection {
         name: "enemy_hp".to_string(),
+        emit: true,
         base: Base::Tier1 {
             module: exe.to_string(),
             offsets: vec![enemies_offset, 0],
@@ -97,6 +100,7 @@ fn enemies(exe: &str, enemies_offset: i64) -> Watch {
     );
     Watch::Collection {
         name: "enemies".to_string(),
+        emit: true,
         base: Base::Tier1 {
             module: exe.to_string(),
             offsets: vec![enemies_offset, 0],
