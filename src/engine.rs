@@ -261,6 +261,19 @@ enum ElementReader {
     Record(RecordFields),
 }
 
+/// How a collection learns how many elements it has: [`Watch::Collection`]'s
+/// `count` chain or its fixed `len`, exactly one of which a validated profile
+/// sets.
+enum Size {
+    /// Read a 32-bit count at the end of this chain from the container.
+    Count(Vec<i64>),
+    /// Always this many; nothing is read.
+    Fixed(usize),
+    /// Neither was given. Only a hand-built, unvalidated profile gets here, and
+    /// its list reads as unavailable rather than as an invented empty one.
+    Missing,
+}
+
 /// What a watch does once its anchor is resolved: read one typed value, iterate
 /// a container into an array, or read named fields off a base. The per-tier
 /// difference (how the anchor is *found*) lives in [`AnchorKind`]; this is the
@@ -273,7 +286,7 @@ enum Reader {
     /// then iterate. Field meaning mirrors [`Watch::Collection`].
     Collection {
         base: Vec<i64>,
-        count: Vec<i64>,
+        size: Size,
         items: Option<Vec<i64>>,
         first: i64,
         stride: i64,
@@ -951,7 +964,7 @@ fn sample_one<B: MemoryBackend + ?Sized>(
         },
         Reader::Collection {
             base,
-            count,
+            size,
             items,
             first,
             stride,
@@ -968,15 +981,22 @@ fn sample_one<B: MemoryBackend + ?Sized>(
             // Size the list. If the count can't be read we can't know how many
             // elements to walk, so the whole watch is unavailable (a per-element
             // failure is different — that stays local to the element).
-            let n = match backend
-                .resolve(container, count)
-                .and_then(|a| backend.read_i32(a))
-            {
-                // Clamped to the ceiling as well as to `max`: a validated profile
-                // cannot exceed it, but a hand-built one can, and `n` is about to
-                // size an allocation from a number read out of untrusted memory.
-                Ok(raw) => (raw.max(0) as usize).min(*max).min(MAX_COLLECTION_LEN),
-                Err(_) => return Value::Unavailable,
+            let n = match size {
+                Size::Count(count) => match backend
+                    .resolve(container, count)
+                    .and_then(|a| backend.read_i32(a))
+                {
+                    // Clamped to the ceiling as well as to `max`: a validated
+                    // profile cannot exceed it, but a hand-built one can, and `n`
+                    // is about to size an allocation from a number read out of
+                    // untrusted memory.
+                    Ok(raw) => (raw.max(0) as usize).min(*max).min(MAX_COLLECTION_LEN),
+                    Err(_) => return Value::Unavailable,
+                },
+                // Not read from memory, but clamped the same way: a hand-built
+                // profile can still say more than it may.
+                Size::Fixed(len) => (*len).min(*max).min(MAX_COLLECTION_LEN),
+                Size::Missing => return Value::Unavailable,
             };
             // Find the element region: the backing array an `items` chain points
             // at (dereferenced), or the container itself for a bare pointer array.
@@ -1088,6 +1108,7 @@ impl<B: MemoryBackend> Session<B> {
                     name,
                     base,
                     count,
+                    len,
                     items,
                     first,
                     stride,
@@ -1108,12 +1129,20 @@ impl<B: MemoryBackend> Session<B> {
                         Some(fields) => ElementReader::Record(flatten_fields(fields)),
                         None => ElementReader::Scalar(ty.unwrap_or(ValueType::U64)),
                     };
+                    // Count-XOR-len, likewise guaranteed by validation. A fixed
+                    // length wins over a count should a hand-built profile carry
+                    // both, since it is the one that cannot fail to read.
+                    let size = match (count, len) {
+                        (_, Some(len)) => Size::Fixed(*len),
+                        (Some(count), None) => Size::Count(count.clone()),
+                        (None, None) => Size::Missing,
+                    };
                     (
                         name.clone(),
                         Some(kind),
                         Reader::Collection {
                             base: base_offsets,
-                            count: count.clone(),
+                            size,
                             items: items.clone(),
                             first: *first,
                             stride: *stride,
@@ -2041,7 +2070,8 @@ mod tests {
                 module: "fake".to_string(),
                 offsets: vec![0x100],
             },
-            count: vec![0x8],
+            count: Some(vec![0x8]),
+            len: None,
             items: Some(vec![0x0]),
             first: 0x20,
             stride: 8,
@@ -2110,6 +2140,140 @@ mod tests {
             s.poll(Duration::ZERO).get("capped"),
             Some(&Value::List(vec![Value::I32(11), Value::I32(22)])),
             "count must be clamped to max"
+        );
+    }
+
+    /// A static table of three inline records at 0x100, 0x10 bytes apart, with
+    /// no count anywhere: a one-byte level at +0 and an `i32` HP at +4. The
+    /// shape of a native game's character table.
+    fn fixed_table_watch(len: Option<usize>, max: usize) -> Watch {
+        let fields = BTreeMap::from([
+            (
+                "level".to_string(),
+                Field {
+                    offsets: vec![0x0],
+                    ty: ValueType::U8,
+                },
+            ),
+            (
+                "hp".to_string(),
+                Field {
+                    offsets: vec![0x4],
+                    ty: ValueType::I32,
+                },
+            ),
+        ]);
+        Watch::Collection {
+            name: "characters".to_string(),
+            base: Base::Tier1 {
+                module: "fake".to_string(),
+                offsets: vec![0x100],
+            },
+            count: None,
+            len,
+            items: None,
+            first: 0,
+            stride: 0x10,
+            element: vec![],
+            ty: None,
+            fields: Some(fields),
+            max,
+            rate_hz: None,
+        }
+    }
+
+    fn plant_fixed_table(fake: &Fake) {
+        for (i, (level, hp)) in [(17u8, 1134), (17, 1672), (12, 930)].iter().enumerate() {
+            let at = 0x100 + i * 0x10;
+            // The byte after the level is garbage, as it is in a real table: a
+            // `u8` must read the one byte and not its neighbours.
+            fake.write_bytes(at, &[*level, 0x04, 0x00, 0x01]);
+            fake.write_i32(at + 4, *hp);
+        }
+    }
+
+    fn character(level: u8, hp: i32) -> Value {
+        Value::Map(BTreeMap::from([
+            ("level".to_string(), Value::U8(level)),
+            ("hp".to_string(), Value::I32(hp)),
+        ]))
+    }
+
+    #[test]
+    fn a_fixed_len_collection_reads_a_table_with_no_count() {
+        let fake = Rc::new(Fake::new(0x600));
+        plant_fixed_table(&fake);
+        let profile = Profile {
+            label: None,
+            contract: None,
+            contract_version: None,
+            match_: ident(),
+            watches: vec![fixed_table_watch(Some(3), 9)],
+        };
+        let mut s = Session::attach(Rc::clone(&fake), &profile, Config::default());
+        assert_eq!(
+            s.poll(Duration::ZERO).get("characters"),
+            Some(&Value::List(vec![
+                character(17, 1134),
+                character(17, 1672),
+                character(12, 930)
+            ])),
+            "a fixed `len` sizes the list without reading a count"
+        );
+
+        // It is still read every tick like any list: a change re-diffs it.
+        fake.write_i32(0x124, 931);
+        assert_eq!(
+            s.poll(Duration::from_millis(100)).get("characters"),
+            Some(&Value::List(vec![
+                character(17, 1134),
+                character(17, 1672),
+                character(12, 931)
+            ]))
+        );
+    }
+
+    /// Validation refuses a `len` above `max`, but a hand-built profile is not
+    /// validated, so the engine clamps a fixed length exactly as it clamps a
+    /// count read from memory.
+    #[test]
+    fn a_fixed_len_is_clamped_to_max_in_an_unvalidated_profile() {
+        let fake = Rc::new(Fake::new(0x600));
+        plant_fixed_table(&fake);
+        let profile = Profile {
+            label: None,
+            contract: None,
+            contract_version: None,
+            match_: ident(),
+            watches: vec![fixed_table_watch(Some(3), 2)],
+        };
+        let mut s = Session::attach(Rc::clone(&fake), &profile, Config::default());
+        assert_eq!(
+            s.poll(Duration::ZERO).get("characters"),
+            Some(&Value::List(vec![
+                character(17, 1134),
+                character(17, 1672)
+            ]))
+        );
+    }
+
+    /// Neither a `count` nor a `len`: only a hand-built profile can say that, and
+    /// its list cannot be sized, so it is unavailable, not an empty list.
+    #[test]
+    fn a_collection_with_no_size_is_unavailable() {
+        let fake = Rc::new(Fake::new(0x600));
+        plant_fixed_table(&fake);
+        let profile = Profile {
+            label: None,
+            contract: None,
+            contract_version: None,
+            match_: ident(),
+            watches: vec![fixed_table_watch(None, 9)],
+        };
+        let mut s = Session::attach(Rc::clone(&fake), &profile, Config::default());
+        assert_eq!(
+            s.poll(Duration::ZERO).get("characters"),
+            Some(&Value::Unavailable)
         );
     }
 
@@ -2267,7 +2431,8 @@ mod tests {
                     module: "fake".to_string(),
                     offsets: vec![0x100],
                 },
-                count: vec![0x8],
+                count: Some(vec![0x8]),
+                len: None,
                 items: Some(vec![0x0]),
                 first: 0x20,
                 stride: 8,
@@ -2846,7 +3011,8 @@ mod tests {
                 module: "fake".to_string(),
                 offsets: vec![0x100],
             },
-            count: vec![0x8],
+            count: Some(vec![0x8]),
+            len: None,
             items: Some(vec![0x0]),
             first: 0x20,
             stride: 8,
@@ -3080,7 +3246,8 @@ mod tests {
                     module: "fake".to_string(),
                     offsets: vec![0x100],
                 },
-                count: vec![0x8],
+                count: Some(vec![0x8]),
+                len: None,
                 items: Some(vec![0x0]),
                 first: 0x20,
                 stride: 8,

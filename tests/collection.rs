@@ -54,7 +54,8 @@ fn collection_reads_an_enemy_hp_list_from_the_cavia() {
                 module: ready.exe.clone(),
                 offsets: vec![enemies_offset, 0],
             },
-            count: vec![0x8],       // List.count
+            count: Some(vec![0x8]), // List.count
+            len: None,
             items: Some(vec![0x0]), // List.items -> backing array
             first: 0x20,            // array header before element 0
             stride: 8,              // pointer array
@@ -118,7 +119,8 @@ fn collection_reads_records_per_enemy_from_the_cavia() {
                 module: ready.exe.clone(),
                 offsets: vec![enemies_offset, 0],
             },
-            count: vec![0x8],
+            count: Some(vec![0x8]),
+            len: None,
             items: Some(vec![0x0]),
             first: 0x20,
             stride: 8,
@@ -164,7 +166,8 @@ fn collection_reads_the_ordered_party_roster_as_strings() {
                 module: ready.exe.clone(),
                 offsets: vec![roster_offset, 0],
             },
-            count: vec![0x8],
+            count: Some(vec![0x8]),
+            len: None,
             items: Some(vec![0x0]),
             first: 0x20,
             stride: 8,

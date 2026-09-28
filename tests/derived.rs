@@ -64,7 +64,8 @@ fn enemy_hp(exe: &str, enemies_offset: i64) -> Watch {
             module: exe.to_string(),
             offsets: vec![enemies_offset, 0],
         },
-        count: vec![0x8],       // List.count
+        count: Some(vec![0x8]), // List.count
+        len: None,
         items: Some(vec![0x0]), // List.items -> backing array
         first: 0x20,            // array header before element 0
         stride: 8,              // pointer array
@@ -100,7 +101,8 @@ fn enemies(exe: &str, enemies_offset: i64) -> Watch {
             module: exe.to_string(),
             offsets: vec![enemies_offset, 0],
         },
-        count: vec![0x8],
+        count: Some(vec![0x8]),
+        len: None,
         items: Some(vec![0x0]),
         first: 0x20,
         stride: 8,

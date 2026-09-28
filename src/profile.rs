@@ -855,7 +855,8 @@ pub enum Watch {
     /// — so the runtime stays structurally read-only and dependency-free.
     ///
     /// Resolution each tick: walk [`base`](Watch::Collection::base) to the
-    /// container; read [`count`](Watch::Collection::count) (clamped to
+    /// container; read [`count`](Watch::Collection::count), or take the fixed
+    /// [`len`](Watch::Collection::len) (either clamped to
     /// [`max`](Watch::Collection::max)); find the element region — the array a
     /// [`items`](Watch::Collection::items) chain points at (dereferenced), or the
     /// container itself when `items` is absent; then for `i in 0..count` read the
@@ -870,9 +871,22 @@ pub enum Watch {
         /// How to reach the container (list object / array). See [`Base`].
         base: Base,
         /// Chain from the container to the 32-bit element count. Clamped to
-        /// `max`; a negative count reads as zero.
-        #[serde(deserialize_with = "hexnum::de_vec_i64")]
-        count: Vec<i64>,
+        /// `max`; a negative count reads as zero. Exactly one of `count` and
+        /// [`len`](Watch::Collection::len) is set — enforced when the profile is
+        /// parsed.
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "hexnum::de_opt_vec_i64"
+        )]
+        count: Option<Vec<i64>>,
+        /// A fixed element count, for a container that stores none: a static
+        /// table in a native game (one record per character, a party of three
+        /// slots) has a length only the code knows. Nothing is read to size the
+        /// list. At most [`max`](Watch::Collection::max), checked when the
+        /// profile is parsed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        len: Option<usize>,
         /// Optional chain from the container to the backing-array *pointer*,
         /// which is dereferenced to reach the elements (the C# `List<T>` shape:
         /// `list.items`). Absent means the elements live at the container itself
@@ -1214,6 +1228,32 @@ impl Profile {
                     "watch {name:?} is declared more than once; every watch needs its own name, \
                      whatever its tier"
                 )));
+            }
+            if let Watch::Collection {
+                count, len, max, ..
+            } = w
+            {
+                match (count, len) {
+                    (Some(_), Some(_)) => {
+                        return Err(Error::BadProfile(format!(
+                            "collection {name:?}: has both `count` and `len`; a list is sized \
+                             either by a count read from memory or by a fixed length, not both"
+                        )));
+                    }
+                    (None, None) => {
+                        return Err(Error::BadProfile(format!(
+                            "collection {name:?}: needs either a `count` (a chain to the \
+                             element count) or a `len` (a fixed number of elements)"
+                        )));
+                    }
+                    (None, Some(len)) if len > max => {
+                        return Err(Error::BadProfile(format!(
+                            "collection {name:?}: `len` {len} is above its `max` {max}; a fixed \
+                             length the cap would cut short is a contradiction, not a list"
+                        )));
+                    }
+                    _ => {}
+                }
             }
             match w {
                 Watch::Collection { max, .. } if *max > MAX_COLLECTION_LEN => {
@@ -1917,7 +1957,8 @@ mod tests {
                     module: "GameAssembly.dll".to_string(),
                     offsets: vec![0x38BB238, 0],
                 },
-                count: vec![0x18],
+                count: Some(vec![0x18]),
+                len: None,
                 items: Some(vec![0x10]),
                 first: 0x20,
                 stride: 8,
@@ -2179,6 +2220,85 @@ mod tests {
         }
         "#;
         assert!(Profile::from_json(json).is_err());
+    }
+
+    /// A collection over a static table, sized by `size` (the JSON of a `count`
+    /// and/or `len`, or nothing) and capped at `max`.
+    fn sized_collection(size: &str, max: usize) -> Result<Profile> {
+        Profile::from_json(&format!(
+            r#"{{ "match": {{ "process": "g", "module": "g", "probe": "90" }},
+                  "watches": [
+                    {{ "tier": "collection", "name": "characters",
+                       "base": {{ "tier": "tier1", "module": "g", "offsets": ["0x6FF46B0"] }},
+                       {size} "stride": "0x100",
+                       "fields": {{ "level": {{ "offsets": [0], "type": "u8" }},
+                                    "hp": {{ "offsets": ["0x10"], "type": "i32" }} }},
+                       "max": {max} }}
+                  ] }}"#
+        ))
+    }
+
+    #[test]
+    fn a_fixed_len_collection_deserializes_and_round_trips() {
+        let p = sized_collection(r#""len": 9,"#, 9).expect("parse");
+        match &p.watches[0] {
+            Watch::Collection {
+                count, len, max, ..
+            } => {
+                assert_eq!(*count, None, "a fixed-length list has no count chain");
+                assert_eq!(*len, Some(9));
+                assert_eq!(*max, 9);
+            }
+            other => panic!("expected a collection, got {other:?}"),
+        }
+        // `count` stays out of the serialized form rather than appearing as null,
+        // and the profile survives the round trip unchanged.
+        let json = p.to_json().unwrap();
+        assert!(!json.contains("count"), "no count should be written: {json}");
+        assert_eq!(Profile::from_json(&json).unwrap(), p);
+    }
+
+    #[test]
+    fn a_counted_collection_still_round_trips_without_a_len() {
+        let p = sized_collection(r#""count": ["0x58"],"#, 9).expect("parse");
+        match &p.watches[0] {
+            Watch::Collection { count, len, .. } => {
+                assert_eq!(*count, Some(vec![0x58]));
+                assert_eq!(*len, None);
+            }
+            other => panic!("expected a collection, got {other:?}"),
+        }
+        let json = p.to_json().unwrap();
+        assert!(!json.contains("\"len\""), "no len should be written: {json}");
+        assert_eq!(Profile::from_json(&json).unwrap(), p);
+    }
+
+    #[test]
+    fn collection_rejects_both_count_and_len() {
+        let err = sized_collection(r#""count": [0], "len": 3,"#, 9)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("characters"), "error should name the watch: {err}");
+        assert!(
+            err.contains("`count`") && err.contains("`len`"),
+            "error should name both fields: {err}"
+        );
+    }
+
+    #[test]
+    fn collection_rejects_neither_count_nor_len() {
+        let err = sized_collection("", 9).unwrap_err().to_string();
+        assert!(err.contains("characters"), "error should name the watch: {err}");
+        assert!(err.contains("`len`"), "error should offer a len: {err}");
+    }
+
+    #[test]
+    fn collection_rejects_a_len_above_its_max() {
+        let err = sized_collection(r#""len": 10,"#, 9).unwrap_err().to_string();
+        assert!(err.contains("characters"), "error should name the watch: {err}");
+        assert!(err.contains("above its `max`"), "error should say why: {err}");
+        // A len equal to the cap is the ordinary case, not an edge to refuse.
+        assert!(sized_collection(r#""len": 9,"#, 9).is_ok());
     }
 
     /// A profile carrying one derived watch, wrapped around the minimum

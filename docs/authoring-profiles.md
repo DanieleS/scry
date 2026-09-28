@@ -217,6 +217,7 @@ Fields:
 |---|---|
 | `base` | how to reach the container — a nested `{ "tier": "tier1"/"tier2", … }`, same shapes as a scalar watch, whose `offsets` end at the list object / array |
 | `count` | chain from the container to the 32-bit element count (clamped to `max`) |
+| `len` | a **fixed** element count, for a container that stores none; set exactly one of `count` and `len`, and `len` at most `max` |
 | `items` | *optional* chain to the backing-array **pointer** (dereferenced); omit it when the elements live at the container itself (a bare pointer array) |
 | `first` | byte offset to element 0 within the element region (an array header); default `0` |
 | `stride` | bytes between consecutive elements (a pointer array → `8`) |
@@ -246,10 +247,27 @@ from the container and each element's HP reached through the entity:
   "count": [16], "stride": 8, "element": ["0x0", "0x58"], "type": "i32", "max": 64 }
 ```
 
+A managed list knows its own length; a native game's static tables usually do
+not. One record per character in a fixed array, three party slots in a row: the
+length lives in the code that walks them, and nothing in memory says it. For
+those, `len` replaces `count`, and nothing is read to size the list. Final
+Fantasy VII Rebirth keeps its active party as three one-byte indices in the
+executable's own data, with `0x10` for an empty slot:
+
+```json
+{ "tier": "collection", "name": "party_slots",
+  "base": { "tier": "tier1", "module": "ff7rebirth_.exe", "offsets": ["0x70D4815"] },
+  "len": 3, "stride": 1, "type": "u8", "max": 3 }
+```
+
+Don't reach for `len` when a count exists. A fixed length over a list that can
+shrink reads stale elements past its real end; a count read from memory is the
+list's own word for how long it is.
+
 Per-element resolution is **fail-soft**: a broken element is `unavailable` in
 place without sinking the list. A base/count/items failure makes the whole watch
 `unavailable` — the list can't be sized or located, so there is nothing honest to
-emit.
+emit. A list sized by `len` has no count to fail.
 
 ## Records (named fields off one base)
 
