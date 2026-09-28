@@ -31,6 +31,7 @@ fn cavia_profile(exe: &str, player_offset: i64) -> Profile {
         label: Some("cavia".to_string()),
         contract: None,
         contract_version: None,
+        fname_pool: None,
         match_: Match {
             process: exe.to_string(),
             module: exe.to_string(),

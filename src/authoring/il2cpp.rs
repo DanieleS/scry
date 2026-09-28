@@ -708,6 +708,7 @@ pub fn convert(spec: &ConvertSpec, symbols: &Symbols) -> Result<Profile, Convert
         label: spec.label.clone(),
         contract: spec.contract.clone(),
         contract_version: spec.contract_version,
+        fname_pool: None,
         match_: Match {
             process: spec.process.clone(),
             module: spec.module.clone(),

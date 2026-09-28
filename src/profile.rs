@@ -182,12 +182,22 @@ pub enum ValueType {
 
 impl ValueType {
     /// The concrete [`StringLayout`] for a [`String`](ValueType::String) type
-    /// (expanding a preset), or `None` for the numeric types.
+    /// (expanding a preset), or `None` for the numeric types and for an
+    /// [`fname`](StringPreset::Fname), which is looked up rather than laid out.
     pub fn string_layout(self) -> Option<StringLayout> {
         match self {
-            ValueType::String(spec) => Some(spec.layout()),
+            ValueType::String(spec) => spec.layout(),
             _ => None,
         }
+    }
+
+    /// Whether this type reads an Unreal `FName`, and so needs the profile's
+    /// [`fname_pool`](Profile::fname_pool).
+    pub fn is_fname(self) -> bool {
+        matches!(
+            self,
+            ValueType::String(StringSpec::Preset(StringPreset::Fname))
+        )
     }
 }
 
@@ -205,39 +215,94 @@ pub enum StringSpec {
 
 impl StringSpec {
     /// Resolve to the concrete [`StringLayout`] the engine reads with, expanding
-    /// a preset to its known offsets.
-    pub fn layout(self) -> StringLayout {
+    /// a preset to its known offsets. `None` for an [`fname`](StringPreset::Fname),
+    /// whose text is not at the address at all but in the engine's name table.
+    pub fn layout(self) -> Option<StringLayout> {
         match self {
             StringSpec::Preset(p) => p.layout(),
-            StringSpec::Layout(l) => l,
+            StringSpec::Layout(l) => Some(l),
         }
     }
 }
 
-/// A named string layout for an engine whose shape we've validated. IL2CPP is
-/// the first and (today) only one — a *peer* entry here, not a privileged
-/// default. New engines earn a preset once validated against a real target;
-/// until then they use an explicit [`StringLayout`].
+/// A named string shape for an engine whose representation we've validated —
+/// *peer* entries here, not a privileged default. New engines earn a preset
+/// once validated against a real target; until then they use an explicit
+/// [`StringLayout`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum StringPreset {
     /// IL2CPP `System.String`: a reference to an object holding a 32-bit UTF-16
     /// code-unit count at `+0x10` and the payload at `+0x14`.
     Il2cpp,
+    /// An Unreal `FName` (4.23 and later, UE5 included): a 32-bit index into the
+    /// engine's name table and a 32-bit instance number, read at the address and
+    /// looked up in the profile's [`fname_pool`](Profile::fname_pool). It reads
+    /// as `Name`, or `Name_<n-1>` when the number is `n > 0`, the way Unreal
+    /// prints one. Identifiers, not display text: a level, a class, a state.
+    Fname,
 }
 
 impl StringPreset {
-    /// The concrete layout this preset stands for.
-    pub fn layout(self) -> StringLayout {
+    /// The concrete layout this preset stands for, or `None` for a preset that
+    /// is not a layout at all ([`Fname`](StringPreset::Fname)).
+    pub fn layout(self) -> Option<StringLayout> {
         match self {
-            StringPreset::Il2cpp => StringLayout {
+            StringPreset::Il2cpp => Some(StringLayout {
                 encoding: StringEncoding::Utf16,
                 len_at: Some(0x10),
                 chars_at: 0x14,
                 deref: true,
-            },
+            }),
+            StringPreset::Fname => None,
         }
     }
+}
+
+/// Where an Unreal game keeps its name table (`FNamePool`), and the two ways a
+/// build's entries can differ from stock Unreal. Declared once per profile, in
+/// [`Profile::fname_pool`], and needed by every [`fname`](StringPreset::Fname).
+///
+/// The pool is a static in the game's executable, so `blocks` is an ordinary
+/// [`Base`]: a module offset or a signature, whose chain ends at the pool's
+/// `Blocks` array — the array of pointers to the chunks of name entries (in
+/// stock Unreal, `FNamePool + 0x10`).
+///
+/// An `FName` index splits into a block (its top 16 bits) and an offset within
+/// that block (its low 16 bits, in units of `entry_align` bytes). `header_at`
+/// bytes into the entry is a 16-bit header: bit 0 set means UTF-16 characters,
+/// and the top 10 bits are the length in characters, which follow the header.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FNamePool {
+    /// How to reach the `Blocks` array.
+    pub blocks: Base,
+    /// Bytes per unit of an entry's offset within its block: `2` in stock
+    /// Unreal, whose entries are 2-byte aligned. A build that stores more before
+    /// each header aligns its entries wider.
+    #[serde(
+        default = "default_entry_align",
+        skip_serializing_if = "is_default_entry_align",
+        deserialize_with = "hexnum::de_i64"
+    )]
+    pub entry_align: i64,
+    /// Bytes from the start of an entry to its 16-bit header: `0` in stock
+    /// Unreal. Final Fantasy VII Rebirth stores a 4-byte hash first.
+    #[serde(
+        default,
+        skip_serializing_if = "is_zero",
+        deserialize_with = "hexnum::de_i64"
+    )]
+    pub header_at: i64,
+}
+
+/// Stock Unreal aligns name entries to 2 bytes.
+fn default_entry_align() -> i64 {
+    2
+}
+
+/// `skip_serializing_if` helper: the stock alignment stays implicit.
+fn is_default_entry_align(n: &i64) -> bool {
+    *n == default_entry_align()
 }
 
 /// Text encoding of a string's payload.
@@ -1207,6 +1272,12 @@ pub struct Profile {
     #[serde(rename = "match")]
     pub match_: Match,
 
+    /// Where an Unreal game's name table is, for the watches that read an
+    /// [`fname`](StringPreset::Fname). Required by any such watch, and pointless
+    /// without one; absent for every other game.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fname_pool: Option<FNamePool>,
+
     /// The values to read once this profile is selected.
     pub watches: Vec<Watch>,
 }
@@ -1253,6 +1324,15 @@ impl Profile {
         // evaluation order falls out of declaration order.
         let mut earlier: Vec<&Watch> = Vec::with_capacity(self.watches.len());
         for w in &self.watches {
+            // An `fname` is looked up in the game's name table, and a profile
+            // that never says where that is could only ever read unavailable.
+            if self.fname_pool.is_none() && watch_types(w).iter().any(|ty| ty.is_fname()) {
+                return Err(Error::BadProfile(format!(
+                    "watch {:?} reads an `fname`, but the profile declares no `fname_pool` to \
+                     look it up in",
+                    watch_name(w)
+                )));
+            }
             // A name is the key a value is emitted under, and the key a derived
             // watch reads it back by. Two watches sharing one would overwrite
             // each other in the snapshot every tick, so the diff would never
@@ -1453,6 +1533,19 @@ pub fn watch_emits(w: &Watch) -> bool {
     }
 }
 
+/// Every type a watch reads with: its own, its element's, or its fields'.
+fn watch_types(w: &Watch) -> Vec<ValueType> {
+    match w {
+        Watch::Tier1 { ty, .. } | Watch::Tier2 { ty, .. } | Watch::Derived { ty, .. } => vec![*ty],
+        Watch::Record { fields, .. } => fields.values().map(|f| f.ty).collect(),
+        Watch::Collection { ty, fields, .. } => ty
+            .iter()
+            .copied()
+            .chain(fields.iter().flat_map(|f| f.values().map(|f| f.ty)))
+            .collect(),
+    }
+}
+
 /// The label a watch emits under, whichever kind it is.
 fn watch_name(w: &Watch) -> &str {
     match w {
@@ -1623,6 +1716,7 @@ mod tests {
             label: Some("Example Game (Steam)".to_string()),
             contract: None,
             contract_version: None,
+            fname_pool: None,
             match_: Match {
                 process: "game.exe".to_string(),
                 module: "game.exe".to_string(),
@@ -2372,6 +2466,76 @@ mod tests {
         );
         // A len equal to the cap is the ordinary case, not an edge to refuse.
         assert!(sized_collection(r#""len": 9,"#, 9).is_ok());
+    }
+
+    /// A profile around `watches` with an optional `fname_pool` block.
+    fn named(pool: &str, watches: &str) -> Result<Profile> {
+        Profile::from_json(&format!(
+            r#"{{ "match": {{ "process": "g", "module": "g", "probe": "90" }},
+                  {pool}
+                  "watches": [{watches}] }}"#
+        ))
+    }
+
+    const FF7_POOL: &str = r#""fname_pool": {
+        "blocks": { "tier": "tier1", "module": "g", "offsets": ["0x90D3C10"] },
+        "entry_align": 4, "header_at": 4 },"#;
+
+    #[test]
+    fn an_fname_pool_deserializes_and_round_trips() {
+        let p = named(
+            FF7_POOL,
+            r#"{ "tier": "tier1", "name": "location", "module": "g",
+                 "offsets": ["0x8F30420", "0x150", "0x304"], "type": { "string": "fname" } }"#,
+        )
+        .expect("parse");
+        let pool = p.fname_pool.as_ref().expect("pool");
+        assert_eq!(pool.entry_align, 4);
+        assert_eq!(pool.header_at, 4);
+        assert!(matches!(p.watches[0], Watch::Tier1 { ty, .. } if ty.is_fname()));
+        assert_eq!(Profile::from_json(&p.to_json().unwrap()).unwrap(), p);
+
+        // Stock Unreal's layout is the default, and stays implicit when written.
+        let stock = named(
+            r#""fname_pool": { "blocks": { "tier": "tier1", "module": "g", "offsets": [16] } },"#,
+            r#"{ "tier": "tier1", "name": "level", "module": "g", "offsets": [0],
+                 "type": { "string": "fname" } }"#,
+        )
+        .expect("parse");
+        let pool = stock.fname_pool.as_ref().expect("pool");
+        assert_eq!((pool.entry_align, pool.header_at), (2, 0));
+        let json = stock.to_json().unwrap();
+        assert!(
+            !json.contains("entry_align") && !json.contains("header_at"),
+            "{json}"
+        );
+    }
+
+    /// Wherever an `fname` is read — a scalar, a record field, a collection
+    /// element's field — the profile has to say where the name table is.
+    #[test]
+    fn an_fname_without_a_pool_is_rejected_wherever_it_is_read() {
+        for watch in [
+            r#"{ "tier": "tier1", "name": "level", "module": "g", "offsets": [0],
+                 "type": { "string": "fname" } }"#,
+            r#"{ "tier": "record", "name": "level",
+                 "base": { "tier": "tier1", "module": "g", "offsets": [0] },
+                 "fields": { "id": { "type": { "string": "fname" } } } }"#,
+            r#"{ "tier": "collection", "name": "level",
+                 "base": { "tier": "tier1", "module": "g", "offsets": [0] },
+                 "len": 2, "stride": 8, "max": 2,
+                 "fields": { "id": { "type": { "string": "fname" } } } }"#,
+        ] {
+            let err = named("", watch).unwrap_err().to_string();
+            assert!(
+                err.contains("\"level\"") && err.contains("fname_pool"),
+                "{err}"
+            );
+            assert!(
+                named(FF7_POOL, watch).is_ok(),
+                "with a pool it loads: {watch}"
+            );
+        }
     }
 
     #[test]

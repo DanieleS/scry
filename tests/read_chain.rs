@@ -101,6 +101,7 @@ fn tier2_rip_relative_watch_reads_hp_end_to_end() {
         label: Some("cavia (rip)".to_string()),
         contract: None,
         contract_version: None,
+        fname_pool: None,
         match_: Match {
             process: ready.exe.clone(),
             module: ready.exe.clone(),
