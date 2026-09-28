@@ -799,7 +799,8 @@ fn build_watch(
             Ok(Watch::Collection {
                 name: name.clone(),
                 base: build_base(name, base, symbols, default_module)?,
-                count: resolve_chain(name, count, symbols)?,
+                count: Some(resolve_chain(name, count, symbols)?),
+                len: None,
                 items,
                 first,
                 stride: resolve_entry(name, stride, symbols)?,
@@ -1366,6 +1367,7 @@ public class Next
                 name,
                 base,
                 count,
+                len,
                 items,
                 first,
                 stride,
@@ -1384,7 +1386,8 @@ public class Next
                         offsets: vec![0x38BB238, 0x28],         // literal + resolved `leader`
                     }
                 );
-                assert_eq!(count, &vec![0x18]);
+                assert_eq!(*count, Some(vec![0x18]));
+                assert_eq!(*len, None, "the converter always sizes by a count");
                 assert_eq!(*items, Some(vec![0x10]));
                 assert_eq!(*first, 0x20);
                 assert_eq!(*stride, 8);
