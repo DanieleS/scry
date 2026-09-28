@@ -718,10 +718,16 @@ EXIT STATUS:
 
     fn fmt_value(v: &Value) -> String {
         match v {
+            Value::I8(n) => n.to_string(),
+            Value::U8(n) => n.to_string(),
+            Value::I16(n) => n.to_string(),
+            Value::U16(n) => n.to_string(),
             Value::I32(n) => n.to_string(),
             Value::U32(n) => n.to_string(),
             Value::F32(x) => x.to_string(),
+            Value::I64(n) => n.to_string(),
             Value::U64(n) => n.to_string(),
+            Value::Bool(b) => b.to_string(),
             // Quote strings so an empty or space-bearing value is visible.
             Value::Str(s) => format!("{s:?}"),
             // Render a collection as its elements, comma-separated — each element

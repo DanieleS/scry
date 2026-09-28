@@ -241,7 +241,9 @@ contiguous token present in memory — see the note in step 4.
 - `rip` (Tier-2, optional) is a RIP-relative decode `{ "disp", "len" }` applied to
   the anchor before the chain is walked — the x64 static-base shape. Omit it and
   the AOB hit is the chain start. See [`Rip`](../src/profile.rs).
-- `type` is `i32`, `u32`, `f32`, `u64`, or a `string`. For IL2CPP use the preset
+- `type` is `i8`, `u8`, `i16`, `u16`, `i32`, `u32`, `i64`, `u64`, `f32`,
+  `bool`, or a `string`. A C# `byte`/`sbyte`/`short`/`ushort`/`long` maps to
+  `u8`/`i8`/`i16`/`u16`/`i64`, and a `bool` to `bool`. For IL2CPP use the preset
   `{ "string": "il2cpp" }`; other engines give an explicit layout — see
   `docs/authoring-profiles.md` → *Strings*.
 - `rate_hz` (optional) is the per-watch sample rate; omit for "every base tick".

@@ -96,6 +96,25 @@ Offsets accept **hex strings or decimal**, mixed freely — paste what CE shows.
 The RIP decode computes `base = anchor + len + i32_at(anchor + disp)`, then
 `offsets` walk from there (each dereferenced except the last).
 
+`type` says how many bytes to read at the end of the chain and how to read them.
+All numbers are little-endian:
+
+| `type` | bytes | reads as |
+|---|---|---|
+| `i8` / `u8` | 1 | signed / unsigned integer |
+| `i16` / `u16` | 2 | signed / unsigned integer |
+| `i32` / `u32` | 4 | signed / unsigned integer |
+| `i64` / `u64` | 8 | signed / unsigned integer |
+| `f32` | 4 | IEEE float; a `NaN` is emitted as `null` |
+| `bool` | 1 | `0` is `false`, `1` is `true`; **any other byte is `unavailable`** |
+| `{ "string": … }` | varies | text — see [Strings](#strings) |
+
+Pick the width the game actually stores. Reading a 1-byte field as `i32` picks
+up the three bytes next to it, and the number looks plausible until they change.
+A `bool` is strict on purpose: a byte of `2` or `0xFF` is a torn read or not a
+flag at all, and turning it into `true` would hide that. A field that uses any
+non-zero byte as "on" is a `u8`, compared with `ne: 0`.
+
 Any watch may add a `rate_hz` to sample less often than the loop's base tick
 (slow state like a zone name needs far fewer reads than HP). It must lie between
 `0.01` (once every 100 s) and `1000`; leave it out to sample every tick. A rate
@@ -202,7 +221,7 @@ Fields:
 | `first` | byte offset to element 0 within the element region (an array header); default `0` |
 | `stride` | bytes between consecutive elements (a pointer array → `8`) |
 | `element` | per-element chain from a slot to the value; empty means the slot *is* the value's address |
-| `type` | element type (`i32` … or a `string` — see [Strings](#strings)) |
+| `type` | element type (any [value type](#4-write-the-profile), a `string` included — see [Strings](#strings)) |
 | `max` | hard cap — a garbage count can neither allocate nor loop unboundedly; at most `4096` |
 
 The C# `List<T>` shape (validated against Sea of Stars — `items` at `+0x10`,
@@ -311,7 +330,7 @@ expression it is just a number, a string, a list or a map.
 
 | field | meaning |
 |---|---|
-| `type` | the output type — `i32`, `u32`, `f32`, `u64`. **Never a string**: this is an arithmetic result |
+| `type` | the output type — any integer type, `f32` or `bool`. **Never a string**: this is an arithmetic result |
 | `each` | *optional*; names a `collection` declared earlier. The expression runs once per element and the watch emits a list |
 | `value` | the expression (below) |
 
@@ -353,7 +372,10 @@ Each compares one field of the element against a literal:
 
 `eq`, `ne`, `lt`, `le`, `gt`, `ge`. Numbers compare numerically; strings only
 under `eq`/`ne` (an ordering on text would be a collation policy the engine has
-no business having). Clauses stay flat — no nesting, no boolean algebra, no `or`.
+no business having). A `bool` field is tested with a JSON boolean,
+`{ "field": "alive", "eq": true }`, again under `eq`/`ne` only; a boolean
+literal against a field that is not a `bool` is undecidable, so the fold is
+`unavailable`. Clauses stay flat — no nesting, no boolean algebra, no `or`.
 A profile that genuinely needs `or` is a signal to reconsider the profile, not to
 extend the language.
 
@@ -371,7 +393,12 @@ the discriminant is the profile's job exactly as it is for every other field.
 - The expression evaluates in `f64`, then coerces to `type`. Integer types
   truncate toward zero. A non-finite result, or one outside the target's range,
   is `unavailable` — **never a saturated number**, which would be a lie a
-  consumer can't detect.
+  consumer can't detect. A `bool` output holds only `0` and `1` (after
+  truncation); anything else is `unavailable` too.
+- A `bool` input counts as the `0` or `1` it is stored as, so
+  `{"add": [{"watch": "a"}, {"watch": "b"}]}` counts flags that are set.
+- An `i64` or `u64` input beyond 2^53 loses precision in `f64`. That is exact
+  enough for a counter, not for an ID.
 - **Any** referenced watch that is missing, `unavailable`, or the wrong shape
   (indexing a scalar, keying a list, a field that isn't a number where arithmetic
   needs one) makes the whole expression `unavailable`.

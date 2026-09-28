@@ -146,10 +146,19 @@ fn is_false(b: &bool) -> bool {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ValueType {
+    I8,
+    U8,
+    I16,
+    U16,
     I32,
     U32,
     F32,
+    I64,
     U64,
+    /// One byte, `0` for `false` and `1` for `true`. Any other byte is not an
+    /// honest boolean — torn, uninitialised, or not a bool at all — and reads as
+    /// unavailable rather than being guessed into `true`.
+    Bool,
     /// A text string. Unlike the numeric types, a string's bytes are not a fixed
     /// field: its length, encoding, char offset, and whether it lives behind a
     /// pointer all vary **by engine** (IL2CPP, Mono, native C, Unreal `FString`,
@@ -742,9 +751,10 @@ impl<'de> Deserialize<'de> for Clause {
 
 /// The comparison a [`Clause`] applies, named by its JSON key.
 ///
-/// Numbers compare numerically; strings compare only under `eq`/`ne`, because
-/// an ordering on text would be a collation policy the engine has no business
-/// having an opinion about.
+/// Numbers compare numerically; strings and booleans compare only under
+/// `eq`/`ne`, because an ordering on text would be a collation policy the engine
+/// has no business having an opinion about, and `true > false` is a convention
+/// nobody writes a filter to lean on.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Compare {
@@ -762,7 +772,7 @@ pub enum Compare {
     Ge(Literal),
 }
 
-/// The right-hand side of a [`Clause`]: a bare JSON number or string.
+/// The right-hand side of a [`Clause`]: a bare JSON number, boolean or string.
 ///
 /// No hex-string form here, unlike every offset in a profile: a clause's operand
 /// is genuinely sometimes text (`"eq": "PlayerAddStatModifier"`), and quietly
@@ -770,6 +780,10 @@ pub enum Compare {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum Literal {
+    /// A boolean, compared for identity against a
+    /// [`Bool`](crate::engine::Value::Bool) reading. It orders under nothing but
+    /// `eq`/`ne`, like text.
+    Bool(bool),
     /// A number, compared numerically against the field's reading.
     Num(f64),
     /// A string, compared for identity against a
@@ -1387,7 +1401,7 @@ fn check_derived(
 ) -> Result<()> {
     if matches!(ty, ValueType::String(_)) {
         return Err(Error::BadProfile(format!(
-            "derived {name:?}: `type` must be a number — a derived watch is an arithmetic \
+            "derived {name:?}: `type` must be a number or `bool` — a derived watch is an arithmetic \
              result, never text"
         )));
     }
@@ -2395,6 +2409,47 @@ mod tests {
             "error should name the watch: {err}"
         );
         assert!(err.contains("add"), "…and the operator: {err}");
+    }
+
+    /// Every scalar tag is its lowercase Rust name and survives a round-trip.
+    #[test]
+    fn every_scalar_type_tag_parses_and_round_trips() {
+        let tags = [
+            ("i8", ValueType::I8),
+            ("u8", ValueType::U8),
+            ("i16", ValueType::I16),
+            ("u16", ValueType::U16),
+            ("i32", ValueType::I32),
+            ("u32", ValueType::U32),
+            ("f32", ValueType::F32),
+            ("i64", ValueType::I64),
+            ("u64", ValueType::U64),
+            ("bool", ValueType::Bool),
+        ];
+        for (tag, ty) in tags {
+            let parsed: ValueType = serde_json::from_str(&format!("{tag:?}")).expect(tag);
+            assert_eq!(parsed, ty, "{tag}");
+            assert_eq!(serde_json::to_string(&ty).unwrap(), format!("{tag:?}"));
+        }
+    }
+
+    /// A derived watch may be a flag, and a clause may test one by value — a
+    /// JSON `true` stays a boolean rather than being read as a number.
+    #[test]
+    fn a_derived_bool_and_a_bool_literal_parse() {
+        let p = derived_profile(
+            r#"{ "tier": "derived", "name": "alive", "type": "bool", "value": { "const": 1 } }"#,
+        )
+        .expect("a derived bool is a valid output type");
+        assert!(matches!(
+            p.watches.last(),
+            Some(Watch::Derived {
+                ty: ValueType::Bool,
+                ..
+            })
+        ));
+        let clause: Clause = serde_json::from_str(r#"{ "field": "alive", "eq": true }"#).unwrap();
+        assert_eq!(clause.test, Compare::Eq(Literal::Bool(true)));
     }
 
     #[test]

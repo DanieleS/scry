@@ -67,6 +67,26 @@ pub trait MemoryBackend {
         8
     }
 
+    fn read_u8(&self, addr: u64) -> Result<u8> {
+        let mut b = [0u8; 1];
+        self.read_bytes(addr, &mut b)?;
+        Ok(b[0])
+    }
+
+    fn read_i8(&self, addr: u64) -> Result<i8> {
+        Ok(self.read_u8(addr)? as i8)
+    }
+
+    fn read_u16(&self, addr: u64) -> Result<u16> {
+        let mut b = [0u8; 2];
+        self.read_bytes(addr, &mut b)?;
+        Ok(u16::from_le_bytes(b))
+    }
+
+    fn read_i16(&self, addr: u64) -> Result<i16> {
+        Ok(self.read_u16(addr)? as i16)
+    }
+
     fn read_u32(&self, addr: u64) -> Result<u32> {
         let mut b = [0u8; 4];
         self.read_bytes(addr, &mut b)?;
@@ -85,6 +105,10 @@ pub trait MemoryBackend {
         let mut b = [0u8; 8];
         self.read_bytes(addr, &mut b)?;
         Ok(u64::from_le_bytes(b))
+    }
+
+    fn read_i64(&self, addr: u64) -> Result<i64> {
+        Ok(self.read_u64(addr)? as i64)
     }
 
     /// Read a pointer-sized value and widen it to `u64`.

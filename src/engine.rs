@@ -80,10 +80,16 @@ use crate::profile::{
 /// derived: see the [`PartialEq`] impl for how floats compare.
 #[derive(Debug, Clone)]
 pub enum Value {
+    I8(i8),
+    U8(u8),
+    I16(i16),
+    U16(u16),
     I32(i32),
     U32(u32),
     F32(f32),
+    I64(i64),
     U64(u64),
+    Bool(bool),
     /// A decoded string (per the watch's [`StringLayout`]). A null reference
     /// reads as the empty string, not `Unavailable`.
     Str(String),
@@ -121,12 +127,18 @@ pub enum Value {
 impl PartialEq for Value {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
+            (Value::I8(a), Value::I8(b)) => a == b,
+            (Value::U8(a), Value::U8(b)) => a == b,
+            (Value::I16(a), Value::I16(b)) => a == b,
+            (Value::U16(a), Value::U16(b)) => a == b,
             (Value::I32(a), Value::I32(b)) => a == b,
             (Value::U32(a), Value::U32(b)) => a == b,
             (Value::F32(a), Value::F32(b)) => {
                 a.to_bits() == b.to_bits() || (a.is_nan() && b.is_nan())
             }
+            (Value::I64(a), Value::I64(b)) => a == b,
             (Value::U64(a), Value::U64(b)) => a == b,
+            (Value::Bool(a), Value::Bool(b)) => a == b,
             (Value::Str(a), Value::Str(b)) => a == b,
             (Value::List(a), Value::List(b)) => a == b,
             (Value::Map(a), Value::Map(b)) => a == b,
@@ -141,7 +153,7 @@ impl Eq for Value {}
 /// The **wire form** of a value: the shape a host outside this process sees.
 ///
 /// Deliberately *untagged* — a number serialises as a bare JSON number, a string
-/// as a string, a list as an array, a record as an object, and
+/// as a string, a boolean as `true`/`false`, a list as an array, a record as an object, and
 /// [`Unavailable`](Value::Unavailable) as `null`. The variant name is not on the
 /// wire because the consumer already knows it: the watch's `type` is declared in
 /// the profile it loaded. Tagging every reading (`{"I32": 42}`) would put that
@@ -158,10 +170,16 @@ impl Eq for Value {}
 impl serde::Serialize for Value {
     fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
         match self {
+            Value::I8(n) => s.serialize_i8(*n),
+            Value::U8(n) => s.serialize_u8(*n),
+            Value::I16(n) => s.serialize_i16(*n),
+            Value::U16(n) => s.serialize_u16(*n),
             Value::I32(n) => s.serialize_i32(*n),
             Value::U32(n) => s.serialize_u32(*n),
             Value::F32(x) => s.serialize_f32(*x),
+            Value::I64(n) => s.serialize_i64(*n),
             Value::U64(n) => s.serialize_u64(*n),
+            Value::Bool(b) => s.serialize_bool(*b),
             Value::Str(v) => s.serialize_str(v),
             // Both delegate: `Vec<Value>`/`BTreeMap<String, Value>` are already
             // serialisable once `Value` is, so nesting comes out right for free.
@@ -370,10 +388,21 @@ const STRING_MAX_BYTES: usize = 1024;
 /// becomes `Unavailable`, never a partial or guessed number.
 fn read_typed<B: MemoryBackend + ?Sized>(backend: &B, addr: u64, ty: ValueType) -> Value {
     let read = match ty {
+        ValueType::I8 => backend.read_i8(addr).map(Value::I8),
+        ValueType::U8 => backend.read_u8(addr).map(Value::U8),
+        ValueType::I16 => backend.read_i16(addr).map(Value::I16),
+        ValueType::U16 => backend.read_u16(addr).map(Value::U16),
         ValueType::I32 => backend.read_i32(addr).map(Value::I32),
         ValueType::U32 => backend.read_u32(addr).map(Value::U32),
         ValueType::F32 => backend.read_f32(addr).map(Value::F32),
+        ValueType::I64 => backend.read_i64(addr).map(Value::I64),
         ValueType::U64 => backend.read_u64(addr).map(Value::U64),
+        // Only 0 and 1 are a boolean; any other byte is not guessed into `true`.
+        ValueType::Bool => backend.read_u8(addr).map(|b| match b {
+            0 => Value::Bool(false),
+            1 => Value::Bool(true),
+            _ => Value::Unavailable,
+        }),
         ValueType::String(spec) => read_string(backend, addr, spec.layout()).map(Value::Str),
     };
     read.unwrap_or(Value::Unavailable)
@@ -536,6 +565,11 @@ enum FoldKind {
 /// rounded maximum would admit a value that cannot round-trip.
 const U64_LIMIT: f64 = 18_446_744_073_709_551_616.0;
 
+/// 2^63, the `i64` counterpart of [`U64_LIMIT`]: `i64::MAX as f64` rounds up to
+/// it, so it bounds an `i64` coercion exclusively. The lower end, `-2^63`, is
+/// exact and stays inclusive.
+const I64_LIMIT: f64 = 9_223_372_036_854_775_808.0;
+
 /// A reading as an `f64`, or `None` when it simply is not a number.
 ///
 /// A string, a list, a record or an `Unavailable` where arithmetic needs a
@@ -543,10 +577,17 @@ const U64_LIMIT: f64 = 18_446_744_073_709_551_616.0;
 /// expression unavailable rather than contributing a zero nobody read.
 fn number_of(value: &Value) -> Option<f64> {
     match value {
+        Value::I8(n) => Some(*n as f64),
+        Value::U8(n) => Some(*n as f64),
+        Value::I16(n) => Some(*n as f64),
+        Value::U16(n) => Some(*n as f64),
         Value::I32(n) => Some(*n as f64),
         Value::U32(n) => Some(*n as f64),
         Value::F32(x) => Some(*x as f64),
+        Value::I64(n) => Some(*n as f64),
         Value::U64(n) => Some(*n as f64),
+        // A flag counts as the 0/1 it is stored as, so `add` over flags counts them.
+        Value::Bool(b) => Some(u8::from(*b) as f64),
         Value::Str(_) | Value::List(_) | Value::Map(_) | Value::Unavailable => None,
     }
 }
@@ -748,11 +789,18 @@ fn compare(value: &Value, test: &Compare) -> Option<bool> {
     }
 }
 
-/// Identity against a literal: numbers numerically, strings textually. A number
-/// tested against a string reading (or the reverse) is undecidable, not `false`.
+/// Identity against a literal: numbers numerically, strings textually, booleans
+/// by value. A number tested against a string reading (or the reverse) is
+/// undecidable, not `false`; so is a boolean literal against anything but a
+/// boolean reading. A numeric literal against a boolean reading compares the 0/1
+/// it is stored as.
 fn equals(value: &Value, lit: &Literal) -> Option<bool> {
     match lit {
         Literal::Num(n) => Some(number_of(value)? == *n),
+        Literal::Bool(b) => match value {
+            Value::Bool(v) => Some(v == b),
+            _ => None,
+        },
         Literal::Text(s) => match value {
             Value::Str(v) => Some(v == s),
             _ => None,
@@ -760,12 +808,12 @@ fn equals(value: &Value, lit: &Literal) -> Option<bool> {
     }
 }
 
-/// Ordering against a **numeric** literal. Text orders under nothing but
-/// `eq`/`ne`, so a string operand is undecidable here rather than collated.
+/// Ordering against a **numeric** literal. Text and booleans order under nothing
+/// but `eq`/`ne`, so such an operand is undecidable here rather than collated.
 fn order(value: &Value, lit: &Literal) -> Option<Ordering> {
     match lit {
         Literal::Num(n) => number_of(value)?.partial_cmp(n),
-        Literal::Text(_) => None,
+        Literal::Text(_) | Literal::Bool(_) => None,
     }
 }
 
@@ -787,22 +835,50 @@ fn coerce(value: Option<f64>, ty: ValueType) -> Value {
             f if f.is_finite() => Value::F32(f),
             _ => Value::Unavailable,
         },
-        ValueType::I32 => match x.trunc() {
-            n if (i32::MIN as f64..=i32::MAX as f64).contains(&n) => Value::I32(n as i32),
-            _ => Value::Unavailable,
-        },
-        ValueType::U32 => match x.trunc() {
-            n if (0.0..=u32::MAX as f64).contains(&n) => Value::U32(n as u32),
+        ValueType::I8 => {
+            in_range(x, i8::MIN, i8::MAX).map_or(Value::Unavailable, |n| Value::I8(n as i8))
+        }
+        ValueType::U8 => {
+            in_range(x, u8::MIN, u8::MAX).map_or(Value::Unavailable, |n| Value::U8(n as u8))
+        }
+        ValueType::I16 => {
+            in_range(x, i16::MIN, i16::MAX).map_or(Value::Unavailable, |n| Value::I16(n as i16))
+        }
+        ValueType::U16 => {
+            in_range(x, u16::MIN, u16::MAX).map_or(Value::Unavailable, |n| Value::U16(n as u16))
+        }
+        ValueType::I32 => {
+            in_range(x, i32::MIN, i32::MAX).map_or(Value::Unavailable, |n| Value::I32(n as i32))
+        }
+        ValueType::U32 => {
+            in_range(x, u32::MIN, u32::MAX).map_or(Value::Unavailable, |n| Value::U32(n as u32))
+        }
+        ValueType::I64 => match x.trunc() {
+            n if (-I64_LIMIT..I64_LIMIT).contains(&n) => Value::I64(n as i64),
             _ => Value::Unavailable,
         },
         ValueType::U64 => match x.trunc() {
             n if (0.0..U64_LIMIT).contains(&n) => Value::U64(n as u64),
             _ => Value::Unavailable,
         },
+        // Exactly 0 or 1 after truncation, like any other integer type that holds
+        // only two values: a `2` is not quietly promoted to `true`.
+        ValueType::Bool => match x.trunc() {
+            0.0 => Value::Bool(false),
+            1.0 => Value::Bool(true),
+            _ => Value::Unavailable,
+        },
         // Unreachable in a validated profile — a derived watch may not declare a
         // string type — and still not a guess if a hand-built one does.
         ValueType::String(_) => Value::Unavailable,
     }
+}
+
+/// `x` truncated toward zero, if it lies within `[min, max]`. For every integer
+/// type up to 32 bits both bounds are exact in an `f64`, so the check is too.
+fn in_range<T: Into<f64>>(x: f64, min: T, max: T) -> Option<f64> {
+    let n = x.trunc();
+    (min.into()..=max.into()).contains(&n).then_some(n)
 }
 
 /// Evaluate a derived watch against the readings already in `last`.
@@ -1362,9 +1438,16 @@ mod tests {
     #[test]
     fn values_serialise_untagged() {
         let cases = [
+            (Value::I8(-8), "-8"),
+            (Value::U8(255), "255"),
+            (Value::I16(-16), "-16"),
+            (Value::U16(65535), "65535"),
             (Value::I32(-7), "-7"),
             (Value::U32(7), "7"),
+            (Value::I64(i64::MIN), "-9223372036854775808"),
             (Value::U64(u64::MAX), "18446744073709551615"),
+            (Value::Bool(true), "true"),
+            (Value::Bool(false), "false"),
             (Value::F32(1.5), "1.5"),
             (Value::Str("VALERE".into()), "\"VALERE\""),
             // The fail-soft state is `null`, not a missing key and not a zero: a
@@ -2430,6 +2513,153 @@ mod tests {
             ty: ValueType::I32,
             rate_hz: None,
         }
+    }
+
+    /// A Tier-1 watch of any type at `module_base + off`.
+    fn typed(name: &str, off: i64, ty: ValueType) -> Watch {
+        Watch::Tier1 {
+            name: name.to_string(),
+            module: "fake".to_string(),
+            offsets: vec![off],
+            ty,
+            rate_hz: None,
+        }
+    }
+
+    /// Every integer type reads exactly its own width, little-endian, with its
+    /// own signedness: the same bytes are a different number under each type, and
+    /// a narrow read must never pick up the byte next door.
+    #[test]
+    fn each_integer_type_reads_its_own_width_and_sign() {
+        let fake = Rc::new(Fake::new(64));
+        fake.write_bytes(0, &[0xFE, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]);
+        // A neighbour that would leak into a read one width too wide.
+        fake.write_bytes(8, &[0x2A, 0x01, 0x07]);
+        let p = profile(vec![
+            typed("i8", 0, ValueType::I8),
+            typed("u8", 0, ValueType::U8),
+            typed("i16", 0, ValueType::I16),
+            typed("u16", 0, ValueType::U16),
+            typed("i64", 0, ValueType::I64),
+            typed("u64", 0, ValueType::U64),
+            typed("u8_next", 8, ValueType::U8),
+            typed("u16_next", 8, ValueType::U16),
+        ]);
+        let mut s = Session::attach(Rc::clone(&fake), &p, Config::default());
+        let d = s.poll(Duration::ZERO);
+        assert_eq!(d.get("i8"), Some(&Value::I8(-2)));
+        assert_eq!(d.get("u8"), Some(&Value::U8(0xFE)));
+        assert_eq!(d.get("i16"), Some(&Value::I16(-2)));
+        assert_eq!(d.get("u16"), Some(&Value::U16(0xFFFE)));
+        assert_eq!(d.get("i64"), Some(&Value::I64(-2)));
+        assert_eq!(d.get("u64"), Some(&Value::U64(u64::MAX - 1)));
+        assert_eq!(d.get("u8_next"), Some(&Value::U8(0x2A)));
+        assert_eq!(d.get("u16_next"), Some(&Value::U16(0x012A)));
+    }
+
+    /// A bool is one byte that is either 0 or 1. Anything else is not guessed
+    /// into `true`: it is the torn or mistyped read that `Unavailable` exists for.
+    #[test]
+    fn a_bool_reads_only_zero_or_one() {
+        let fake = Rc::new(Fake::new(64));
+        fake.write_bytes(0, &[0, 1, 2, 0xFF]);
+        let p = profile(vec![
+            typed("off", 0, ValueType::Bool),
+            typed("on", 1, ValueType::Bool),
+            typed("two", 2, ValueType::Bool),
+            typed("ff", 3, ValueType::Bool),
+        ]);
+        let mut s = Session::attach(Rc::clone(&fake), &p, Config::default());
+        let d = s.poll(Duration::ZERO);
+        assert_eq!(d.get("off"), Some(&Value::Bool(false)));
+        assert_eq!(d.get("on"), Some(&Value::Bool(true)));
+        assert_eq!(d.get("two"), Some(&Value::Unavailable));
+        assert_eq!(d.get("ff"), Some(&Value::Unavailable));
+
+        // And it diffs like any value: flipping the flag is one change.
+        fake.write_bytes(0, &[1]);
+        let d = s.poll(Duration::from_millis(50));
+        assert_eq!(d.len(), 1);
+        assert_eq!(d.get("off"), Some(&Value::Bool(true)));
+    }
+
+    /// A derived result is held to the declared type's range, whatever its width:
+    /// a value it cannot hold is unavailable, never wrapped or saturated.
+    #[test]
+    fn derived_results_respect_each_types_range() {
+        let fake = Rc::new(Fake::new(64));
+        let cases: [(&str, ValueType, f64, Value); 16] = [
+            ("i8_max", ValueType::I8, 127.0, Value::I8(127)),
+            ("i8_over", ValueType::I8, 128.0, Value::Unavailable),
+            ("i8_min", ValueType::I8, -128.0, Value::I8(-128)),
+            ("u8_max", ValueType::U8, 255.9, Value::U8(255)),
+            ("u8_over", ValueType::U8, 256.0, Value::Unavailable),
+            ("u8_neg", ValueType::U8, -1.0, Value::Unavailable),
+            ("i16_min", ValueType::I16, -32768.0, Value::I16(i16::MIN)),
+            ("i16_under", ValueType::I16, -32769.0, Value::Unavailable),
+            ("u16_max", ValueType::U16, 65535.0, Value::U16(u16::MAX)),
+            ("u16_over", ValueType::U16, 65536.0, Value::Unavailable),
+            ("i64_min", ValueType::I64, -I64_LIMIT, Value::I64(i64::MIN)),
+            // 2^63 is the first value an i64 cannot hold — and what `i64::MAX`
+            // rounds to in an f64, which is why the bound is exclusive.
+            ("i64_over", ValueType::I64, I64_LIMIT, Value::Unavailable),
+            ("bool_false", ValueType::Bool, 0.0, Value::Bool(false)),
+            ("bool_true", ValueType::Bool, 1.7, Value::Bool(true)),
+            ("bool_two", ValueType::Bool, 2.0, Value::Unavailable),
+            ("bool_neg", ValueType::Bool, -1.0, Value::Unavailable),
+        ];
+        let watches = cases
+            .iter()
+            .map(|(name, ty, x, _)| derived(name, *ty, None, &format!(r#"{{ "const": {x:?} }}"#)))
+            .collect();
+        let mut s = Session::attach(Rc::clone(&fake), &profile(watches), Config::default());
+        let d = s.poll(Duration::ZERO);
+        for (name, _, x, expected) in &cases {
+            assert_eq!(d.get(*name), Some(expected), "{name}: {x}");
+        }
+    }
+
+    /// Flags join the expression language as the 0/1 they are stored as, and
+    /// `where` tests them by value: `"eq": true` against a bool, never against a
+    /// number, which is undecidable rather than a quiet `false`.
+    #[test]
+    fn bools_filter_and_count_in_expressions() {
+        let fake = Rc::new(Fake::new(64));
+        fake.write_bytes(0, &[1, 0, 1]);
+        fake.write_i32(4, 1);
+        let p = profile(vec![
+            typed("a", 0, ValueType::Bool),
+            typed("b", 1, ValueType::Bool),
+            typed("c", 2, ValueType::Bool),
+            tier1("one", 4, None),
+            derived(
+                "flags_set",
+                ValueType::U8,
+                None,
+                r#"{ "add": [{ "watch": "a" }, { "watch": "b" }, { "watch": "c" }] }"#,
+            ),
+            derived(
+                "any_set",
+                ValueType::Bool,
+                None,
+                r#"{ "max": [{ "watch": "a" }, { "watch": "b" }] }"#,
+            ),
+        ]);
+        let mut s = Session::attach(Rc::clone(&fake), &p, Config::default());
+        let d = s.poll(Duration::ZERO);
+        assert_eq!(d.get("flags_set"), Some(&Value::U8(2)));
+        assert_eq!(d.get("any_set"), Some(&Value::Bool(true)));
+
+        let yes = Literal::Bool(true);
+        assert_eq!(equals(&Value::Bool(true), &yes), Some(true));
+        assert_eq!(equals(&Value::Bool(false), &yes), Some(false));
+        assert_eq!(
+            equals(&Value::I32(1), &yes),
+            None,
+            "a bool literal only meets a bool"
+        );
+        assert_eq!(equals(&Value::Bool(true), &Literal::Num(1.0)), Some(true));
+        assert_eq!(order(&Value::Bool(true), &yes), None, "bools do not order");
     }
 
     #[test]

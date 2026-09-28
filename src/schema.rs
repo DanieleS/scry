@@ -124,26 +124,29 @@ fn watch_schema<'a>(w: &'a Watch, all: &[Watch]) -> (&'a str, Json) {
 /// game will produce; a view still clamps.
 fn scalar(ty: ValueType) -> Json {
     match ty {
-        ValueType::I32 => json!({
-            "type": ["integer", "null"],
-            "minimum": i32::MIN,
-            "maximum": i32::MAX,
-        }),
-        ValueType::U32 => json!({
-            "type": ["integer", "null"],
-            "minimum": 0,
-            "maximum": u32::MAX,
-        }),
-        ValueType::U64 => json!({
-            "type": ["integer", "null"],
-            "minimum": 0,
-            "maximum": u64::MAX,
-        }),
+        ValueType::I8 => integer(i8::MIN, i8::MAX),
+        ValueType::U8 => integer(u8::MIN, u8::MAX),
+        ValueType::I16 => integer(i16::MIN, i16::MAX),
+        ValueType::U16 => integer(u16::MIN, u16::MAX),
+        ValueType::I32 => integer(i32::MIN, i32::MAX),
+        ValueType::U32 => integer(u32::MIN, u32::MAX),
+        ValueType::I64 => integer(i64::MIN, i64::MAX),
+        ValueType::U64 => integer(u64::MIN, u64::MAX),
+        ValueType::Bool => json!({ "type": ["boolean", "null"] }),
         // A non-finite float already serialises as `null`, so a number that
         // arrives is always finite and needs no further constraint.
         ValueType::F32 => json!({ "type": ["number", "null"] }),
         ValueType::String(_) => json!({ "type": ["string", "null"] }),
     }
+}
+
+/// A nullable integer bounded by its type's range.
+fn integer<T: Into<Json>>(min: T, max: T) -> Json {
+    json!({
+        "type": ["integer", "null"],
+        "minimum": min.into(),
+        "maximum": max.into(),
+    })
 }
 
 /// A nullable object with every field present and each field nullable.
@@ -254,6 +257,34 @@ mod tests {
         assert_eq!(p["zone"], json!({ "type": ["string", "null"] }));
         // The derived tier types like any other scalar.
         assert_eq!(p["hp_percent"], json!({ "type": ["number", "null"] }));
+    }
+
+    /// Each integer type carries its own encodable range, and a bool is a JSON
+    /// boolean rather than a 0/1 integer.
+    #[test]
+    fn narrow_and_wide_types_carry_their_own_bounds() {
+        let schema = values_schema(&profile(
+            r#"{
+              "match": { "process": "g.exe", "module": "g.exe", "probe": "90" },
+              "watches": [
+                { "tier": "tier1", "name": "a", "module": "g.exe", "offsets": [0], "type": "i8" },
+                { "tier": "tier1", "name": "b", "module": "g.exe", "offsets": [0], "type": "u8" },
+                { "tier": "tier1", "name": "c", "module": "g.exe", "offsets": [0], "type": "i16" },
+                { "tier": "tier1", "name": "d", "module": "g.exe", "offsets": [0], "type": "u16" },
+                { "tier": "tier1", "name": "e", "module": "g.exe", "offsets": [0], "type": "i64" },
+                { "tier": "tier1", "name": "f", "module": "g.exe", "offsets": [0], "type": "bool" }
+              ]
+            }"#,
+        ));
+        let p = &schema["properties"];
+        let bounds = |name: &str| (p[name]["minimum"].clone(), p[name]["maximum"].clone());
+        assert_eq!(bounds("a"), (json!(i8::MIN), json!(i8::MAX)));
+        assert_eq!(bounds("b"), (json!(0), json!(u8::MAX)));
+        assert_eq!(bounds("c"), (json!(i16::MIN), json!(i16::MAX)));
+        assert_eq!(bounds("d"), (json!(0), json!(u16::MAX)));
+        assert_eq!(bounds("e"), (json!(i64::MIN), json!(i64::MAX)));
+        assert_eq!(p["e"]["type"], json!(["integer", "null"]));
+        assert_eq!(p["f"], json!({ "type": ["boolean", "null"] }));
     }
 
     #[test]
