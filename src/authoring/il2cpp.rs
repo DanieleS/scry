@@ -745,6 +745,7 @@ fn build_watch(
             rate_hz,
         } => Ok(Watch::Tier1 {
             name: name.clone(),
+            emit: true,
             module: module.clone().unwrap_or_else(|| default_module.to_string()),
             offsets: resolve_chain(name, chain, symbols)?,
             ty: *ty,
@@ -764,6 +765,7 @@ fn build_watch(
             })?;
             Ok(Watch::Tier2 {
                 name: name.clone(),
+                emit: true,
                 anchor: anchor.clone(),
                 rip: *rip,
                 offsets: resolve_chain(name, chain, symbols)?,
@@ -798,6 +800,7 @@ fn build_watch(
             };
             Ok(Watch::Collection {
                 name: name.clone(),
+                emit: true,
                 base: build_base(name, base, symbols, default_module)?,
                 count: Some(resolve_chain(name, count, symbols)?),
                 len: None,
@@ -818,6 +821,7 @@ fn build_watch(
             rate_hz,
         } => Ok(Watch::Record {
             name: name.clone(),
+            emit: true,
             base: build_base(name, base, symbols, default_module)?,
             fields: resolve_fields(name, fields, symbols)?,
             rate_hz: *rate_hz,
@@ -832,6 +836,7 @@ fn build_watch(
             rate_hz,
         } => Ok(Watch::Derived {
             name: name.clone(),
+            emit: true,
             ty: *ty,
             each: each.clone(),
             value: value.clone(),
@@ -1193,12 +1198,14 @@ public class Next
         match &profile.watches[0] {
             Watch::Tier1 {
                 name,
+                emit,
                 module,
                 offsets,
                 ty,
                 rate_hz,
             } => {
                 assert_eq!(name, "hp");
+                assert!(*emit, "a converted watch is emitted");
                 assert_eq!(module, "GameAssembly.dll"); // defaulted from the spec
                 assert_eq!(offsets, &vec![0x2C4E120, 16, 0x28, 0x18]);
                 assert_eq!(*ty, ValueType::I32);
@@ -1365,6 +1372,7 @@ public class Next
         match &profile.watches[0] {
             Watch::Collection {
                 name,
+                emit,
                 base,
                 count,
                 len,
@@ -1378,6 +1386,7 @@ public class Next
                 rate_hz,
             } => {
                 assert_eq!(name, "party_hp");
+                assert!(*emit, "a converted watch is emitted");
                 assert_eq!(*fields, None, "a scalar collection carries no fields");
                 assert_eq!(
                     *base,
@@ -1473,11 +1482,13 @@ public class Next
         match &profile.watches[0] {
             Watch::Record {
                 name,
+                emit,
                 base,
                 fields,
                 rate_hz,
             } => {
                 assert_eq!(name, "player");
+                assert!(*emit, "a converted watch is emitted");
                 assert_eq!(
                     *base,
                     Base::Tier1 {
@@ -1554,12 +1565,14 @@ public class Next
         match &profile.watches[2] {
             Watch::Derived {
                 name,
+                emit,
                 ty,
                 each,
                 value,
                 rate_hz,
             } => {
                 assert_eq!(name, "hp_percent");
+                assert!(*emit, "a converted watch is emitted");
                 assert_eq!(*ty, ValueType::F32);
                 assert_eq!(*each, None);
                 assert_eq!(*rate_hz, Some(4.0));

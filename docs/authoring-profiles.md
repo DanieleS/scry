@@ -447,6 +447,31 @@ also never count toward the failure streak that triggers a re-attach: they read
 no memory, so letting them vote would make a formula error look like a detached
 process.
 
+### Internal watches
+
+A derived value often needs inputs nobody downstream wants: the raw table a
+fold walks, the maximum a percentage divides by, a list of widgets searched for
+the one on screen. Give such a watch `"emit": false`. It is read on its
+schedule like any other and a derived watch can use it, but its value never
+goes into the stream, and `scry schema` leaves it out of the contract:
+
+```json
+{ "tier": "collection", "name": "inventory", "emit": false,
+  "base": { "tier": "tier1", "module": "ff7rebirth_.exe", "offsets": ["0x70440E8"] },
+  "len": 64, "stride": "0x20",
+  "fields": { "kind": { "offsets": [0], "type": "u32" },
+              "item": { "offsets": [8], "type": "u32" },
+              "qty":  { "offsets": ["0xC"], "type": "i32" } },
+  "max": 64 },
+{ "tier": "derived", "name": "gil", "type": "i32",
+  "value": { "max": { "watch": "inventory", "field": "qty",
+                      "where": [ { "field": "item", "eq": 1 } ] } } }
+```
+
+`emit` defaults to `true`, and a profile only ever writes it when it is `false`.
+An internal watch still costs its reads, so keep its `rate_hz` no higher than
+the fastest derived watch that uses it.
+
 ### Known limitation
 
 A collection element's fields must be scalars, so there is no way to hang a

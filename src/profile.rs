@@ -136,6 +136,17 @@ fn is_zero(n: &i64) -> bool {
     *n == 0
 }
 
+/// A watch is emitted unless it says otherwise.
+fn emitted() -> bool {
+    true
+}
+
+/// `skip_serializing_if` helper: `emit` is `true` by default and stays
+/// implicit, so a profile that never mentions it round-trips unchanged.
+fn is_emitted(emit: &bool) -> bool {
+    *emit
+}
+
 /// `skip_serializing_if` helper: `false` is the default and stays implicit.
 fn is_false(b: &bool) -> bool {
     !*b
@@ -810,6 +821,11 @@ pub enum Watch {
     Tier1 {
         /// Label for the value (e.g. `"hp"`), used by consumers downstream.
         name: String,
+        /// Whether the value goes out in the stream (and the schema). `false` keeps
+        /// a watch internal: it is read, and a derived watch can use it, but only
+        /// what is computed from it is emitted. Defaults to `true`.
+        #[serde(default = "emitted", skip_serializing_if = "is_emitted")]
+        emit: bool,
         /// Module whose load base anchors the chain.
         module: String,
         /// Pointer chain from the module base to the value's address.
@@ -830,6 +846,11 @@ pub enum Watch {
     Tier2 {
         /// Label for the value.
         name: String,
+        /// Whether the value goes out in the stream (and the schema). `false` keeps
+        /// a watch internal: it is read, and a derived watch can use it, but only
+        /// what is computed from it is emitted. Defaults to `true`.
+        #[serde(default = "emitted", skip_serializing_if = "is_emitted")]
+        emit: bool,
         /// AOB signature whose match address anchors the chain.
         anchor: String,
         /// Optional RIP-relative decode applied to the match address before the
@@ -868,6 +889,11 @@ pub enum Watch {
     Collection {
         /// Label for the value; the emitted snapshot value is an array.
         name: String,
+        /// Whether the value goes out in the stream (and the schema). `false` keeps
+        /// a watch internal: it is read, and a derived watch can use it, but only
+        /// what is computed from it is emitted. Defaults to `true`.
+        #[serde(default = "emitted", skip_serializing_if = "is_emitted")]
+        emit: bool,
         /// How to reach the container (list object / array). See [`Base`].
         base: Base,
         /// Chain from the container to the 32-bit element count. Clamped to
@@ -960,6 +986,11 @@ pub enum Watch {
         /// Label for the value; the emitted snapshot value is a map of field name
         /// to value.
         name: String,
+        /// Whether the value goes out in the stream (and the schema). `false` keeps
+        /// a watch internal: it is read, and a derived watch can use it, but only
+        /// what is computed from it is emitted. Defaults to `true`.
+        #[serde(default = "emitted", skip_serializing_if = "is_emitted")]
+        emit: bool,
         /// How to reach the record's base — the shared slot the fields are
         /// relative to. Anchored exactly like a scalar watch or a collection. See
         /// [`Base`].
@@ -997,6 +1028,11 @@ pub enum Watch {
     Derived {
         /// Label for the value.
         name: String,
+        /// Whether the value goes out in the stream (and the schema). `false` keeps
+        /// a watch internal: it is read, and a derived watch can use it, but only
+        /// what is computed from it is emitted. Defaults to `true`.
+        #[serde(default = "emitted", skip_serializing_if = "is_emitted")]
+        emit: bool,
         /// The output type. **Never a string**: this is an arithmetic result, and
         /// [`Profile::validate`] rejects a string type rather than emitting a
         /// number formatted behind the consumer's back.
@@ -1405,6 +1441,18 @@ fn check_rate(name: &str, rate_hz: Option<f64>) -> Result<()> {
     }
 }
 
+/// Whether a watch's value goes out in the stream and the schema, whichever
+/// kind it is. See `emit` on each [`Watch`] variant.
+pub fn watch_emits(w: &Watch) -> bool {
+    match w {
+        Watch::Tier1 { emit, .. }
+        | Watch::Tier2 { emit, .. }
+        | Watch::Collection { emit, .. }
+        | Watch::Record { emit, .. }
+        | Watch::Derived { emit, .. } => *emit,
+    }
+}
+
 /// The label a watch emits under, whichever kind it is.
 fn watch_name(w: &Watch) -> &str {
     match w {
@@ -1584,6 +1632,7 @@ mod tests {
             watches: vec![
                 Watch::Tier1 {
                     name: "hp".to_string(),
+                    emit: true,
                     module: "game.exe".to_string(),
                     offsets: vec![0x1234, 0x10, 0x0],
                     ty: ValueType::I32,
@@ -1591,6 +1640,7 @@ mod tests {
                 },
                 Watch::Tier2 {
                     name: "score".to_string(),
+                    emit: true,
                     anchor: "53 43 52 59 ?? ?? 11 22".to_string(),
                     // Left unset: this anchor's bytes are the chain start directly,
                     // and its omission from the serialized form is asserted below.
@@ -1675,6 +1725,7 @@ mod tests {
             p.watches[0],
             Watch::Tier2 {
                 name: "hp".to_string(),
+                emit: true,
                 anchor: "48 8B 05 ?? ?? ?? ?? 48 8B 88".to_string(),
                 rip: Some(Rip { disp: 3, len: 7 }),
                 offsets: vec![16, 0],
@@ -1953,6 +2004,7 @@ mod tests {
             p.watches[0],
             Watch::Collection {
                 name: "party_roster".to_string(),
+                emit: true,
                 base: Base::Tier1 {
                     module: "GameAssembly.dll".to_string(),
                     offsets: vec![0x38BB238, 0],
@@ -2132,6 +2184,7 @@ mod tests {
             p.watches[0],
             Watch::Record {
                 name: "player".to_string(),
+                emit: true,
                 base: Base::Tier1 {
                     module: "GameAssembly.dll".to_string(),
                     offsets: vec![0x2C4E120, 0],
@@ -2319,6 +2372,29 @@ mod tests {
         );
         // A len equal to the cap is the ordinary case, not an edge to refuse.
         assert!(sized_collection(r#""len": 9,"#, 9).is_ok());
+    }
+
+    #[test]
+    fn emit_defaults_to_true_and_only_false_is_written() {
+        let json = r#"
+        {
+          "match": { "process": "g", "module": "g", "probe": "90" },
+          "watches": [
+            { "tier": "tier1", "name": "hp", "module": "g", "offsets": [0],
+              "type": "i32", "emit": false },
+            { "tier": "tier1", "name": "gil", "module": "g", "offsets": [4],
+              "type": "i32" }
+          ]
+        }
+        "#;
+        let p = Profile::from_json(json).expect("parse");
+        assert!(!watch_emits(&p.watches[0]), "`emit: false` is kept");
+        assert!(watch_emits(&p.watches[1]), "a watch is emitted by default");
+
+        // The default stays implicit: only the internal watch says `emit`.
+        let out = p.to_json().unwrap();
+        assert_eq!(out.matches("\"emit\"").count(), 1, "{out}");
+        assert_eq!(Profile::from_json(&out).unwrap(), p);
     }
 
     /// A profile carrying one derived watch, wrapped around the minimum

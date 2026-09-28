@@ -318,6 +318,9 @@ enum Reader {
 /// A watch reduced to what the loop needs each tick, plus its schedule state.
 struct Scheduled {
     name: String,
+    /// Whether a change goes into the diff. An internal watch (`emit: false`) is
+    /// still sampled and kept in `last`, because a derived watch may read it.
+    emit: bool,
     /// How this watch's anchor is (re)found — `None` for a [`Reader::Derived`],
     /// which has no anchor at all because it reads no memory. Modelled as an
     /// absence rather than a stand-in [`AnchorKind`]: there is no address to
@@ -1070,9 +1073,10 @@ impl<B: MemoryBackend> Session<B> {
     pub fn attach(backend: B, profile: &Profile, config: Config) -> Self {
         let mut watches = Vec::with_capacity(profile.watches.len());
         for w in &profile.watches {
-            let (name, kind, reader, rate_hz) = match w {
+            let (name, kind, reader, rate_hz, emit) = match w {
                 Watch::Tier1 {
                     name,
+                    emit,
                     module,
                     offsets,
                     ty,
@@ -1085,9 +1089,11 @@ impl<B: MemoryBackend> Session<B> {
                         ty: *ty,
                     },
                     *rate_hz,
+                    *emit,
                 ),
                 Watch::Tier2 {
                     name,
+                    emit,
                     anchor,
                     rip,
                     offsets,
@@ -1103,9 +1109,11 @@ impl<B: MemoryBackend> Session<B> {
                         ty: *ty,
                     },
                     *rate_hz,
+                    *emit,
                 ),
                 Watch::Collection {
                     name,
+                    emit,
                     base,
                     count,
                     len,
@@ -1151,10 +1159,12 @@ impl<B: MemoryBackend> Session<B> {
                             max: *max,
                         },
                         *rate_hz,
+                        *emit,
                     )
                 }
                 Watch::Record {
                     name,
+                    emit,
                     base,
                     fields,
                     rate_hz,
@@ -1170,10 +1180,12 @@ impl<B: MemoryBackend> Session<B> {
                             fields: flatten_fields(fields),
                         },
                         *rate_hz,
+                        *emit,
                     )
                 }
                 Watch::Derived {
                     name,
+                    emit,
                     ty,
                     each,
                     value,
@@ -1189,11 +1201,13 @@ impl<B: MemoryBackend> Session<B> {
                         ty: *ty,
                     },
                     *rate_hz,
+                    *emit,
                 ),
             };
             let anchor = kind.as_ref().and_then(|k| resolve_anchor(&backend, k));
             watches.push(Scheduled {
                 name,
+                emit,
                 kind,
                 reader,
                 period: period_of(rate_hz),
@@ -1298,10 +1312,15 @@ impl<B: MemoryBackend> Session<B> {
             // Writing back here also feeds the phase: a derived watch declared
             // after another sees the value this loop just stored, which is why
             // declaration order is a sufficient evaluation order.
+            //
+            // An internal watch is kept in `last` like any other, for the derived
+            // watches that read it, and only kept out of the diff.
             let changed = self.last.get(&w.name) != Some(&value);
             if changed {
                 self.last.insert(w.name.clone(), value.clone());
-                diff.insert(w.name.clone(), value);
+                if w.emit {
+                    diff.insert(w.name.clone(), value);
+                }
             }
         }
         (sampled, failed)
@@ -1348,11 +1367,16 @@ impl<B: MemoryBackend> Session<B> {
         self.backend.has_exited()
     }
 
-    /// The last known value of every label sampled so far — the full state a
-    /// diff stream is relative to. Useful for a consumer that joins late and
-    /// needs the current picture, not just the next change.
-    pub fn current(&self) -> &BTreeMap<String, Value> {
-        &self.last
+    /// The last known value of every emitted label sampled so far — the full
+    /// state a diff stream is relative to. Useful for a consumer that joins late
+    /// and needs the current picture, not just the next change. Internal watches
+    /// (`emit: false`) are left out, as they are from every diff.
+    pub fn current(&self) -> Snapshot {
+        self.watches
+            .iter()
+            .filter(|w| w.emit)
+            .filter_map(|w| Some((w.name.clone(), self.last.get(&w.name)?.clone())))
+            .collect()
     }
 }
 
@@ -1639,6 +1663,7 @@ mod tests {
     fn tier1(name: &str, off: i64, rate_hz: Option<f64>) -> Watch {
         Watch::Tier1 {
             name: name.to_string(),
+            emit: true,
             module: "fake".to_string(),
             offsets: vec![off],
             ty: ValueType::I32,
@@ -1695,6 +1720,7 @@ mod tests {
             watches: vec![
                 Watch::Tier1 {
                     name: "speed".to_string(),
+                    emit: true,
                     module: "fake".to_string(),
                     offsets: vec![0],
                     ty: ValueType::F32,
@@ -1999,6 +2025,7 @@ mod tests {
             match_: ident(),
             watches: vec![Watch::Tier2 {
                 name: "hp".to_string(),
+                emit: true,
                 anchor: "48 8B 05 ?? ?? ?? ?? C3 90 5A A5".to_string(),
                 rip: Some(Rip { disp: 3, len: 7 }),
                 offsets: vec![0, 0],
@@ -2032,6 +2059,7 @@ mod tests {
             match_: ident(),
             watches: vec![Watch::Tier2 {
                 name: "marker".to_string(),
+                emit: true,
                 anchor: "44 33 22 11 5A A5 5A A5".to_string(),
                 rip: None,
                 offsets: vec![],
@@ -2066,6 +2094,7 @@ mod tests {
     fn i32_collection_watch(name: &str, max: usize) -> Watch {
         Watch::Collection {
             name: name.to_string(),
+            emit: true,
             base: Base::Tier1 {
                 module: "fake".to_string(),
                 offsets: vec![0x100],
@@ -2165,6 +2194,7 @@ mod tests {
         ]);
         Watch::Collection {
             name: "characters".to_string(),
+            emit: true,
             base: Base::Tier1 {
                 module: "fake".to_string(),
                 offsets: vec![0x100],
@@ -2382,6 +2412,7 @@ mod tests {
             match_: ident(),
             watches: vec![Watch::Record {
                 name: "player".to_string(),
+                emit: true,
                 base: Base::Tier1 {
                     module: "fake".to_string(),
                     offsets: vec![0x40], // module base + 0x40 = the record base
@@ -2424,6 +2455,7 @@ mod tests {
             match_: ident(),
             watches: vec![Watch::Collection {
                 name: "party".to_string(),
+                emit: true,
                 base: Base::Tier1 {
                     module: "fake".to_string(),
                     offsets: vec![0x100],
@@ -2469,6 +2501,7 @@ mod tests {
             match_: ident(),
             watches: vec![Watch::Record {
                 name: "player".to_string(),
+                emit: true,
                 base: Base::Tier1 {
                     module: "fake".to_string(),
                     offsets: vec![0x40],
@@ -2500,6 +2533,7 @@ mod tests {
             match_: ident(),
             watches: vec![Watch::Record {
                 name: "player".to_string(),
+                emit: true,
                 base: Base::Tier1 {
                     module: "fake".to_string(),
                     offsets: vec![0x100, 0], // deref past the mapped region -> fails
@@ -2533,6 +2567,7 @@ mod tests {
             match_: ident(),
             watches: vec![Watch::Tier1 {
                 name: "name".to_string(),
+                emit: true,
                 module: "fake".to_string(),
                 offsets: vec![0x10], // resolve to the reference slot; read_string derefs
                 ty: il2cpp_string(),
@@ -2568,6 +2603,7 @@ mod tests {
             match_: ident(),
             watches: vec![Watch::Tier1 {
                 name: "tag".to_string(),
+                emit: true,
                 module: "fake".to_string(),
                 offsets: vec![0x20], // resolve straight to the buffer
                 ty: ValueType::String(StringSpec::Layout(layout)),
@@ -2623,6 +2659,7 @@ mod tests {
             match_: ident(),
             watches: vec![Watch::Tier1 {
                 name: "name".to_string(),
+                emit: true,
                 module: "fake".to_string(),
                 offsets: vec![0x10],
                 ty: il2cpp_string(),
@@ -2658,6 +2695,7 @@ mod tests {
     fn derived(name: &str, ty: ValueType, each: Option<&str>, value: &str) -> Watch {
         Watch::Derived {
             name: name.to_string(),
+            emit: true,
             ty,
             each: each.map(str::to_string),
             value: serde_json::from_str(value).expect("parse expression"),
@@ -2670,6 +2708,7 @@ mod tests {
     fn broken_tier1(name: &str) -> Watch {
         Watch::Tier1 {
             name: name.to_string(),
+            emit: true,
             module: "fake".to_string(),
             offsets: vec![0x1000, 0],
             ty: ValueType::I32,
@@ -2681,11 +2720,61 @@ mod tests {
     fn typed(name: &str, off: i64, ty: ValueType) -> Watch {
         Watch::Tier1 {
             name: name.to_string(),
+            emit: true,
             module: "fake".to_string(),
             offsets: vec![off],
             ty,
             rate_hz: None,
         }
+    }
+
+    /// An internal watch (`emit: false`) is read, and a derived watch computes
+    /// from it, but it never shows up in a diff or in the current picture: only
+    /// what is computed from it goes out.
+    #[test]
+    fn an_internal_watch_feeds_derived_watches_without_being_emitted() {
+        let fake = Rc::new(Fake::new(64));
+        fake.write_i32(0, 50); // hp
+        fake.write_i32(4, 200); // hp_max
+        let internal = |name: &str, off: i64| {
+            let mut w = typed(name, off, ValueType::I32);
+            if let Watch::Tier1 { emit, .. } = &mut w {
+                *emit = false;
+            }
+            w
+        };
+        let p = profile(vec![
+            internal("hp", 0),
+            internal("hp_max", 4),
+            derived(
+                "hp_percent",
+                ValueType::F32,
+                None,
+                r#"{ "mul": [ { "const": 100 },
+                              { "div": [ { "watch": "hp" }, { "watch": "hp_max" } ] } ] }"#,
+            ),
+        ]);
+        let mut s = Session::attach(Rc::clone(&fake), &p, Config::default());
+
+        let first = s.poll(Duration::ZERO);
+        assert_eq!(
+            first,
+            Snapshot::from([("hp_percent".to_string(), Value::F32(25.0))]),
+            "only the derived value goes out on the first tick"
+        );
+        assert_eq!(
+            s.current(),
+            first,
+            "the current picture leaves them out too"
+        );
+
+        // A change to an internal input re-emits what depends on it, and still
+        // not the input itself.
+        fake.write_i32(0, 100);
+        assert_eq!(
+            s.poll(Duration::from_millis(100)),
+            Snapshot::from([("hp_percent".to_string(), Value::F32(50.0))])
+        );
     }
 
     /// Every integer type reads exactly its own width, little-endian, with its
@@ -3004,6 +3093,7 @@ mod tests {
     fn modifier_collection(name: &str) -> Watch {
         Watch::Collection {
             name: name.to_string(),
+            emit: true,
             base: Base::Tier1 {
                 module: "fake".to_string(),
                 offsets: vec![0x100],
@@ -3239,6 +3329,7 @@ mod tests {
         let p = profile(vec![
             Watch::Collection {
                 name: "party".to_string(),
+                emit: true,
                 base: Base::Tier1 {
                     module: "fake".to_string(),
                     offsets: vec![0x100],
@@ -3347,6 +3438,7 @@ mod tests {
             match_: ident(),
             watches: vec![Watch::Tier2 {
                 name: "bad".to_string(),
+                emit: true,
                 anchor: "not hex".to_string(),
                 rip: None,
                 offsets: vec![0],

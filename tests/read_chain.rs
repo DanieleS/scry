@@ -109,6 +109,7 @@ fn tier2_rip_relative_watch_reads_hp_end_to_end() {
         },
         watches: vec![Watch::Tier2 {
             name: "hp".to_string(),
+            emit: true,
             anchor: "48 8B 05 ?? ?? ?? ?? C3 90 5A A5 5A A5".to_string(),
             rip: Some(Rip { disp: 3, len: 7 }),
             offsets: vec![0, 0],
