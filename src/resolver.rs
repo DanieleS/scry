@@ -119,9 +119,17 @@ fn ranked_candidates<'a, B: MemoryBackend + ?Sized>(
 /// Step 3, the probe test for one candidate. A malformed probe can never claim
 /// anything, so it is "does not fit" rather than an error that would abort the
 /// others.
+///
+/// The scan starts at the profile's `match.module`, where a probe normally is:
+/// a game with gigabytes of heap below its executable would otherwise have all
+/// of it read first, which on Final Fantasy VII Rebirth took over a minute. The
+/// rest of the process is still scanned if the module does not hold it.
 fn probe_fits<B: MemoryBackend + ?Sized>(backend: &B, profile: &Profile) -> Result<bool> {
     match aob::parse_pattern(&profile.match_.probe) {
-        Ok(pattern) => Ok(aob::find_in_process(backend, &pattern)?.is_some()),
+        Ok(pattern) => {
+            let first = backend.module_base(&profile.match_.module).ok();
+            Ok(aob::find_in_process_from(backend, &pattern, first)?.is_some())
+        }
         Err(_) => Ok(false),
     }
 }
