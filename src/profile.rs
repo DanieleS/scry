@@ -2254,7 +2254,10 @@ mod tests {
         // `count` stays out of the serialized form rather than appearing as null,
         // and the profile survives the round trip unchanged.
         let json = p.to_json().unwrap();
-        assert!(!json.contains("count"), "no count should be written: {json}");
+        assert!(
+            !json.contains("count"),
+            "no count should be written: {json}"
+        );
         assert_eq!(Profile::from_json(&json).unwrap(), p);
     }
 
@@ -2269,7 +2272,10 @@ mod tests {
             other => panic!("expected a collection, got {other:?}"),
         }
         let json = p.to_json().unwrap();
-        assert!(!json.contains("\"len\""), "no len should be written: {json}");
+        assert!(
+            !json.contains("\"len\""),
+            "no len should be written: {json}"
+        );
         assert_eq!(Profile::from_json(&json).unwrap(), p);
     }
 
@@ -2278,7 +2284,10 @@ mod tests {
         let err = sized_collection(r#""count": [0], "len": 3,"#, 9)
             .unwrap_err()
             .to_string();
-        assert!(err.contains("characters"), "error should name the watch: {err}");
+        assert!(
+            err.contains("characters"),
+            "error should name the watch: {err}"
+        );
         assert!(
             err.contains("`count`") && err.contains("`len`"),
             "error should name both fields: {err}"
@@ -2288,15 +2297,26 @@ mod tests {
     #[test]
     fn collection_rejects_neither_count_nor_len() {
         let err = sized_collection("", 9).unwrap_err().to_string();
-        assert!(err.contains("characters"), "error should name the watch: {err}");
+        assert!(
+            err.contains("characters"),
+            "error should name the watch: {err}"
+        );
         assert!(err.contains("`len`"), "error should offer a len: {err}");
     }
 
     #[test]
     fn collection_rejects_a_len_above_its_max() {
-        let err = sized_collection(r#""len": 10,"#, 9).unwrap_err().to_string();
-        assert!(err.contains("characters"), "error should name the watch: {err}");
-        assert!(err.contains("above its `max`"), "error should say why: {err}");
+        let err = sized_collection(r#""len": 10,"#, 9)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("characters"),
+            "error should name the watch: {err}"
+        );
+        assert!(
+            err.contains("above its `max`"),
+            "error should say why: {err}"
+        );
         // A len equal to the cap is the ordinary case, not an edge to refuse.
         assert!(sized_collection(r#""len": 9,"#, 9).is_ok());
     }

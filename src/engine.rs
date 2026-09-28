@@ -2250,10 +2250,7 @@ mod tests {
         let mut s = Session::attach(Rc::clone(&fake), &profile, Config::default());
         assert_eq!(
             s.poll(Duration::ZERO).get("characters"),
-            Some(&Value::List(vec![
-                character(17, 1134),
-                character(17, 1672)
-            ]))
+            Some(&Value::List(vec![character(17, 1134), character(17, 1672)]))
         );
     }
 
