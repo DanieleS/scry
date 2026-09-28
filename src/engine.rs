@@ -62,8 +62,8 @@ use std::time::{Duration, Instant};
 use crate::aob;
 use crate::backend::MemoryBackend;
 use crate::profile::{
-    Base, Clause, Compare, Expr, Extremum, Field, Fold, Literal, Profile, Rip, StringEncoding,
-    StringLayout, ValueType, Watch, MAX_COLLECTION_LEN,
+    Base, Clause, Compare, Expr, Extremum, FNamePool, Field, Fold, Literal, Profile, Rip,
+    StringEncoding, StringLayout, ValueType, Watch, MAX_COLLECTION_LEN,
 };
 
 /// A single sampled value — or the honest absence of one.
@@ -400,9 +400,127 @@ fn resolve_anchor<B: MemoryBackend + ?Sized>(backend: &B, kind: &AnchorKind) -> 
 /// terminator can't drive an unbounded read. 1 KiB is ample for any name/label.
 const STRING_MAX_BYTES: usize = 1024;
 
+/// A profile's [`FNamePool`] as the session keeps it: how to find the `Blocks`
+/// array again after a re-attach, and where it was last found.
+struct NameTable {
+    kind: AnchorKind,
+    offsets: Vec<i64>,
+    names: Names,
+    /// `None` until the array is found, and again whenever a re-attach cannot
+    /// find it; every `fname` then reads as unavailable.
+    blocks: Option<u64>,
+}
+
+/// What reading an `FName` needs to know about the table: where its `Blocks`
+/// array is (filled in once resolved) and how its entries are laid out.
+#[derive(Clone, Copy)]
+struct Names {
+    blocks: u64,
+    align: u64,
+    header_at: u64,
+}
+
+impl NameTable {
+    fn new(pool: &FNamePool) -> Self {
+        let (kind, offsets) = anchor_from_base(&pool.blocks);
+        NameTable {
+            kind,
+            offsets,
+            names: Names {
+                blocks: 0,
+                // A validated profile cannot say less than 1; a hand-built one
+                // saying 0 would put every name at its block's first entry.
+                align: pool.entry_align.max(1) as u64,
+                header_at: pool.header_at.max(0) as u64,
+            },
+            blocks: None,
+        }
+    }
+
+    fn resolve<B: MemoryBackend + ?Sized>(&mut self, backend: &B) {
+        self.blocks = resolve_anchor(backend, &self.kind)
+            .and_then(|anchor| backend.resolve(anchor, &self.offsets).ok());
+    }
+
+    /// The table as a read needs it, or `None` while it has not been found.
+    fn names(&self) -> Option<Names> {
+        self.blocks.map(|blocks| Names {
+            blocks,
+            ..self.names
+        })
+    }
+}
+
+/// Read an Unreal `FName` at `addr` — a 32-bit index into the name table and a
+/// 32-bit instance number — and look its text up in the table.
+///
+/// The index's top 16 bits pick a block from the `Blocks` array, the low 16 bits
+/// an entry within it (in units of `align` bytes). `header_at` bytes into the
+/// entry is a 16-bit header: bit 0 set for UTF-16 characters, the top 10 bits
+/// the length in characters, which follow. A number `n > 0` is Unreal's
+/// instance suffix, printed `_<n-1>`.
+///
+/// A zero-length entry, a missing block, or a failed read is an error, so the
+/// watch reads unavailable: a name table either answers or it does not, and a
+/// guess at one would be a lie with a plausible shape.
+fn read_fname<B: MemoryBackend + ?Sized>(
+    backend: &B,
+    addr: u64,
+    names: Names,
+) -> crate::Result<String> {
+    let index = backend.read_u32(addr)?;
+    let number = backend.read_u32(addr.wrapping_add(4))?;
+    let slot = u64::from(index >> 16).wrapping_mul(backend.pointer_size() as u64);
+    let block = backend.read_ptr(names.blocks.wrapping_add(slot))?;
+    if block == 0 {
+        return Err(unreadable_name(index, "its block is not allocated"));
+    }
+    let entry = block
+        .wrapping_add(u64::from(index & 0xFFFF).wrapping_mul(names.align))
+        .wrapping_add(names.header_at);
+    let header = backend.read_u16(entry)?;
+    let wide = header & 1 != 0;
+    let len = usize::from(header >> 6);
+    if len == 0 {
+        return Err(unreadable_name(index, "its entry is empty"));
+    }
+    let unit = if wide { 2 } else { 1 };
+    let mut bytes = vec![0u8; (len * unit).min(STRING_MAX_BYTES)];
+    backend.read_bytes(entry.wrapping_add(2), &mut bytes)?;
+    let text = if wide {
+        let wide: Vec<u16> = bytes
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|c| u16::from_le_bytes(*c))
+            .collect();
+        String::from_utf16_lossy(&wide)
+    } else {
+        // Unreal's narrow names are Latin-1, one byte per character.
+        bytes.iter().map(|&b| char::from(b)).collect()
+    };
+    Ok(match number {
+        0 => text,
+        n => format!("{text}_{}", n - 1),
+    })
+}
+
+fn unreadable_name(index: u32, why: &str) -> crate::Error {
+    crate::Error::Io(std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        format!("FName {index:#x} does not name an entry: {why}"),
+    ))
+}
+
 /// Read one typed value at an already-resolved address. Every read failure
-/// becomes `Unavailable`, never a partial or guessed number.
-fn read_typed<B: MemoryBackend + ?Sized>(backend: &B, addr: u64, ty: ValueType) -> Value {
+/// becomes `Unavailable`, never a partial or guessed number. `names` is the
+/// profile's name table, for an `fname`; `None` makes an `fname` unavailable.
+fn read_typed<B: MemoryBackend + ?Sized>(
+    backend: &B,
+    addr: u64,
+    ty: ValueType,
+    names: Option<Names>,
+) -> Value {
     let read = match ty {
         ValueType::I8 => backend.read_i8(addr).map(Value::I8),
         ValueType::U8 => backend.read_u8(addr).map(Value::U8),
@@ -419,7 +537,13 @@ fn read_typed<B: MemoryBackend + ?Sized>(backend: &B, addr: u64, ty: ValueType) 
             1 => Value::Bool(true),
             _ => Value::Unavailable,
         }),
-        ValueType::String(spec) => read_string(backend, addr, spec.layout()).map(Value::Str),
+        ValueType::String(spec) => match (spec.layout(), names) {
+            (Some(layout), _) => read_string(backend, addr, layout).map(Value::Str),
+            // The one string that is not a layout: an FName, looked up in the
+            // name table, and unavailable while there is none to look it up in.
+            (None, Some(names)) => read_fname(backend, addr, names).map(Value::Str),
+            (None, None) => return Value::Unavailable,
+        },
     };
     read.unwrap_or(Value::Unavailable)
 }
@@ -429,11 +553,16 @@ fn read_typed<B: MemoryBackend + ?Sized>(backend: &B, addr: u64, ty: ValueType) 
 /// field off one base in one call is what makes the record a coherent atomic
 /// sample. A field whose chain can't be resolved is a nested
 /// [`Unavailable`](Value::Unavailable) in place — the record still forms.
-fn read_record<B: MemoryBackend + ?Sized>(backend: &B, base: u64, fields: &RecordFields) -> Value {
+fn read_record<B: MemoryBackend + ?Sized>(
+    backend: &B,
+    base: u64,
+    fields: &RecordFields,
+    names: Option<Names>,
+) -> Value {
     let mut map = BTreeMap::new();
     for (name, offsets, ty) in fields {
         let value = match backend.resolve(base, offsets) {
-            Ok(addr) => read_typed(backend, addr, *ty),
+            Ok(addr) => read_typed(backend, addr, *ty, names),
             Err(_) => Value::Unavailable,
         };
         map.insert(name.clone(), value);
@@ -943,6 +1072,7 @@ fn sample_one<B: MemoryBackend + ?Sized>(
     backend: &B,
     w: &Scheduled,
     last: &BTreeMap<String, Value>,
+    names: Option<Names>,
 ) -> Value {
     // Before the anchor lookup, because a derived watch has no anchor: it reads
     // no memory, only what the memory watches already produced.
@@ -955,14 +1085,14 @@ fn sample_one<B: MemoryBackend + ?Sized>(
     };
     match &w.reader {
         Reader::Scalar { offsets, ty } => match backend.resolve(anchor, offsets) {
-            Ok(addr) => read_typed(backend, addr, *ty),
+            Ok(addr) => read_typed(backend, addr, *ty, names),
             Err(_) => Value::Unavailable,
         },
         Reader::Record { base, fields } => match backend.resolve(anchor, base) {
             // Reach the record's base once, then read every field relative to it.
             // A base that no longer resolves makes the whole record unavailable;
             // a single broken field stays a nested Unavailable (in read_record).
-            Ok(base_addr) => read_record(backend, base_addr, fields),
+            Ok(base_addr) => read_record(backend, base_addr, fields, names),
             Err(_) => Value::Unavailable,
         },
         Reader::Collection {
@@ -1022,8 +1152,8 @@ fn sample_one<B: MemoryBackend + ?Sized>(
                 // record); a failure here fails the whole element, not one field.
                 let value = match backend.resolve(slot, element) {
                     Ok(addr) => match content {
-                        ElementReader::Scalar(ty) => read_typed(backend, addr, *ty),
-                        ElementReader::Record(fields) => read_record(backend, addr, fields),
+                        ElementReader::Scalar(ty) => read_typed(backend, addr, *ty, names),
+                        ElementReader::Record(fields) => read_record(backend, addr, fields, names),
                     },
                     Err(_) => Value::Unavailable,
                 };
@@ -1053,6 +1183,8 @@ pub struct Session<B: MemoryBackend> {
     watches: Vec<Scheduled>,
     /// Last known value per label — the baseline every poll diffs against.
     last: BTreeMap<String, Value>,
+    /// The profile's name table, for `fname` reads; `None` when it declares none.
+    names: Option<NameTable>,
     /// Consecutive fully-failed ticks; drives the re-attach decision.
     fail_streak: u32,
     /// The wait imposed after the last re-attach; zero until one has run
@@ -1215,11 +1347,19 @@ impl<B: MemoryBackend> Session<B> {
                 next_due: Duration::ZERO,
             });
         }
+        // Resolved once here and again on every re-attach, like a watch's anchor:
+        // the table is a static of the executable, found the same way.
+        let names = profile.fname_pool.as_ref().map(|pool| {
+            let mut table = NameTable::new(pool);
+            table.resolve(&backend);
+            table
+        });
         Session {
             backend,
             config,
             watches,
             last: BTreeMap::new(),
+            names,
             fail_streak: 0,
             reattach_delay: Duration::ZERO,
             next_reattach: Duration::ZERO,
@@ -1288,6 +1428,7 @@ impl<B: MemoryBackend> Session<B> {
     ) -> (u32, u32) {
         let mut sampled = 0u32;
         let mut failed = 0u32;
+        let names = self.names.as_ref().and_then(NameTable::names);
         for w in &mut self.watches {
             if matches!(w.reader, Reader::Derived { .. }) != derived {
                 continue;
@@ -1300,7 +1441,7 @@ impl<B: MemoryBackend> Session<B> {
             // would otherwise overflow the addition.
             w.next_due = elapsed.saturating_add(w.period);
 
-            let value = sample_one(&self.backend, w, &self.last);
+            let value = sample_one(&self.backend, w, &self.last, names);
             if value == Value::Unavailable {
                 failed += 1;
             }
@@ -1353,6 +1494,9 @@ impl<B: MemoryBackend> Session<B> {
             if let Some(kind) = &w.kind {
                 w.anchor = resolve_anchor(&self.backend, kind);
             }
+        }
+        if let Some(table) = &mut self.names {
+            table.resolve(&self.backend);
         }
     }
 
@@ -1679,6 +1823,7 @@ mod tests {
             label: None,
             contract: None,
             contract_version: None,
+            fname_pool: None,
             match_: ident(),
             watches: vec![tier1("hp", 0, None)],
         };
@@ -1716,6 +1861,7 @@ mod tests {
             label: None,
             contract: None,
             contract_version: None,
+            fname_pool: None,
             match_: ident(),
             watches: vec![
                 Watch::Tier1 {
@@ -1761,6 +1907,7 @@ mod tests {
             label: None,
             contract: None,
             contract_version: None,
+            fname_pool: None,
             match_: ident(),
             watches: vec![tier1("hp", 0, Some(1e-300))],
         };
@@ -1777,6 +1924,7 @@ mod tests {
             label: None,
             contract: None,
             contract_version: None,
+            fname_pool: None,
             match_: ident(),
             watches: vec![
                 tier1("fast", 0, Some(20.0)), // 50 ms period -> every tick
@@ -1812,6 +1960,7 @@ mod tests {
             label: None,
             contract: None,
             contract_version: None,
+            fname_pool: None,
             match_: ident(),
             watches: vec![tier1("hp", 0, None)],
         };
@@ -1857,6 +2006,7 @@ mod tests {
             label: None,
             contract: None,
             contract_version: None,
+            fname_pool: None,
             match_: ident(),
             watches: vec![tier1("hp", 0, None)],
         };
@@ -1900,6 +2050,7 @@ mod tests {
             label: None,
             contract: None,
             contract_version: None,
+            fname_pool: None,
             match_: ident(),
             watches: vec![tier1("hp", 0, None)],
         };
@@ -1948,6 +2099,7 @@ mod tests {
             label: None,
             contract: None,
             contract_version: None,
+            fname_pool: None,
             match_: ident(),
             watches: vec![tier1("hp", 0, None)],
         };
@@ -1967,6 +2119,7 @@ mod tests {
             label: None,
             contract: None,
             contract_version: None,
+            fname_pool: None,
             match_: ident(),
             watches: vec![tier1("slow", 0, Some(1.0))], // 1 s period
         };
@@ -2022,6 +2175,7 @@ mod tests {
             label: None,
             contract: None,
             contract_version: None,
+            fname_pool: None,
             match_: ident(),
             watches: vec![Watch::Tier2 {
                 name: "hp".to_string(),
@@ -2056,6 +2210,7 @@ mod tests {
             label: None,
             contract: None,
             contract_version: None,
+            fname_pool: None,
             match_: ident(),
             watches: vec![Watch::Tier2 {
                 name: "marker".to_string(),
@@ -2120,6 +2275,7 @@ mod tests {
             label: None,
             contract: None,
             contract_version: None,
+            fname_pool: None,
             match_: ident(),
             watches: vec![i32_collection_watch("enemy_hp", 64)],
         };
@@ -2161,6 +2317,7 @@ mod tests {
             label: None,
             contract: None,
             contract_version: None,
+            fname_pool: None,
             match_: ident(),
             watches: vec![i32_collection_watch("capped", 2)],
         };
@@ -2237,6 +2394,7 @@ mod tests {
             label: None,
             contract: None,
             contract_version: None,
+            fname_pool: None,
             match_: ident(),
             watches: vec![fixed_table_watch(Some(3), 9)],
         };
@@ -2274,6 +2432,7 @@ mod tests {
             label: None,
             contract: None,
             contract_version: None,
+            fname_pool: None,
             match_: ident(),
             watches: vec![fixed_table_watch(Some(3), 2)],
         };
@@ -2294,6 +2453,7 @@ mod tests {
             label: None,
             contract: None,
             contract_version: None,
+            fname_pool: None,
             match_: ident(),
             watches: vec![fixed_table_watch(None, 9)],
         };
@@ -2315,6 +2475,7 @@ mod tests {
             label: None,
             contract: None,
             contract_version: None,
+            fname_pool: None,
             match_: ident(),
             watches: vec![i32_collection_watch("enemy_hp", usize::MAX)],
         };
@@ -2336,6 +2497,7 @@ mod tests {
             label: None,
             contract: None,
             contract_version: None,
+            fname_pool: None,
             match_: ident(),
             watches: vec![i32_collection_watch("enemy_hp", 64)],
         };
@@ -2360,6 +2522,7 @@ mod tests {
             label: None,
             contract: None,
             contract_version: None,
+            fname_pool: None,
             match_: ident(),
             watches: vec![i32_collection_watch("enemy_hp", 64)],
         };
@@ -2409,6 +2572,7 @@ mod tests {
             label: None,
             contract: None,
             contract_version: None,
+            fname_pool: None,
             match_: ident(),
             watches: vec![Watch::Record {
                 name: "player".to_string(),
@@ -2452,6 +2616,7 @@ mod tests {
             label: None,
             contract: None,
             contract_version: None,
+            fname_pool: None,
             match_: ident(),
             watches: vec![Watch::Collection {
                 name: "party".to_string(),
@@ -2498,6 +2663,7 @@ mod tests {
             label: None,
             contract: None,
             contract_version: None,
+            fname_pool: None,
             match_: ident(),
             watches: vec![Watch::Record {
                 name: "player".to_string(),
@@ -2530,6 +2696,7 @@ mod tests {
             label: None,
             contract: None,
             contract_version: None,
+            fname_pool: None,
             match_: ident(),
             watches: vec![Watch::Record {
                 name: "player".to_string(),
@@ -2564,6 +2731,7 @@ mod tests {
             label: None,
             contract: None,
             contract_version: None,
+            fname_pool: None,
             match_: ident(),
             watches: vec![Watch::Tier1 {
                 name: "name".to_string(),
@@ -2600,6 +2768,7 @@ mod tests {
             label: None,
             contract: None,
             contract_version: None,
+            fname_pool: None,
             match_: ident(),
             watches: vec![Watch::Tier1 {
                 name: "tag".to_string(),
@@ -2656,6 +2825,7 @@ mod tests {
             label: None,
             contract: None,
             contract_version: None,
+            fname_pool: None,
             match_: ident(),
             watches: vec![Watch::Tier1 {
                 name: "name".to_string(),
@@ -2683,6 +2853,7 @@ mod tests {
             label: None,
             contract: None,
             contract_version: None,
+            fname_pool: None,
             match_: ident(),
             watches,
         }
@@ -2726,6 +2897,191 @@ mod tests {
             ty,
             rate_hz: None,
         }
+    }
+
+    // ---- FName ------------------------------------------------------------
+
+    fn fname() -> ValueType {
+        ValueType::String(StringSpec::Preset(StringPreset::Fname))
+    }
+
+    /// A name table in a `Fake`: the `Blocks` array at 0x100, block 0 at 0x400,
+    /// block 1 at 0x800 (block 2 is left unallocated). `entries` are
+    /// `(block, index within block, wide, text)`, laid out as `align` and
+    /// `header_at` say. Returns the profile's pool.
+    fn plant_names(
+        fake: &Fake,
+        align: i64,
+        header_at: i64,
+        entries: &[(u64, u32, bool, &str)],
+    ) -> FNamePool {
+        fake.write_u64(0x100, fake.base + 0x400);
+        fake.write_u64(0x108, fake.base + 0x800);
+        for &(block, index, wide, text) in entries {
+            let entry = [0x400, 0x800][block as usize] + index as usize * align as usize;
+            let header = (text.chars().count() as u16) << 6 | u16::from(wide);
+            // A build's per-entry hash sits before the header; it is never read.
+            fake.write_bytes(entry, &vec![0xAB; header_at as usize]);
+            let at = entry + header_at as usize;
+            fake.write_bytes(at, &header.to_le_bytes());
+            let chars: Vec<u8> = if wide {
+                text.encode_utf16().flat_map(u16::to_le_bytes).collect()
+            } else {
+                text.bytes().collect()
+            };
+            fake.write_bytes(at + 2, &chars);
+        }
+        FNamePool {
+            blocks: Base::Tier1 {
+                module: "fake".to_string(),
+                offsets: vec![0x100],
+            },
+            entry_align: align,
+            header_at,
+        }
+    }
+
+    /// An `FName` value — index and instance number — at `off`.
+    fn plant_fname(fake: &Fake, off: usize, block: u32, index: u32, number: u32) {
+        fake.write_i32(off, ((block << 16) | index) as i32);
+        fake.write_i32(off + 4, number as i32);
+    }
+
+    fn with_pool(pool: Option<FNamePool>, watches: Vec<Watch>) -> Profile {
+        Profile {
+            fname_pool: pool,
+            ..profile(watches)
+        }
+    }
+
+    #[test]
+    fn an_fname_reads_its_text_from_a_stock_name_table() {
+        let fake = Rc::new(Fake::new(0x1000));
+        let pool = plant_names(
+            &fake,
+            2,
+            0,
+            &[(0, 0, false, "None"), (0, 3, false, "PersistentLevel")],
+        );
+        plant_fname(&fake, 0x40, 0, 3, 0);
+        plant_fname(&fake, 0x48, 0, 0, 0);
+        let p = with_pool(
+            Some(pool),
+            vec![typed("level", 0x40, fname()), typed("none", 0x48, fname())],
+        );
+        let mut s = Session::attach(Rc::clone(&fake), &p, Config::default());
+        let d = s.poll(Duration::ZERO);
+        assert_eq!(d.get("level"), Some(&Value::Str("PersistentLevel".into())));
+        assert_eq!(d.get("none"), Some(&Value::Str("None".into())));
+    }
+
+    /// Final Fantasy VII Rebirth's table: a 4-byte hash before every header, and
+    /// entries aligned to 4 bytes. Also a second block, and a UTF-16 entry.
+    #[test]
+    fn an_fname_reads_a_table_with_hashed_wider_entries_and_wide_text() {
+        let fake = Rc::new(Fake::new(0x1000));
+        let pool = plant_names(
+            &fake,
+            4,
+            4,
+            &[(0, 5, false, "0005-TITLB"), (1, 2, true, "Chocobo Ranch")],
+        );
+        plant_fname(&fake, 0x40, 0, 5, 0);
+        plant_fname(&fake, 0x48, 1, 2, 0);
+        let p = with_pool(
+            Some(pool),
+            vec![
+                typed("location", 0x40, fname()),
+                typed("wide", 0x48, fname()),
+            ],
+        );
+        let mut s = Session::attach(Rc::clone(&fake), &p, Config::default());
+        let d = s.poll(Duration::ZERO);
+        assert_eq!(d.get("location"), Some(&Value::Str("0005-TITLB".into())));
+        assert_eq!(d.get("wide"), Some(&Value::Str("Chocobo Ranch".into())));
+    }
+
+    /// Unreal prints an instance number `n > 0` as the suffix `_<n-1>`.
+    #[test]
+    fn an_fname_with_an_instance_number_carries_unreals_suffix() {
+        let fake = Rc::new(Fake::new(0x1000));
+        let pool = plant_names(&fake, 2, 0, &[(0, 1, false, "EnemyStatus")]);
+        plant_fname(&fake, 0x40, 0, 1, 1);
+        plant_fname(&fake, 0x48, 0, 1, 12);
+        let p = with_pool(
+            Some(pool),
+            vec![
+                typed("first", 0x40, fname()),
+                typed("twelfth", 0x48, fname()),
+            ],
+        );
+        let mut s = Session::attach(Rc::clone(&fake), &p, Config::default());
+        let d = s.poll(Duration::ZERO);
+        assert_eq!(d.get("first"), Some(&Value::Str("EnemyStatus_0".into())));
+        assert_eq!(d.get("twelfth"), Some(&Value::Str("EnemyStatus_11".into())));
+    }
+
+    /// An index into a block the table has not allocated, or at an empty entry,
+    /// names nothing: unavailable, not an empty string or a neighbour's name.
+    #[test]
+    fn an_fname_that_names_no_entry_is_unavailable() {
+        let fake = Rc::new(Fake::new(0x1000));
+        let pool = plant_names(&fake, 2, 0, &[(0, 0, false, "None")]);
+        plant_fname(&fake, 0x40, 2, 0, 0); // block 2: never allocated
+        plant_fname(&fake, 0x48, 0, 40, 0); // block 0, an entry nothing wrote
+        let p = with_pool(
+            Some(pool),
+            vec![
+                typed("unallocated", 0x40, fname()),
+                typed("empty", 0x48, fname()),
+            ],
+        );
+        let mut s = Session::attach(Rc::clone(&fake), &p, Config::default());
+        let d = s.poll(Duration::ZERO);
+        assert_eq!(d.get("unallocated"), Some(&Value::Unavailable));
+        assert_eq!(d.get("empty"), Some(&Value::Unavailable));
+    }
+
+    /// Validation refuses an `fname` without a pool; a hand-built profile is not
+    /// validated, and its `fname` reads unavailable rather than guessing a table.
+    #[test]
+    fn an_fname_without_a_name_table_is_unavailable() {
+        let fake = Rc::new(Fake::new(0x1000));
+        plant_names(&fake, 2, 0, &[(0, 3, false, "PersistentLevel")]);
+        plant_fname(&fake, 0x40, 0, 3, 0);
+        let p = with_pool(None, vec![typed("level", 0x40, fname())]);
+        let mut s = Session::attach(Rc::clone(&fake), &p, Config::default());
+        assert_eq!(
+            s.poll(Duration::ZERO).get("level"),
+            Some(&Value::Unavailable)
+        );
+    }
+
+    /// The table is found like any anchor: a module that is not there yet leaves
+    /// every `fname` unavailable, and the re-attach that finds it brings them back.
+    #[test]
+    fn the_name_table_is_found_again_on_a_reattach() {
+        let fake = Rc::new(Fake::new(0x1000));
+        let pool = plant_names(&fake, 2, 0, &[(0, 3, false, "PersistentLevel")]);
+        plant_fname(&fake, 0x40, 0, 3, 0);
+        let p = with_pool(Some(pool), vec![typed("level", 0x40, fname())]);
+        fake.fail.set(true);
+        let mut s = Session::attach(Rc::clone(&fake), &p, Config::default());
+        assert_eq!(
+            s.poll(Duration::ZERO).get("level"),
+            Some(&Value::Unavailable)
+        );
+        fake.fail.set(false);
+        let mut t = Duration::ZERO;
+        let mut seen = None;
+        for _ in 0..20 {
+            t += Duration::from_millis(250);
+            if let Some(v) = s.poll(t).get("level") {
+                seen = Some(v.clone());
+                break;
+            }
+        }
+        assert_eq!(seen, Some(Value::Str("PersistentLevel".into())));
     }
 
     /// An internal watch (`emit: false`) is read, and a derived watch computes
@@ -3435,6 +3791,7 @@ mod tests {
             label: None,
             contract: None,
             contract_version: None,
+            fname_pool: None,
             match_: ident(),
             watches: vec![Watch::Tier2 {
                 name: "bad".to_string(),

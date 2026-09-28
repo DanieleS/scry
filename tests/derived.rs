@@ -131,6 +131,7 @@ fn derived_watches_compute_over_a_native_target() {
         label: Some("cavia (derived)".to_string()),
         contract: None,
         contract_version: None,
+        fname_pool: None,
         match_: ident(&ready.exe),
         watches: vec![
             // The memory tier: four plain reads out of a `#[repr(C)]` struct.
@@ -225,6 +226,7 @@ fn a_derived_watch_re_emits_exactly_when_its_input_changes() {
         label: Some("cavia (derived, moving)".to_string()),
         contract: None,
         contract_version: None,
+        fname_pool: None,
         match_: ident(&ready.exe),
         watches: vec![
             stat("frame", &ready.exe, player_offset, 0x8),

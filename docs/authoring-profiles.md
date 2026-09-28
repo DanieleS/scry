@@ -183,6 +183,7 @@ itself, so don't add a trailing deref.
 | preset | layout it stands for |
 |---|---|
 | `il2cpp` | reference → object; UTF-16, 32-bit length at `+0x10`, chars at `+0x14` |
+| `fname` | an Unreal `FName`, looked up in the profile's `fname_pool` — see [Unreal names](#unreal-names-fname) |
 
 **Explicit layout** — the escape hatch for any engine without a preset:
 
@@ -203,6 +204,60 @@ itself, so don't add a trailing deref.
 
 The read length is capped (1 KiB) so a garbage length or a missing terminator
 can't run away; a null reference reads as `""` (honest empty), not `unavailable`.
+
+An Unreal `FString` needs no preset: it is a pointer to NUL-terminated UTF-16,
+followed by a length and a capacity, so a chain ending at the `FString` reads it
+as `{ "encoding": "utf16", "deref": true }`.
+
+### Unreal names (`FName`)
+
+An `FName` is not text at all: it is a 32-bit index into the engine's name table
+and a 32-bit instance number. Unreal uses them for identifiers — level and
+streaming-level names, class names, gameplay tags, states — so they are how an
+Unreal game says *which* thing, where it would say *what it is called* with a
+translated `FText`.
+
+Reading one needs the name table, which a profile declares once, at the top:
+
+```json
+"fname_pool": {
+  "blocks": { "tier": "tier1", "module": "ff7rebirth_.exe", "offsets": ["0x90D3C10"] },
+  "entry_align": 4,
+  "header_at": 4
+}
+```
+
+| field | meaning |
+|---|---|
+| `blocks` | a `tier1`/`tier2` base, like a collection's, whose chain ends at the name pool's `Blocks` array (`FNamePool + 0x10` in stock Unreal) |
+| `entry_align` | bytes per unit of an entry's offset in its block; default `2`, stock Unreal |
+| `header_at` | bytes from an entry's start to its 16-bit header; default `0`, stock Unreal |
+
+Then any watch, record field or collection field can read an `FName` with
+`"type": { "string": "fname" }`, at the address of the `FName` itself:
+
+```json
+{ "tier": "tier1", "name": "location", "module": "ff7rebirth_.exe",
+  "offsets": ["0x8F30420", "0x150", "0x304"], "type": { "string": "fname" } }
+```
+
+It reads as the name, or `Name_<n-1>` when the instance number `n` is above
+zero, as Unreal prints it. An index into a block that was never allocated, or at
+an empty entry, reads as `unavailable`, never as a neighbour's name. A profile
+that reads an `fname` without declaring `fname_pool` is rejected when it loads.
+
+The layout is Unreal 4.23 and later, UE5 included: the index's top 16 bits pick
+a block, the low 16 bits an entry in it, and each entry's header holds a UTF-16
+flag in bit 0 and the length in its top 10 bits. `entry_align` and `header_at`
+cover builds that store more per entry: Final Fantasy VII Rebirth keeps a 4-byte
+hash before every header, and so aligns its entries to 4.
+
+To find the pool, search memory for the first names every Unreal game registers,
+in order: `None` then `ByteProperty`, each behind a small header. The entry for
+`None` is the start of block 0; one static pointer in the executable points at
+it, and that pointer is `Blocks[0]`. The distance from `None` to `ByteProperty`,
+against `ByteProperty`'s index (3 in stock Unreal), gives `entry_align`; the bytes
+before `None`'s header give `header_at`.
 
 ## Collections (lists & arrays)
 
