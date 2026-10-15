@@ -31,6 +31,7 @@ fn cavia_profile(exe: &str, player_offset: i64) -> Profile {
         label: Some("cavia".to_string()),
         contract: None,
         contract_version: None,
+        fname_pool: None,
         match_: Match {
             process: exe.to_string(),
             module: exe.to_string(),
@@ -40,6 +41,7 @@ fn cavia_profile(exe: &str, player_offset: i64) -> Profile {
         watches: vec![
             Watch::Tier1 {
                 name: "frame".to_string(),
+                emit: true,
                 module: exe.to_string(),
                 offsets: vec![player_offset, FRAME_FIELD],
                 ty: ValueType::I32,
@@ -47,6 +49,7 @@ fn cavia_profile(exe: &str, player_offset: i64) -> Profile {
             },
             Watch::Tier1 {
                 name: "hp".to_string(),
+                emit: true,
                 module: exe.to_string(),
                 offsets: vec![player_offset, HP_FIELD],
                 ty: ValueType::I32,

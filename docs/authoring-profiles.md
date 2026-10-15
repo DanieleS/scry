@@ -96,6 +96,25 @@ Offsets accept **hex strings or decimal**, mixed freely — paste what CE shows.
 The RIP decode computes `base = anchor + len + i32_at(anchor + disp)`, then
 `offsets` walk from there (each dereferenced except the last).
 
+`type` says how many bytes to read at the end of the chain and how to read them.
+All numbers are little-endian:
+
+| `type` | bytes | reads as |
+|---|---|---|
+| `i8` / `u8` | 1 | signed / unsigned integer |
+| `i16` / `u16` | 2 | signed / unsigned integer |
+| `i32` / `u32` | 4 | signed / unsigned integer |
+| `i64` / `u64` | 8 | signed / unsigned integer |
+| `f32` | 4 | IEEE float; a `NaN` is emitted as `null` |
+| `bool` | 1 | `0` is `false`, `1` is `true`; **any other byte is `unavailable`** |
+| `{ "string": … }` | varies | text — see [Strings](#strings) |
+
+Pick the width the game actually stores. Reading a 1-byte field as `i32` picks
+up the three bytes next to it, and the number looks plausible until they change.
+A `bool` is strict on purpose: a byte of `2` or `0xFF` is a torn read or not a
+flag at all, and turning it into `true` would hide that. A field that uses any
+non-zero byte as "on" is a `u8`, compared with `ne: 0`.
+
 Any watch may add a `rate_hz` to sample less often than the loop's base tick
 (slow state like a zone name needs far fewer reads than HP). It must lie between
 `0.01` (once every 100 s) and `1000`; leave it out to sample every tick. A rate
@@ -164,6 +183,7 @@ itself, so don't add a trailing deref.
 | preset | layout it stands for |
 |---|---|
 | `il2cpp` | reference → object; UTF-16, 32-bit length at `+0x10`, chars at `+0x14` |
+| `fname` | an Unreal `FName`, looked up in the profile's `fname_pool` — see [Unreal names](#unreal-names-fname) |
 
 **Explicit layout** — the escape hatch for any engine without a preset:
 
@@ -185,6 +205,60 @@ itself, so don't add a trailing deref.
 The read length is capped (1 KiB) so a garbage length or a missing terminator
 can't run away; a null reference reads as `""` (honest empty), not `unavailable`.
 
+An Unreal `FString` needs no preset: it is a pointer to NUL-terminated UTF-16,
+followed by a length and a capacity, so a chain ending at the `FString` reads it
+as `{ "encoding": "utf16", "deref": true }`.
+
+### Unreal names (`FName`)
+
+An `FName` is not text at all: it is a 32-bit index into the engine's name table
+and a 32-bit instance number. Unreal uses them for identifiers — level and
+streaming-level names, class names, gameplay tags, states — so they are how an
+Unreal game says *which* thing, where it would say *what it is called* with a
+translated `FText`.
+
+Reading one needs the name table, which a profile declares once, at the top:
+
+```json
+"fname_pool": {
+  "blocks": { "tier": "tier1", "module": "ff7rebirth_.exe", "offsets": ["0x90D3C10"] },
+  "entry_align": 4,
+  "header_at": 4
+}
+```
+
+| field | meaning |
+|---|---|
+| `blocks` | a `tier1`/`tier2` base, like a collection's, whose chain ends at the name pool's `Blocks` array (`FNamePool + 0x10` in stock Unreal) |
+| `entry_align` | bytes per unit of an entry's offset in its block; default `2`, stock Unreal |
+| `header_at` | bytes from an entry's start to its 16-bit header; default `0`, stock Unreal |
+
+Then any watch, record field or collection field can read an `FName` with
+`"type": { "string": "fname" }`, at the address of the `FName` itself:
+
+```json
+{ "tier": "tier1", "name": "location", "module": "ff7rebirth_.exe",
+  "offsets": ["0x8F30420", "0x150", "0x304"], "type": { "string": "fname" } }
+```
+
+It reads as the name, or `Name_<n-1>` when the instance number `n` is above
+zero, as Unreal prints it. An index into a block that was never allocated, or at
+an empty entry, reads as `unavailable`, never as a neighbour's name. A profile
+that reads an `fname` without declaring `fname_pool` is rejected when it loads.
+
+The layout is Unreal 4.23 and later, UE5 included: the index's top 16 bits pick
+a block, the low 16 bits an entry in it, and each entry's header holds a UTF-16
+flag in bit 0 and the length in its top 10 bits. `entry_align` and `header_at`
+cover builds that store more per entry: Final Fantasy VII Rebirth keeps a 4-byte
+hash before every header, and so aligns its entries to 4.
+
+To find the pool, search memory for the first names every Unreal game registers,
+in order: `None` then `ByteProperty`, each behind a small header. The entry for
+`None` is the start of block 0; one static pointer in the executable points at
+it, and that pointer is `Blocks[0]`. The distance from `None` to `ByteProperty`,
+against `ByteProperty`'s index (3 in stock Unreal), gives `entry_align`; the bytes
+before `None`'s header give `header_at`.
+
 ## Collections (lists & arrays)
 
 Party/enemy **lists** need iteration. Rather than a scripting engine, a
@@ -198,11 +272,12 @@ Fields:
 |---|---|
 | `base` | how to reach the container — a nested `{ "tier": "tier1"/"tier2", … }`, same shapes as a scalar watch, whose `offsets` end at the list object / array |
 | `count` | chain from the container to the 32-bit element count (clamped to `max`) |
+| `len` | a **fixed** element count, for a container that stores none; set exactly one of `count` and `len`, and `len` at most `max` |
 | `items` | *optional* chain to the backing-array **pointer** (dereferenced); omit it when the elements live at the container itself (a bare pointer array) |
 | `first` | byte offset to element 0 within the element region (an array header); default `0` |
 | `stride` | bytes between consecutive elements (a pointer array → `8`) |
 | `element` | per-element chain from a slot to the value; empty means the slot *is* the value's address |
-| `type` | element type (`i32` … or a `string` — see [Strings](#strings)) |
+| `type` | element type (any [value type](#4-write-the-profile), a `string` included — see [Strings](#strings)) |
 | `max` | hard cap — a garbage count can neither allocate nor loop unboundedly; at most `4096` |
 
 The C# `List<T>` shape (validated against Sea of Stars — `items` at `+0x10`,
@@ -227,10 +302,27 @@ from the container and each element's HP reached through the entity:
   "count": [16], "stride": 8, "element": ["0x0", "0x58"], "type": "i32", "max": 64 }
 ```
 
+A managed list knows its own length; a native game's static tables usually do
+not. One record per character in a fixed array, three party slots in a row: the
+length lives in the code that walks them, and nothing in memory says it. For
+those, `len` replaces `count`, and nothing is read to size the list. Final
+Fantasy VII Rebirth keeps its active party as three one-byte indices in the
+executable's own data, with `0x10` for an empty slot:
+
+```json
+{ "tier": "collection", "name": "party_slots",
+  "base": { "tier": "tier1", "module": "ff7rebirth_.exe", "offsets": ["0x70D4815"] },
+  "len": 3, "stride": 1, "type": "u8", "max": 3 }
+```
+
+Don't reach for `len` when a count exists. A fixed length over a list that can
+shrink reads stale elements past its real end; a count read from memory is the
+list's own word for how long it is.
+
 Per-element resolution is **fail-soft**: a broken element is `unavailable` in
 place without sinking the list. A base/count/items failure makes the whole watch
 `unavailable` — the list can't be sized or located, so there is nothing honest to
-emit.
+emit. A list sized by `len` has no count to fail.
 
 ## Records (named fields off one base)
 
@@ -311,7 +403,7 @@ expression it is just a number, a string, a list or a map.
 
 | field | meaning |
 |---|---|
-| `type` | the output type — `i32`, `u32`, `f32`, `u64`. **Never a string**: this is an arithmetic result |
+| `type` | the output type — any integer type, `f32` or `bool`. **Never a string**: this is an arithmetic result |
 | `each` | *optional*; names a `collection` declared earlier. The expression runs once per element and the watch emits a list |
 | `value` | the expression (below) |
 
@@ -353,7 +445,10 @@ Each compares one field of the element against a literal:
 
 `eq`, `ne`, `lt`, `le`, `gt`, `ge`. Numbers compare numerically; strings only
 under `eq`/`ne` (an ordering on text would be a collation policy the engine has
-no business having). Clauses stay flat — no nesting, no boolean algebra, no `or`.
+no business having). A `bool` field is tested with a JSON boolean,
+`{ "field": "alive", "eq": true }`, again under `eq`/`ne` only; a boolean
+literal against a field that is not a `bool` is undecidable, so the fold is
+`unavailable`. Clauses stay flat — no nesting, no boolean algebra, no `or`.
 A profile that genuinely needs `or` is a signal to reconsider the profile, not to
 extend the language.
 
@@ -371,7 +466,12 @@ the discriminant is the profile's job exactly as it is for every other field.
 - The expression evaluates in `f64`, then coerces to `type`. Integer types
   truncate toward zero. A non-finite result, or one outside the target's range,
   is `unavailable` — **never a saturated number**, which would be a lie a
-  consumer can't detect.
+  consumer can't detect. A `bool` output holds only `0` and `1` (after
+  truncation); anything else is `unavailable` too.
+- A `bool` input counts as the `0` or `1` it is stored as, so
+  `{"add": [{"watch": "a"}, {"watch": "b"}]}` counts flags that are set.
+- An `i64` or `u64` input beyond 2^53 loses precision in `f64`. That is exact
+  enough for a counter, not for an ID.
 - **Any** referenced watch that is missing, `unavailable`, or the wrong shape
   (indexing a scalar, keying a list, a field that isn't a number where arithmetic
   needs one) makes the whole expression `unavailable`.
@@ -401,6 +501,31 @@ for whatever wasn't due — the correct "latest known" semantics. Derived watche
 also never count toward the failure streak that triggers a re-attach: they read
 no memory, so letting them vote would make a formula error look like a detached
 process.
+
+### Internal watches
+
+A derived value often needs inputs nobody downstream wants: the raw table a
+fold walks, the maximum a percentage divides by, a list of widgets searched for
+the one on screen. Give such a watch `"emit": false`. It is read on its
+schedule like any other and a derived watch can use it, but its value never
+goes into the stream, and `scry schema` leaves it out of the contract:
+
+```json
+{ "tier": "collection", "name": "inventory", "emit": false,
+  "base": { "tier": "tier1", "module": "ff7rebirth_.exe", "offsets": ["0x70440E8"] },
+  "len": 64, "stride": "0x20",
+  "fields": { "kind": { "offsets": [0], "type": "u32" },
+              "item": { "offsets": [8], "type": "u32" },
+              "qty":  { "offsets": ["0xC"], "type": "i32" } },
+  "max": 64 },
+{ "tier": "derived", "name": "gil", "type": "i32",
+  "value": { "max": { "watch": "inventory", "field": "qty",
+                      "where": [ { "field": "item", "eq": 1 } ] } } }
+```
+
+`emit` defaults to `true`, and a profile only ever writes it when it is `false`.
+An internal watch still costs its reads, so keep its `rate_hz` no higher than
+the fastest derived watch that uses it.
 
 ### Known limitation
 

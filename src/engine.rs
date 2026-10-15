@@ -62,8 +62,8 @@ use std::time::{Duration, Instant};
 use crate::aob;
 use crate::backend::MemoryBackend;
 use crate::profile::{
-    Base, Clause, Compare, Expr, Extremum, Field, Fold, Literal, Profile, Rip, StringEncoding,
-    StringLayout, ValueType, Watch, MAX_COLLECTION_LEN,
+    Base, Clause, Compare, Expr, Extremum, FNamePool, Field, Fold, Literal, Profile, Rip,
+    StringEncoding, StringLayout, ValueType, Watch, MAX_COLLECTION_LEN,
 };
 
 /// A single sampled value — or the honest absence of one.
@@ -80,10 +80,16 @@ use crate::profile::{
 /// derived: see the [`PartialEq`] impl for how floats compare.
 #[derive(Debug, Clone)]
 pub enum Value {
+    I8(i8),
+    U8(u8),
+    I16(i16),
+    U16(u16),
     I32(i32),
     U32(u32),
     F32(f32),
+    I64(i64),
     U64(u64),
+    Bool(bool),
     /// A decoded string (per the watch's [`StringLayout`]). A null reference
     /// reads as the empty string, not `Unavailable`.
     Str(String),
@@ -121,12 +127,18 @@ pub enum Value {
 impl PartialEq for Value {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
+            (Value::I8(a), Value::I8(b)) => a == b,
+            (Value::U8(a), Value::U8(b)) => a == b,
+            (Value::I16(a), Value::I16(b)) => a == b,
+            (Value::U16(a), Value::U16(b)) => a == b,
             (Value::I32(a), Value::I32(b)) => a == b,
             (Value::U32(a), Value::U32(b)) => a == b,
             (Value::F32(a), Value::F32(b)) => {
                 a.to_bits() == b.to_bits() || (a.is_nan() && b.is_nan())
             }
+            (Value::I64(a), Value::I64(b)) => a == b,
             (Value::U64(a), Value::U64(b)) => a == b,
+            (Value::Bool(a), Value::Bool(b)) => a == b,
             (Value::Str(a), Value::Str(b)) => a == b,
             (Value::List(a), Value::List(b)) => a == b,
             (Value::Map(a), Value::Map(b)) => a == b,
@@ -141,7 +153,7 @@ impl Eq for Value {}
 /// The **wire form** of a value: the shape a host outside this process sees.
 ///
 /// Deliberately *untagged* — a number serialises as a bare JSON number, a string
-/// as a string, a list as an array, a record as an object, and
+/// as a string, a boolean as `true`/`false`, a list as an array, a record as an object, and
 /// [`Unavailable`](Value::Unavailable) as `null`. The variant name is not on the
 /// wire because the consumer already knows it: the watch's `type` is declared in
 /// the profile it loaded. Tagging every reading (`{"I32": 42}`) would put that
@@ -158,10 +170,16 @@ impl Eq for Value {}
 impl serde::Serialize for Value {
     fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
         match self {
+            Value::I8(n) => s.serialize_i8(*n),
+            Value::U8(n) => s.serialize_u8(*n),
+            Value::I16(n) => s.serialize_i16(*n),
+            Value::U16(n) => s.serialize_u16(*n),
             Value::I32(n) => s.serialize_i32(*n),
             Value::U32(n) => s.serialize_u32(*n),
             Value::F32(x) => s.serialize_f32(*x),
+            Value::I64(n) => s.serialize_i64(*n),
             Value::U64(n) => s.serialize_u64(*n),
+            Value::Bool(b) => s.serialize_bool(*b),
             Value::Str(v) => s.serialize_str(v),
             // Both delegate: `Vec<Value>`/`BTreeMap<String, Value>` are already
             // serialisable once `Value` is, so nesting comes out right for free.
@@ -243,6 +261,19 @@ enum ElementReader {
     Record(RecordFields),
 }
 
+/// How a collection learns how many elements it has: [`Watch::Collection`]'s
+/// `count` chain or its fixed `len`, exactly one of which a validated profile
+/// sets.
+enum Size {
+    /// Read a 32-bit count at the end of this chain from the container.
+    Count(Vec<i64>),
+    /// Always this many; nothing is read.
+    Fixed(usize),
+    /// Neither was given. Only a hand-built, unvalidated profile gets here, and
+    /// its list reads as unavailable rather than as an invented empty one.
+    Missing,
+}
+
 /// What a watch does once its anchor is resolved: read one typed value, iterate
 /// a container into an array, or read named fields off a base. The per-tier
 /// difference (how the anchor is *found*) lives in [`AnchorKind`]; this is the
@@ -255,7 +286,7 @@ enum Reader {
     /// then iterate. Field meaning mirrors [`Watch::Collection`].
     Collection {
         base: Vec<i64>,
-        count: Vec<i64>,
+        size: Size,
         items: Option<Vec<i64>>,
         first: i64,
         stride: i64,
@@ -287,6 +318,9 @@ enum Reader {
 /// A watch reduced to what the loop needs each tick, plus its schedule state.
 struct Scheduled {
     name: String,
+    /// Whether a change goes into the diff. An internal watch (`emit: false`) is
+    /// still sampled and kept in `last`, because a derived watch may read it.
+    emit: bool,
     /// How this watch's anchor is (re)found — `None` for a [`Reader::Derived`],
     /// which has no anchor at all because it reads no memory. Modelled as an
     /// absence rather than a stand-in [`AnchorKind`]: there is no address to
@@ -366,15 +400,150 @@ fn resolve_anchor<B: MemoryBackend + ?Sized>(backend: &B, kind: &AnchorKind) -> 
 /// terminator can't drive an unbounded read. 1 KiB is ample for any name/label.
 const STRING_MAX_BYTES: usize = 1024;
 
+/// A profile's [`FNamePool`] as the session keeps it: how to find the `Blocks`
+/// array again after a re-attach, and where it was last found.
+struct NameTable {
+    kind: AnchorKind,
+    offsets: Vec<i64>,
+    names: Names,
+    /// `None` until the array is found, and again whenever a re-attach cannot
+    /// find it; every `fname` then reads as unavailable.
+    blocks: Option<u64>,
+}
+
+/// What reading an `FName` needs to know about the table: where its `Blocks`
+/// array is (filled in once resolved) and how its entries are laid out.
+#[derive(Clone, Copy)]
+struct Names {
+    blocks: u64,
+    align: u64,
+    header_at: u64,
+}
+
+impl NameTable {
+    fn new(pool: &FNamePool) -> Self {
+        let (kind, offsets) = anchor_from_base(&pool.blocks);
+        NameTable {
+            kind,
+            offsets,
+            names: Names {
+                blocks: 0,
+                // A validated profile cannot say less than 1; a hand-built one
+                // saying 0 would put every name at its block's first entry.
+                align: pool.entry_align.max(1) as u64,
+                header_at: pool.header_at.max(0) as u64,
+            },
+            blocks: None,
+        }
+    }
+
+    fn resolve<B: MemoryBackend + ?Sized>(&mut self, backend: &B) {
+        self.blocks = resolve_anchor(backend, &self.kind)
+            .and_then(|anchor| backend.resolve(anchor, &self.offsets).ok());
+    }
+
+    /// The table as a read needs it, or `None` while it has not been found.
+    fn names(&self) -> Option<Names> {
+        self.blocks.map(|blocks| Names {
+            blocks,
+            ..self.names
+        })
+    }
+}
+
+/// Read an Unreal `FName` at `addr` — a 32-bit index into the name table and a
+/// 32-bit instance number — and look its text up in the table.
+///
+/// The index's top 16 bits pick a block from the `Blocks` array, the low 16 bits
+/// an entry within it (in units of `align` bytes). `header_at` bytes into the
+/// entry is a 16-bit header: bit 0 set for UTF-16 characters, the top 10 bits
+/// the length in characters, which follow. A number `n > 0` is Unreal's
+/// instance suffix, printed `_<n-1>`.
+///
+/// A zero-length entry, a missing block, or a failed read is an error, so the
+/// watch reads unavailable: a name table either answers or it does not, and a
+/// guess at one would be a lie with a plausible shape.
+fn read_fname<B: MemoryBackend + ?Sized>(
+    backend: &B,
+    addr: u64,
+    names: Names,
+) -> crate::Result<String> {
+    let index = backend.read_u32(addr)?;
+    let number = backend.read_u32(addr.wrapping_add(4))?;
+    let slot = u64::from(index >> 16).wrapping_mul(backend.pointer_size() as u64);
+    let block = backend.read_ptr(names.blocks.wrapping_add(slot))?;
+    if block == 0 {
+        return Err(unreadable_name(index, "its block is not allocated"));
+    }
+    let entry = block
+        .wrapping_add(u64::from(index & 0xFFFF).wrapping_mul(names.align))
+        .wrapping_add(names.header_at);
+    let header = backend.read_u16(entry)?;
+    let wide = header & 1 != 0;
+    let len = usize::from(header >> 6);
+    if len == 0 {
+        return Err(unreadable_name(index, "its entry is empty"));
+    }
+    let unit = if wide { 2 } else { 1 };
+    let mut bytes = vec![0u8; (len * unit).min(STRING_MAX_BYTES)];
+    backend.read_bytes(entry.wrapping_add(2), &mut bytes)?;
+    let text = if wide {
+        let wide: Vec<u16> = bytes
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|c| u16::from_le_bytes(*c))
+            .collect();
+        String::from_utf16_lossy(&wide)
+    } else {
+        // Unreal's narrow names are Latin-1, one byte per character.
+        bytes.iter().map(|&b| char::from(b)).collect()
+    };
+    Ok(match number {
+        0 => text,
+        n => format!("{text}_{}", n - 1),
+    })
+}
+
+fn unreadable_name(index: u32, why: &str) -> crate::Error {
+    crate::Error::Io(std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        format!("FName {index:#x} does not name an entry: {why}"),
+    ))
+}
+
 /// Read one typed value at an already-resolved address. Every read failure
-/// becomes `Unavailable`, never a partial or guessed number.
-fn read_typed<B: MemoryBackend + ?Sized>(backend: &B, addr: u64, ty: ValueType) -> Value {
+/// becomes `Unavailable`, never a partial or guessed number. `names` is the
+/// profile's name table, for an `fname`; `None` makes an `fname` unavailable.
+fn read_typed<B: MemoryBackend + ?Sized>(
+    backend: &B,
+    addr: u64,
+    ty: ValueType,
+    names: Option<Names>,
+) -> Value {
     let read = match ty {
+        ValueType::I8 => backend.read_i8(addr).map(Value::I8),
+        ValueType::U8 => backend.read_u8(addr).map(Value::U8),
+        ValueType::I16 => backend.read_i16(addr).map(Value::I16),
+        ValueType::U16 => backend.read_u16(addr).map(Value::U16),
         ValueType::I32 => backend.read_i32(addr).map(Value::I32),
         ValueType::U32 => backend.read_u32(addr).map(Value::U32),
         ValueType::F32 => backend.read_f32(addr).map(Value::F32),
+        ValueType::I64 => backend.read_i64(addr).map(Value::I64),
         ValueType::U64 => backend.read_u64(addr).map(Value::U64),
-        ValueType::String(spec) => read_string(backend, addr, spec.layout()).map(Value::Str),
+        // Only 0 and 1 are a boolean; any other byte is not guessed into `true`.
+        ValueType::Bool => backend.read_u8(addr).map(|b| match b {
+            0 => Value::Bool(false),
+            1 => Value::Bool(true),
+            _ => Value::Unavailable,
+        }),
+        ValueType::String(spec) => match (spec.layout(), names) {
+            (Some(layout), _) => read_string(backend, addr, layout).map(Value::Str),
+            // The one string that is not a layout: an FName, looked up in the
+            // name table, and unavailable while there is none to look it up in.
+            (None, Some(names)) => read_fname(backend, addr, names).map(Value::Str),
+            (None, None) => return Value::Unavailable,
+        },
     };
     read.unwrap_or(Value::Unavailable)
 }
@@ -384,11 +553,16 @@ fn read_typed<B: MemoryBackend + ?Sized>(backend: &B, addr: u64, ty: ValueType) 
 /// field off one base in one call is what makes the record a coherent atomic
 /// sample. A field whose chain can't be resolved is a nested
 /// [`Unavailable`](Value::Unavailable) in place — the record still forms.
-fn read_record<B: MemoryBackend + ?Sized>(backend: &B, base: u64, fields: &RecordFields) -> Value {
+fn read_record<B: MemoryBackend + ?Sized>(
+    backend: &B,
+    base: u64,
+    fields: &RecordFields,
+    names: Option<Names>,
+) -> Value {
     let mut map = BTreeMap::new();
     for (name, offsets, ty) in fields {
         let value = match backend.resolve(base, offsets) {
-            Ok(addr) => read_typed(backend, addr, *ty),
+            Ok(addr) => read_typed(backend, addr, *ty, names),
             Err(_) => Value::Unavailable,
         };
         map.insert(name.clone(), value);
@@ -536,6 +710,11 @@ enum FoldKind {
 /// rounded maximum would admit a value that cannot round-trip.
 const U64_LIMIT: f64 = 18_446_744_073_709_551_616.0;
 
+/// 2^63, the `i64` counterpart of [`U64_LIMIT`]: `i64::MAX as f64` rounds up to
+/// it, so it bounds an `i64` coercion exclusively. The lower end, `-2^63`, is
+/// exact and stays inclusive.
+const I64_LIMIT: f64 = 9_223_372_036_854_775_808.0;
+
 /// A reading as an `f64`, or `None` when it simply is not a number.
 ///
 /// A string, a list, a record or an `Unavailable` where arithmetic needs a
@@ -543,10 +722,17 @@ const U64_LIMIT: f64 = 18_446_744_073_709_551_616.0;
 /// expression unavailable rather than contributing a zero nobody read.
 fn number_of(value: &Value) -> Option<f64> {
     match value {
+        Value::I8(n) => Some(*n as f64),
+        Value::U8(n) => Some(*n as f64),
+        Value::I16(n) => Some(*n as f64),
+        Value::U16(n) => Some(*n as f64),
         Value::I32(n) => Some(*n as f64),
         Value::U32(n) => Some(*n as f64),
         Value::F32(x) => Some(*x as f64),
+        Value::I64(n) => Some(*n as f64),
         Value::U64(n) => Some(*n as f64),
+        // A flag counts as the 0/1 it is stored as, so `add` over flags counts them.
+        Value::Bool(b) => Some(u8::from(*b) as f64),
         Value::Str(_) | Value::List(_) | Value::Map(_) | Value::Unavailable => None,
     }
 }
@@ -748,11 +934,18 @@ fn compare(value: &Value, test: &Compare) -> Option<bool> {
     }
 }
 
-/// Identity against a literal: numbers numerically, strings textually. A number
-/// tested against a string reading (or the reverse) is undecidable, not `false`.
+/// Identity against a literal: numbers numerically, strings textually, booleans
+/// by value. A number tested against a string reading (or the reverse) is
+/// undecidable, not `false`; so is a boolean literal against anything but a
+/// boolean reading. A numeric literal against a boolean reading compares the 0/1
+/// it is stored as.
 fn equals(value: &Value, lit: &Literal) -> Option<bool> {
     match lit {
         Literal::Num(n) => Some(number_of(value)? == *n),
+        Literal::Bool(b) => match value {
+            Value::Bool(v) => Some(v == b),
+            _ => None,
+        },
         Literal::Text(s) => match value {
             Value::Str(v) => Some(v == s),
             _ => None,
@@ -760,12 +953,12 @@ fn equals(value: &Value, lit: &Literal) -> Option<bool> {
     }
 }
 
-/// Ordering against a **numeric** literal. Text orders under nothing but
-/// `eq`/`ne`, so a string operand is undecidable here rather than collated.
+/// Ordering against a **numeric** literal. Text and booleans order under nothing
+/// but `eq`/`ne`, so such an operand is undecidable here rather than collated.
 fn order(value: &Value, lit: &Literal) -> Option<Ordering> {
     match lit {
         Literal::Num(n) => number_of(value)?.partial_cmp(n),
-        Literal::Text(_) => None,
+        Literal::Text(_) | Literal::Bool(_) => None,
     }
 }
 
@@ -787,22 +980,50 @@ fn coerce(value: Option<f64>, ty: ValueType) -> Value {
             f if f.is_finite() => Value::F32(f),
             _ => Value::Unavailable,
         },
-        ValueType::I32 => match x.trunc() {
-            n if (i32::MIN as f64..=i32::MAX as f64).contains(&n) => Value::I32(n as i32),
-            _ => Value::Unavailable,
-        },
-        ValueType::U32 => match x.trunc() {
-            n if (0.0..=u32::MAX as f64).contains(&n) => Value::U32(n as u32),
+        ValueType::I8 => {
+            in_range(x, i8::MIN, i8::MAX).map_or(Value::Unavailable, |n| Value::I8(n as i8))
+        }
+        ValueType::U8 => {
+            in_range(x, u8::MIN, u8::MAX).map_or(Value::Unavailable, |n| Value::U8(n as u8))
+        }
+        ValueType::I16 => {
+            in_range(x, i16::MIN, i16::MAX).map_or(Value::Unavailable, |n| Value::I16(n as i16))
+        }
+        ValueType::U16 => {
+            in_range(x, u16::MIN, u16::MAX).map_or(Value::Unavailable, |n| Value::U16(n as u16))
+        }
+        ValueType::I32 => {
+            in_range(x, i32::MIN, i32::MAX).map_or(Value::Unavailable, |n| Value::I32(n as i32))
+        }
+        ValueType::U32 => {
+            in_range(x, u32::MIN, u32::MAX).map_or(Value::Unavailable, |n| Value::U32(n as u32))
+        }
+        ValueType::I64 => match x.trunc() {
+            n if (-I64_LIMIT..I64_LIMIT).contains(&n) => Value::I64(n as i64),
             _ => Value::Unavailable,
         },
         ValueType::U64 => match x.trunc() {
             n if (0.0..U64_LIMIT).contains(&n) => Value::U64(n as u64),
             _ => Value::Unavailable,
         },
+        // Exactly 0 or 1 after truncation, like any other integer type that holds
+        // only two values: a `2` is not quietly promoted to `true`.
+        ValueType::Bool => match x.trunc() {
+            0.0 => Value::Bool(false),
+            1.0 => Value::Bool(true),
+            _ => Value::Unavailable,
+        },
         // Unreachable in a validated profile — a derived watch may not declare a
         // string type — and still not a guess if a hand-built one does.
         ValueType::String(_) => Value::Unavailable,
     }
+}
+
+/// `x` truncated toward zero, if it lies within `[min, max]`. For every integer
+/// type up to 32 bits both bounds are exact in an `f64`, so the check is too.
+fn in_range<T: Into<f64>>(x: f64, min: T, max: T) -> Option<f64> {
+    let n = x.trunc();
+    (min.into()..=max.into()).contains(&n).then_some(n)
 }
 
 /// Evaluate a derived watch against the readings already in `last`.
@@ -851,6 +1072,7 @@ fn sample_one<B: MemoryBackend + ?Sized>(
     backend: &B,
     w: &Scheduled,
     last: &BTreeMap<String, Value>,
+    names: Option<Names>,
 ) -> Value {
     // Before the anchor lookup, because a derived watch has no anchor: it reads
     // no memory, only what the memory watches already produced.
@@ -863,19 +1085,19 @@ fn sample_one<B: MemoryBackend + ?Sized>(
     };
     match &w.reader {
         Reader::Scalar { offsets, ty } => match backend.resolve(anchor, offsets) {
-            Ok(addr) => read_typed(backend, addr, *ty),
+            Ok(addr) => read_typed(backend, addr, *ty, names),
             Err(_) => Value::Unavailable,
         },
         Reader::Record { base, fields } => match backend.resolve(anchor, base) {
             // Reach the record's base once, then read every field relative to it.
             // A base that no longer resolves makes the whole record unavailable;
             // a single broken field stays a nested Unavailable (in read_record).
-            Ok(base_addr) => read_record(backend, base_addr, fields),
+            Ok(base_addr) => read_record(backend, base_addr, fields, names),
             Err(_) => Value::Unavailable,
         },
         Reader::Collection {
             base,
-            count,
+            size,
             items,
             first,
             stride,
@@ -892,15 +1114,22 @@ fn sample_one<B: MemoryBackend + ?Sized>(
             // Size the list. If the count can't be read we can't know how many
             // elements to walk, so the whole watch is unavailable (a per-element
             // failure is different — that stays local to the element).
-            let n = match backend
-                .resolve(container, count)
-                .and_then(|a| backend.read_i32(a))
-            {
-                // Clamped to the ceiling as well as to `max`: a validated profile
-                // cannot exceed it, but a hand-built one can, and `n` is about to
-                // size an allocation from a number read out of untrusted memory.
-                Ok(raw) => (raw.max(0) as usize).min(*max).min(MAX_COLLECTION_LEN),
-                Err(_) => return Value::Unavailable,
+            let n = match size {
+                Size::Count(count) => match backend
+                    .resolve(container, count)
+                    .and_then(|a| backend.read_i32(a))
+                {
+                    // Clamped to the ceiling as well as to `max`: a validated
+                    // profile cannot exceed it, but a hand-built one can, and `n`
+                    // is about to size an allocation from a number read out of
+                    // untrusted memory.
+                    Ok(raw) => (raw.max(0) as usize).min(*max).min(MAX_COLLECTION_LEN),
+                    Err(_) => return Value::Unavailable,
+                },
+                // Not read from memory, but clamped the same way: a hand-built
+                // profile can still say more than it may.
+                Size::Fixed(len) => (*len).min(*max).min(MAX_COLLECTION_LEN),
+                Size::Missing => return Value::Unavailable,
             };
             // Find the element region: the backing array an `items` chain points
             // at (dereferenced), or the container itself for a bare pointer array.
@@ -923,8 +1152,8 @@ fn sample_one<B: MemoryBackend + ?Sized>(
                 // record); a failure here fails the whole element, not one field.
                 let value = match backend.resolve(slot, element) {
                     Ok(addr) => match content {
-                        ElementReader::Scalar(ty) => read_typed(backend, addr, *ty),
-                        ElementReader::Record(fields) => read_record(backend, addr, fields),
+                        ElementReader::Scalar(ty) => read_typed(backend, addr, *ty, names),
+                        ElementReader::Record(fields) => read_record(backend, addr, fields, names),
                     },
                     Err(_) => Value::Unavailable,
                 };
@@ -954,6 +1183,8 @@ pub struct Session<B: MemoryBackend> {
     watches: Vec<Scheduled>,
     /// Last known value per label — the baseline every poll diffs against.
     last: BTreeMap<String, Value>,
+    /// The profile's name table, for `fname` reads; `None` when it declares none.
+    names: Option<NameTable>,
     /// Consecutive fully-failed ticks; drives the re-attach decision.
     fail_streak: u32,
     /// The wait imposed after the last re-attach; zero until one has run
@@ -974,9 +1205,10 @@ impl<B: MemoryBackend> Session<B> {
     pub fn attach(backend: B, profile: &Profile, config: Config) -> Self {
         let mut watches = Vec::with_capacity(profile.watches.len());
         for w in &profile.watches {
-            let (name, kind, reader, rate_hz) = match w {
+            let (name, kind, reader, rate_hz, emit) = match w {
                 Watch::Tier1 {
                     name,
+                    emit,
                     module,
                     offsets,
                     ty,
@@ -989,9 +1221,11 @@ impl<B: MemoryBackend> Session<B> {
                         ty: *ty,
                     },
                     *rate_hz,
+                    *emit,
                 ),
                 Watch::Tier2 {
                     name,
+                    emit,
                     anchor,
                     rip,
                     offsets,
@@ -1007,11 +1241,14 @@ impl<B: MemoryBackend> Session<B> {
                         ty: *ty,
                     },
                     *rate_hz,
+                    *emit,
                 ),
                 Watch::Collection {
                     name,
+                    emit,
                     base,
                     count,
+                    len,
                     items,
                     first,
                     stride,
@@ -1032,12 +1269,20 @@ impl<B: MemoryBackend> Session<B> {
                         Some(fields) => ElementReader::Record(flatten_fields(fields)),
                         None => ElementReader::Scalar(ty.unwrap_or(ValueType::U64)),
                     };
+                    // Count-XOR-len, likewise guaranteed by validation. A fixed
+                    // length wins over a count should a hand-built profile carry
+                    // both, since it is the one that cannot fail to read.
+                    let size = match (count, len) {
+                        (_, Some(len)) => Size::Fixed(*len),
+                        (Some(count), None) => Size::Count(count.clone()),
+                        (None, None) => Size::Missing,
+                    };
                     (
                         name.clone(),
                         Some(kind),
                         Reader::Collection {
                             base: base_offsets,
-                            count: count.clone(),
+                            size,
                             items: items.clone(),
                             first: *first,
                             stride: *stride,
@@ -1046,10 +1291,12 @@ impl<B: MemoryBackend> Session<B> {
                             max: *max,
                         },
                         *rate_hz,
+                        *emit,
                     )
                 }
                 Watch::Record {
                     name,
+                    emit,
                     base,
                     fields,
                     rate_hz,
@@ -1065,10 +1312,12 @@ impl<B: MemoryBackend> Session<B> {
                             fields: flatten_fields(fields),
                         },
                         *rate_hz,
+                        *emit,
                     )
                 }
                 Watch::Derived {
                     name,
+                    emit,
                     ty,
                     each,
                     value,
@@ -1084,11 +1333,13 @@ impl<B: MemoryBackend> Session<B> {
                         ty: *ty,
                     },
                     *rate_hz,
+                    *emit,
                 ),
             };
             let anchor = kind.as_ref().and_then(|k| resolve_anchor(&backend, k));
             watches.push(Scheduled {
                 name,
+                emit,
                 kind,
                 reader,
                 period: period_of(rate_hz),
@@ -1096,11 +1347,19 @@ impl<B: MemoryBackend> Session<B> {
                 next_due: Duration::ZERO,
             });
         }
+        // Resolved once here and again on every re-attach, like a watch's anchor:
+        // the table is a static of the executable, found the same way.
+        let names = profile.fname_pool.as_ref().map(|pool| {
+            let mut table = NameTable::new(pool);
+            table.resolve(&backend);
+            table
+        });
         Session {
             backend,
             config,
             watches,
             last: BTreeMap::new(),
+            names,
             fail_streak: 0,
             reattach_delay: Duration::ZERO,
             next_reattach: Duration::ZERO,
@@ -1169,6 +1428,7 @@ impl<B: MemoryBackend> Session<B> {
     ) -> (u32, u32) {
         let mut sampled = 0u32;
         let mut failed = 0u32;
+        let names = self.names.as_ref().and_then(NameTable::names);
         for w in &mut self.watches {
             if matches!(w.reader, Reader::Derived { .. }) != derived {
                 continue;
@@ -1181,7 +1441,7 @@ impl<B: MemoryBackend> Session<B> {
             // would otherwise overflow the addition.
             w.next_due = elapsed.saturating_add(w.period);
 
-            let value = sample_one(&self.backend, w, &self.last);
+            let value = sample_one(&self.backend, w, &self.last, names);
             if value == Value::Unavailable {
                 failed += 1;
             }
@@ -1193,10 +1453,15 @@ impl<B: MemoryBackend> Session<B> {
             // Writing back here also feeds the phase: a derived watch declared
             // after another sees the value this loop just stored, which is why
             // declaration order is a sufficient evaluation order.
+            //
+            // An internal watch is kept in `last` like any other, for the derived
+            // watches that read it, and only kept out of the diff.
             let changed = self.last.get(&w.name) != Some(&value);
             if changed {
                 self.last.insert(w.name.clone(), value.clone());
-                diff.insert(w.name.clone(), value);
+                if w.emit {
+                    diff.insert(w.name.clone(), value);
+                }
             }
         }
         (sampled, failed)
@@ -1230,6 +1495,9 @@ impl<B: MemoryBackend> Session<B> {
                 w.anchor = resolve_anchor(&self.backend, kind);
             }
         }
+        if let Some(table) = &mut self.names {
+            table.resolve(&self.backend);
+        }
     }
 
     /// Whether the target process has exited, as far as the backend can tell
@@ -1243,11 +1511,16 @@ impl<B: MemoryBackend> Session<B> {
         self.backend.has_exited()
     }
 
-    /// The last known value of every label sampled so far — the full state a
-    /// diff stream is relative to. Useful for a consumer that joins late and
-    /// needs the current picture, not just the next change.
-    pub fn current(&self) -> &BTreeMap<String, Value> {
-        &self.last
+    /// The last known value of every emitted label sampled so far — the full
+    /// state a diff stream is relative to. Useful for a consumer that joins late
+    /// and needs the current picture, not just the next change. Internal watches
+    /// (`emit: false`) are left out, as they are from every diff.
+    pub fn current(&self) -> Snapshot {
+        self.watches
+            .iter()
+            .filter(|w| w.emit)
+            .filter_map(|w| Some((w.name.clone(), self.last.get(&w.name)?.clone())))
+            .collect()
     }
 }
 
@@ -1362,9 +1635,16 @@ mod tests {
     #[test]
     fn values_serialise_untagged() {
         let cases = [
+            (Value::I8(-8), "-8"),
+            (Value::U8(255), "255"),
+            (Value::I16(-16), "-16"),
+            (Value::U16(65535), "65535"),
             (Value::I32(-7), "-7"),
             (Value::U32(7), "7"),
+            (Value::I64(i64::MIN), "-9223372036854775808"),
             (Value::U64(u64::MAX), "18446744073709551615"),
+            (Value::Bool(true), "true"),
+            (Value::Bool(false), "false"),
             (Value::F32(1.5), "1.5"),
             (Value::Str("VALERE".into()), "\"VALERE\""),
             // The fail-soft state is `null`, not a missing key and not a zero: a
@@ -1527,6 +1807,7 @@ mod tests {
     fn tier1(name: &str, off: i64, rate_hz: Option<f64>) -> Watch {
         Watch::Tier1 {
             name: name.to_string(),
+            emit: true,
             module: "fake".to_string(),
             offsets: vec![off],
             ty: ValueType::I32,
@@ -1542,6 +1823,7 @@ mod tests {
             label: None,
             contract: None,
             contract_version: None,
+            fname_pool: None,
             match_: ident(),
             watches: vec![tier1("hp", 0, None)],
         };
@@ -1579,10 +1861,12 @@ mod tests {
             label: None,
             contract: None,
             contract_version: None,
+            fname_pool: None,
             match_: ident(),
             watches: vec![
                 Watch::Tier1 {
                     name: "speed".to_string(),
+                    emit: true,
                     module: "fake".to_string(),
                     offsets: vec![0],
                     ty: ValueType::F32,
@@ -1623,6 +1907,7 @@ mod tests {
             label: None,
             contract: None,
             contract_version: None,
+            fname_pool: None,
             match_: ident(),
             watches: vec![tier1("hp", 0, Some(1e-300))],
         };
@@ -1639,6 +1924,7 @@ mod tests {
             label: None,
             contract: None,
             contract_version: None,
+            fname_pool: None,
             match_: ident(),
             watches: vec![
                 tier1("fast", 0, Some(20.0)), // 50 ms period -> every tick
@@ -1674,6 +1960,7 @@ mod tests {
             label: None,
             contract: None,
             contract_version: None,
+            fname_pool: None,
             match_: ident(),
             watches: vec![tier1("hp", 0, None)],
         };
@@ -1719,6 +2006,7 @@ mod tests {
             label: None,
             contract: None,
             contract_version: None,
+            fname_pool: None,
             match_: ident(),
             watches: vec![tier1("hp", 0, None)],
         };
@@ -1762,6 +2050,7 @@ mod tests {
             label: None,
             contract: None,
             contract_version: None,
+            fname_pool: None,
             match_: ident(),
             watches: vec![tier1("hp", 0, None)],
         };
@@ -1810,6 +2099,7 @@ mod tests {
             label: None,
             contract: None,
             contract_version: None,
+            fname_pool: None,
             match_: ident(),
             watches: vec![tier1("hp", 0, None)],
         };
@@ -1829,6 +2119,7 @@ mod tests {
             label: None,
             contract: None,
             contract_version: None,
+            fname_pool: None,
             match_: ident(),
             watches: vec![tier1("slow", 0, Some(1.0))], // 1 s period
         };
@@ -1884,9 +2175,11 @@ mod tests {
             label: None,
             contract: None,
             contract_version: None,
+            fname_pool: None,
             match_: ident(),
             watches: vec![Watch::Tier2 {
                 name: "hp".to_string(),
+                emit: true,
                 anchor: "48 8B 05 ?? ?? ?? ?? C3 90 5A A5".to_string(),
                 rip: Some(Rip { disp: 3, len: 7 }),
                 offsets: vec![0, 0],
@@ -1917,9 +2210,11 @@ mod tests {
             label: None,
             contract: None,
             contract_version: None,
+            fname_pool: None,
             match_: ident(),
             watches: vec![Watch::Tier2 {
                 name: "marker".to_string(),
+                emit: true,
                 anchor: "44 33 22 11 5A A5 5A A5".to_string(),
                 rip: None,
                 offsets: vec![],
@@ -1954,11 +2249,13 @@ mod tests {
     fn i32_collection_watch(name: &str, max: usize) -> Watch {
         Watch::Collection {
             name: name.to_string(),
+            emit: true,
             base: Base::Tier1 {
                 module: "fake".to_string(),
                 offsets: vec![0x100],
             },
-            count: vec![0x8],
+            count: Some(vec![0x8]),
+            len: None,
             items: Some(vec![0x0]),
             first: 0x20,
             stride: 8,
@@ -1978,6 +2275,7 @@ mod tests {
             label: None,
             contract: None,
             contract_version: None,
+            fname_pool: None,
             match_: ident(),
             watches: vec![i32_collection_watch("enemy_hp", 64)],
         };
@@ -2019,6 +2317,7 @@ mod tests {
             label: None,
             contract: None,
             contract_version: None,
+            fname_pool: None,
             match_: ident(),
             watches: vec![i32_collection_watch("capped", 2)],
         };
@@ -2027,6 +2326,141 @@ mod tests {
             s.poll(Duration::ZERO).get("capped"),
             Some(&Value::List(vec![Value::I32(11), Value::I32(22)])),
             "count must be clamped to max"
+        );
+    }
+
+    /// A static table of three inline records at 0x100, 0x10 bytes apart, with
+    /// no count anywhere: a one-byte level at +0 and an `i32` HP at +4. The
+    /// shape of a native game's character table.
+    fn fixed_table_watch(len: Option<usize>, max: usize) -> Watch {
+        let fields = BTreeMap::from([
+            (
+                "level".to_string(),
+                Field {
+                    offsets: vec![0x0],
+                    ty: ValueType::U8,
+                },
+            ),
+            (
+                "hp".to_string(),
+                Field {
+                    offsets: vec![0x4],
+                    ty: ValueType::I32,
+                },
+            ),
+        ]);
+        Watch::Collection {
+            name: "characters".to_string(),
+            emit: true,
+            base: Base::Tier1 {
+                module: "fake".to_string(),
+                offsets: vec![0x100],
+            },
+            count: None,
+            len,
+            items: None,
+            first: 0,
+            stride: 0x10,
+            element: vec![],
+            ty: None,
+            fields: Some(fields),
+            max,
+            rate_hz: None,
+        }
+    }
+
+    fn plant_fixed_table(fake: &Fake) {
+        for (i, (level, hp)) in [(17u8, 1134), (17, 1672), (12, 930)].iter().enumerate() {
+            let at = 0x100 + i * 0x10;
+            // The byte after the level is garbage, as it is in a real table: a
+            // `u8` must read the one byte and not its neighbours.
+            fake.write_bytes(at, &[*level, 0x04, 0x00, 0x01]);
+            fake.write_i32(at + 4, *hp);
+        }
+    }
+
+    fn character(level: u8, hp: i32) -> Value {
+        Value::Map(BTreeMap::from([
+            ("level".to_string(), Value::U8(level)),
+            ("hp".to_string(), Value::I32(hp)),
+        ]))
+    }
+
+    #[test]
+    fn a_fixed_len_collection_reads_a_table_with_no_count() {
+        let fake = Rc::new(Fake::new(0x600));
+        plant_fixed_table(&fake);
+        let profile = Profile {
+            label: None,
+            contract: None,
+            contract_version: None,
+            fname_pool: None,
+            match_: ident(),
+            watches: vec![fixed_table_watch(Some(3), 9)],
+        };
+        let mut s = Session::attach(Rc::clone(&fake), &profile, Config::default());
+        assert_eq!(
+            s.poll(Duration::ZERO).get("characters"),
+            Some(&Value::List(vec![
+                character(17, 1134),
+                character(17, 1672),
+                character(12, 930)
+            ])),
+            "a fixed `len` sizes the list without reading a count"
+        );
+
+        // It is still read every tick like any list: a change re-diffs it.
+        fake.write_i32(0x124, 931);
+        assert_eq!(
+            s.poll(Duration::from_millis(100)).get("characters"),
+            Some(&Value::List(vec![
+                character(17, 1134),
+                character(17, 1672),
+                character(12, 931)
+            ]))
+        );
+    }
+
+    /// Validation refuses a `len` above `max`, but a hand-built profile is not
+    /// validated, so the engine clamps a fixed length exactly as it clamps a
+    /// count read from memory.
+    #[test]
+    fn a_fixed_len_is_clamped_to_max_in_an_unvalidated_profile() {
+        let fake = Rc::new(Fake::new(0x600));
+        plant_fixed_table(&fake);
+        let profile = Profile {
+            label: None,
+            contract: None,
+            contract_version: None,
+            fname_pool: None,
+            match_: ident(),
+            watches: vec![fixed_table_watch(Some(3), 2)],
+        };
+        let mut s = Session::attach(Rc::clone(&fake), &profile, Config::default());
+        assert_eq!(
+            s.poll(Duration::ZERO).get("characters"),
+            Some(&Value::List(vec![character(17, 1134), character(17, 1672)]))
+        );
+    }
+
+    /// Neither a `count` nor a `len`: only a hand-built profile can say that, and
+    /// its list cannot be sized, so it is unavailable, not an empty list.
+    #[test]
+    fn a_collection_with_no_size_is_unavailable() {
+        let fake = Rc::new(Fake::new(0x600));
+        plant_fixed_table(&fake);
+        let profile = Profile {
+            label: None,
+            contract: None,
+            contract_version: None,
+            fname_pool: None,
+            match_: ident(),
+            watches: vec![fixed_table_watch(None, 9)],
+        };
+        let mut s = Session::attach(Rc::clone(&fake), &profile, Config::default());
+        assert_eq!(
+            s.poll(Duration::ZERO).get("characters"),
+            Some(&Value::Unavailable)
         );
     }
 
@@ -2041,6 +2475,7 @@ mod tests {
             label: None,
             contract: None,
             contract_version: None,
+            fname_pool: None,
             match_: ident(),
             watches: vec![i32_collection_watch("enemy_hp", usize::MAX)],
         };
@@ -2062,6 +2497,7 @@ mod tests {
             label: None,
             contract: None,
             contract_version: None,
+            fname_pool: None,
             match_: ident(),
             watches: vec![i32_collection_watch("enemy_hp", 64)],
         };
@@ -2086,6 +2522,7 @@ mod tests {
             label: None,
             contract: None,
             contract_version: None,
+            fname_pool: None,
             match_: ident(),
             watches: vec![i32_collection_watch("enemy_hp", 64)],
         };
@@ -2135,9 +2572,11 @@ mod tests {
             label: None,
             contract: None,
             contract_version: None,
+            fname_pool: None,
             match_: ident(),
             watches: vec![Watch::Record {
                 name: "player".to_string(),
+                emit: true,
                 base: Base::Tier1 {
                     module: "fake".to_string(),
                     offsets: vec![0x40], // module base + 0x40 = the record base
@@ -2177,14 +2616,17 @@ mod tests {
             label: None,
             contract: None,
             contract_version: None,
+            fname_pool: None,
             match_: ident(),
             watches: vec![Watch::Collection {
                 name: "party".to_string(),
+                emit: true,
                 base: Base::Tier1 {
                     module: "fake".to_string(),
                     offsets: vec![0x100],
                 },
-                count: vec![0x8],
+                count: Some(vec![0x8]),
+                len: None,
                 items: Some(vec![0x0]),
                 first: 0x20,
                 stride: 8,
@@ -2221,9 +2663,11 @@ mod tests {
             label: None,
             contract: None,
             contract_version: None,
+            fname_pool: None,
             match_: ident(),
             watches: vec![Watch::Record {
                 name: "player".to_string(),
+                emit: true,
                 base: Base::Tier1 {
                     module: "fake".to_string(),
                     offsets: vec![0x40],
@@ -2252,9 +2696,11 @@ mod tests {
             label: None,
             contract: None,
             contract_version: None,
+            fname_pool: None,
             match_: ident(),
             watches: vec![Watch::Record {
                 name: "player".to_string(),
+                emit: true,
                 base: Base::Tier1 {
                     module: "fake".to_string(),
                     offsets: vec![0x100, 0], // deref past the mapped region -> fails
@@ -2285,9 +2731,11 @@ mod tests {
             label: None,
             contract: None,
             contract_version: None,
+            fname_pool: None,
             match_: ident(),
             watches: vec![Watch::Tier1 {
                 name: "name".to_string(),
+                emit: true,
                 module: "fake".to_string(),
                 offsets: vec![0x10], // resolve to the reference slot; read_string derefs
                 ty: il2cpp_string(),
@@ -2320,9 +2768,11 @@ mod tests {
             label: None,
             contract: None,
             contract_version: None,
+            fname_pool: None,
             match_: ident(),
             watches: vec![Watch::Tier1 {
                 name: "tag".to_string(),
+                emit: true,
                 module: "fake".to_string(),
                 offsets: vec![0x20], // resolve straight to the buffer
                 ty: ValueType::String(StringSpec::Layout(layout)),
@@ -2375,9 +2825,11 @@ mod tests {
             label: None,
             contract: None,
             contract_version: None,
+            fname_pool: None,
             match_: ident(),
             watches: vec![Watch::Tier1 {
                 name: "name".to_string(),
+                emit: true,
                 module: "fake".to_string(),
                 offsets: vec![0x10],
                 ty: il2cpp_string(),
@@ -2401,6 +2853,7 @@ mod tests {
             label: None,
             contract: None,
             contract_version: None,
+            fname_pool: None,
             match_: ident(),
             watches,
         }
@@ -2413,6 +2866,7 @@ mod tests {
     fn derived(name: &str, ty: ValueType, each: Option<&str>, value: &str) -> Watch {
         Watch::Derived {
             name: name.to_string(),
+            emit: true,
             ty,
             each: each.map(str::to_string),
             value: serde_json::from_str(value).expect("parse expression"),
@@ -2425,11 +2879,394 @@ mod tests {
     fn broken_tier1(name: &str) -> Watch {
         Watch::Tier1 {
             name: name.to_string(),
+            emit: true,
             module: "fake".to_string(),
             offsets: vec![0x1000, 0],
             ty: ValueType::I32,
             rate_hz: None,
         }
+    }
+
+    /// A Tier-1 watch of any type at `module_base + off`.
+    fn typed(name: &str, off: i64, ty: ValueType) -> Watch {
+        Watch::Tier1 {
+            name: name.to_string(),
+            emit: true,
+            module: "fake".to_string(),
+            offsets: vec![off],
+            ty,
+            rate_hz: None,
+        }
+    }
+
+    // ---- FName ------------------------------------------------------------
+
+    fn fname() -> ValueType {
+        ValueType::String(StringSpec::Preset(StringPreset::Fname))
+    }
+
+    /// A name table in a `Fake`: the `Blocks` array at 0x100, block 0 at 0x400,
+    /// block 1 at 0x800 (block 2 is left unallocated). `entries` are
+    /// `(block, index within block, wide, text)`, laid out as `align` and
+    /// `header_at` say. Returns the profile's pool.
+    fn plant_names(
+        fake: &Fake,
+        align: i64,
+        header_at: i64,
+        entries: &[(u64, u32, bool, &str)],
+    ) -> FNamePool {
+        fake.write_u64(0x100, fake.base + 0x400);
+        fake.write_u64(0x108, fake.base + 0x800);
+        for &(block, index, wide, text) in entries {
+            let entry = [0x400, 0x800][block as usize] + index as usize * align as usize;
+            let header = (text.chars().count() as u16) << 6 | u16::from(wide);
+            // A build's per-entry hash sits before the header; it is never read.
+            fake.write_bytes(entry, &vec![0xAB; header_at as usize]);
+            let at = entry + header_at as usize;
+            fake.write_bytes(at, &header.to_le_bytes());
+            let chars: Vec<u8> = if wide {
+                text.encode_utf16().flat_map(u16::to_le_bytes).collect()
+            } else {
+                text.bytes().collect()
+            };
+            fake.write_bytes(at + 2, &chars);
+        }
+        FNamePool {
+            blocks: Base::Tier1 {
+                module: "fake".to_string(),
+                offsets: vec![0x100],
+            },
+            entry_align: align,
+            header_at,
+        }
+    }
+
+    /// An `FName` value — index and instance number — at `off`.
+    fn plant_fname(fake: &Fake, off: usize, block: u32, index: u32, number: u32) {
+        fake.write_i32(off, ((block << 16) | index) as i32);
+        fake.write_i32(off + 4, number as i32);
+    }
+
+    fn with_pool(pool: Option<FNamePool>, watches: Vec<Watch>) -> Profile {
+        Profile {
+            fname_pool: pool,
+            ..profile(watches)
+        }
+    }
+
+    #[test]
+    fn an_fname_reads_its_text_from_a_stock_name_table() {
+        let fake = Rc::new(Fake::new(0x1000));
+        let pool = plant_names(
+            &fake,
+            2,
+            0,
+            &[(0, 0, false, "None"), (0, 3, false, "PersistentLevel")],
+        );
+        plant_fname(&fake, 0x40, 0, 3, 0);
+        plant_fname(&fake, 0x48, 0, 0, 0);
+        let p = with_pool(
+            Some(pool),
+            vec![typed("level", 0x40, fname()), typed("none", 0x48, fname())],
+        );
+        let mut s = Session::attach(Rc::clone(&fake), &p, Config::default());
+        let d = s.poll(Duration::ZERO);
+        assert_eq!(d.get("level"), Some(&Value::Str("PersistentLevel".into())));
+        assert_eq!(d.get("none"), Some(&Value::Str("None".into())));
+    }
+
+    /// Final Fantasy VII Rebirth's table: a 4-byte hash before every header, and
+    /// entries aligned to 4 bytes. Also a second block, and a UTF-16 entry.
+    #[test]
+    fn an_fname_reads_a_table_with_hashed_wider_entries_and_wide_text() {
+        let fake = Rc::new(Fake::new(0x1000));
+        let pool = plant_names(
+            &fake,
+            4,
+            4,
+            &[(0, 5, false, "0005-TITLB"), (1, 2, true, "Chocobo Ranch")],
+        );
+        plant_fname(&fake, 0x40, 0, 5, 0);
+        plant_fname(&fake, 0x48, 1, 2, 0);
+        let p = with_pool(
+            Some(pool),
+            vec![
+                typed("location", 0x40, fname()),
+                typed("wide", 0x48, fname()),
+            ],
+        );
+        let mut s = Session::attach(Rc::clone(&fake), &p, Config::default());
+        let d = s.poll(Duration::ZERO);
+        assert_eq!(d.get("location"), Some(&Value::Str("0005-TITLB".into())));
+        assert_eq!(d.get("wide"), Some(&Value::Str("Chocobo Ranch".into())));
+    }
+
+    /// Unreal prints an instance number `n > 0` as the suffix `_<n-1>`.
+    #[test]
+    fn an_fname_with_an_instance_number_carries_unreals_suffix() {
+        let fake = Rc::new(Fake::new(0x1000));
+        let pool = plant_names(&fake, 2, 0, &[(0, 1, false, "EnemyStatus")]);
+        plant_fname(&fake, 0x40, 0, 1, 1);
+        plant_fname(&fake, 0x48, 0, 1, 12);
+        let p = with_pool(
+            Some(pool),
+            vec![
+                typed("first", 0x40, fname()),
+                typed("twelfth", 0x48, fname()),
+            ],
+        );
+        let mut s = Session::attach(Rc::clone(&fake), &p, Config::default());
+        let d = s.poll(Duration::ZERO);
+        assert_eq!(d.get("first"), Some(&Value::Str("EnemyStatus_0".into())));
+        assert_eq!(d.get("twelfth"), Some(&Value::Str("EnemyStatus_11".into())));
+    }
+
+    /// An index into a block the table has not allocated, or at an empty entry,
+    /// names nothing: unavailable, not an empty string or a neighbour's name.
+    #[test]
+    fn an_fname_that_names_no_entry_is_unavailable() {
+        let fake = Rc::new(Fake::new(0x1000));
+        let pool = plant_names(&fake, 2, 0, &[(0, 0, false, "None")]);
+        plant_fname(&fake, 0x40, 2, 0, 0); // block 2: never allocated
+        plant_fname(&fake, 0x48, 0, 40, 0); // block 0, an entry nothing wrote
+        let p = with_pool(
+            Some(pool),
+            vec![
+                typed("unallocated", 0x40, fname()),
+                typed("empty", 0x48, fname()),
+            ],
+        );
+        let mut s = Session::attach(Rc::clone(&fake), &p, Config::default());
+        let d = s.poll(Duration::ZERO);
+        assert_eq!(d.get("unallocated"), Some(&Value::Unavailable));
+        assert_eq!(d.get("empty"), Some(&Value::Unavailable));
+    }
+
+    /// Validation refuses an `fname` without a pool; a hand-built profile is not
+    /// validated, and its `fname` reads unavailable rather than guessing a table.
+    #[test]
+    fn an_fname_without_a_name_table_is_unavailable() {
+        let fake = Rc::new(Fake::new(0x1000));
+        plant_names(&fake, 2, 0, &[(0, 3, false, "PersistentLevel")]);
+        plant_fname(&fake, 0x40, 0, 3, 0);
+        let p = with_pool(None, vec![typed("level", 0x40, fname())]);
+        let mut s = Session::attach(Rc::clone(&fake), &p, Config::default());
+        assert_eq!(
+            s.poll(Duration::ZERO).get("level"),
+            Some(&Value::Unavailable)
+        );
+    }
+
+    /// The table is found like any anchor: a module that is not there yet leaves
+    /// every `fname` unavailable, and the re-attach that finds it brings them back.
+    #[test]
+    fn the_name_table_is_found_again_on_a_reattach() {
+        let fake = Rc::new(Fake::new(0x1000));
+        let pool = plant_names(&fake, 2, 0, &[(0, 3, false, "PersistentLevel")]);
+        plant_fname(&fake, 0x40, 0, 3, 0);
+        let p = with_pool(Some(pool), vec![typed("level", 0x40, fname())]);
+        fake.fail.set(true);
+        let mut s = Session::attach(Rc::clone(&fake), &p, Config::default());
+        assert_eq!(
+            s.poll(Duration::ZERO).get("level"),
+            Some(&Value::Unavailable)
+        );
+        fake.fail.set(false);
+        let mut t = Duration::ZERO;
+        let mut seen = None;
+        for _ in 0..20 {
+            t += Duration::from_millis(250);
+            if let Some(v) = s.poll(t).get("level") {
+                seen = Some(v.clone());
+                break;
+            }
+        }
+        assert_eq!(seen, Some(Value::Str("PersistentLevel".into())));
+    }
+
+    /// An internal watch (`emit: false`) is read, and a derived watch computes
+    /// from it, but it never shows up in a diff or in the current picture: only
+    /// what is computed from it goes out.
+    #[test]
+    fn an_internal_watch_feeds_derived_watches_without_being_emitted() {
+        let fake = Rc::new(Fake::new(64));
+        fake.write_i32(0, 50); // hp
+        fake.write_i32(4, 200); // hp_max
+        let internal = |name: &str, off: i64| {
+            let mut w = typed(name, off, ValueType::I32);
+            if let Watch::Tier1 { emit, .. } = &mut w {
+                *emit = false;
+            }
+            w
+        };
+        let p = profile(vec![
+            internal("hp", 0),
+            internal("hp_max", 4),
+            derived(
+                "hp_percent",
+                ValueType::F32,
+                None,
+                r#"{ "mul": [ { "const": 100 },
+                              { "div": [ { "watch": "hp" }, { "watch": "hp_max" } ] } ] }"#,
+            ),
+        ]);
+        let mut s = Session::attach(Rc::clone(&fake), &p, Config::default());
+
+        let first = s.poll(Duration::ZERO);
+        assert_eq!(
+            first,
+            Snapshot::from([("hp_percent".to_string(), Value::F32(25.0))]),
+            "only the derived value goes out on the first tick"
+        );
+        assert_eq!(
+            s.current(),
+            first,
+            "the current picture leaves them out too"
+        );
+
+        // A change to an internal input re-emits what depends on it, and still
+        // not the input itself.
+        fake.write_i32(0, 100);
+        assert_eq!(
+            s.poll(Duration::from_millis(100)),
+            Snapshot::from([("hp_percent".to_string(), Value::F32(50.0))])
+        );
+    }
+
+    /// Every integer type reads exactly its own width, little-endian, with its
+    /// own signedness: the same bytes are a different number under each type, and
+    /// a narrow read must never pick up the byte next door.
+    #[test]
+    fn each_integer_type_reads_its_own_width_and_sign() {
+        let fake = Rc::new(Fake::new(64));
+        fake.write_bytes(0, &[0xFE, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]);
+        // A neighbour that would leak into a read one width too wide.
+        fake.write_bytes(8, &[0x2A, 0x01, 0x07]);
+        let p = profile(vec![
+            typed("i8", 0, ValueType::I8),
+            typed("u8", 0, ValueType::U8),
+            typed("i16", 0, ValueType::I16),
+            typed("u16", 0, ValueType::U16),
+            typed("i64", 0, ValueType::I64),
+            typed("u64", 0, ValueType::U64),
+            typed("u8_next", 8, ValueType::U8),
+            typed("u16_next", 8, ValueType::U16),
+        ]);
+        let mut s = Session::attach(Rc::clone(&fake), &p, Config::default());
+        let d = s.poll(Duration::ZERO);
+        assert_eq!(d.get("i8"), Some(&Value::I8(-2)));
+        assert_eq!(d.get("u8"), Some(&Value::U8(0xFE)));
+        assert_eq!(d.get("i16"), Some(&Value::I16(-2)));
+        assert_eq!(d.get("u16"), Some(&Value::U16(0xFFFE)));
+        assert_eq!(d.get("i64"), Some(&Value::I64(-2)));
+        assert_eq!(d.get("u64"), Some(&Value::U64(u64::MAX - 1)));
+        assert_eq!(d.get("u8_next"), Some(&Value::U8(0x2A)));
+        assert_eq!(d.get("u16_next"), Some(&Value::U16(0x012A)));
+    }
+
+    /// A bool is one byte that is either 0 or 1. Anything else is not guessed
+    /// into `true`: it is the torn or mistyped read that `Unavailable` exists for.
+    #[test]
+    fn a_bool_reads_only_zero_or_one() {
+        let fake = Rc::new(Fake::new(64));
+        fake.write_bytes(0, &[0, 1, 2, 0xFF]);
+        let p = profile(vec![
+            typed("off", 0, ValueType::Bool),
+            typed("on", 1, ValueType::Bool),
+            typed("two", 2, ValueType::Bool),
+            typed("ff", 3, ValueType::Bool),
+        ]);
+        let mut s = Session::attach(Rc::clone(&fake), &p, Config::default());
+        let d = s.poll(Duration::ZERO);
+        assert_eq!(d.get("off"), Some(&Value::Bool(false)));
+        assert_eq!(d.get("on"), Some(&Value::Bool(true)));
+        assert_eq!(d.get("two"), Some(&Value::Unavailable));
+        assert_eq!(d.get("ff"), Some(&Value::Unavailable));
+
+        // And it diffs like any value: flipping the flag is one change.
+        fake.write_bytes(0, &[1]);
+        let d = s.poll(Duration::from_millis(50));
+        assert_eq!(d.len(), 1);
+        assert_eq!(d.get("off"), Some(&Value::Bool(true)));
+    }
+
+    /// A derived result is held to the declared type's range, whatever its width:
+    /// a value it cannot hold is unavailable, never wrapped or saturated.
+    #[test]
+    fn derived_results_respect_each_types_range() {
+        let fake = Rc::new(Fake::new(64));
+        let cases: [(&str, ValueType, f64, Value); 16] = [
+            ("i8_max", ValueType::I8, 127.0, Value::I8(127)),
+            ("i8_over", ValueType::I8, 128.0, Value::Unavailable),
+            ("i8_min", ValueType::I8, -128.0, Value::I8(-128)),
+            ("u8_max", ValueType::U8, 255.9, Value::U8(255)),
+            ("u8_over", ValueType::U8, 256.0, Value::Unavailable),
+            ("u8_neg", ValueType::U8, -1.0, Value::Unavailable),
+            ("i16_min", ValueType::I16, -32768.0, Value::I16(i16::MIN)),
+            ("i16_under", ValueType::I16, -32769.0, Value::Unavailable),
+            ("u16_max", ValueType::U16, 65535.0, Value::U16(u16::MAX)),
+            ("u16_over", ValueType::U16, 65536.0, Value::Unavailable),
+            ("i64_min", ValueType::I64, -I64_LIMIT, Value::I64(i64::MIN)),
+            // 2^63 is the first value an i64 cannot hold — and what `i64::MAX`
+            // rounds to in an f64, which is why the bound is exclusive.
+            ("i64_over", ValueType::I64, I64_LIMIT, Value::Unavailable),
+            ("bool_false", ValueType::Bool, 0.0, Value::Bool(false)),
+            ("bool_true", ValueType::Bool, 1.7, Value::Bool(true)),
+            ("bool_two", ValueType::Bool, 2.0, Value::Unavailable),
+            ("bool_neg", ValueType::Bool, -1.0, Value::Unavailable),
+        ];
+        let watches = cases
+            .iter()
+            .map(|(name, ty, x, _)| derived(name, *ty, None, &format!(r#"{{ "const": {x:?} }}"#)))
+            .collect();
+        let mut s = Session::attach(Rc::clone(&fake), &profile(watches), Config::default());
+        let d = s.poll(Duration::ZERO);
+        for (name, _, x, expected) in &cases {
+            assert_eq!(d.get(*name), Some(expected), "{name}: {x}");
+        }
+    }
+
+    /// Flags join the expression language as the 0/1 they are stored as, and
+    /// `where` tests them by value: `"eq": true` against a bool, never against a
+    /// number, which is undecidable rather than a quiet `false`.
+    #[test]
+    fn bools_filter_and_count_in_expressions() {
+        let fake = Rc::new(Fake::new(64));
+        fake.write_bytes(0, &[1, 0, 1]);
+        fake.write_i32(4, 1);
+        let p = profile(vec![
+            typed("a", 0, ValueType::Bool),
+            typed("b", 1, ValueType::Bool),
+            typed("c", 2, ValueType::Bool),
+            tier1("one", 4, None),
+            derived(
+                "flags_set",
+                ValueType::U8,
+                None,
+                r#"{ "add": [{ "watch": "a" }, { "watch": "b" }, { "watch": "c" }] }"#,
+            ),
+            derived(
+                "any_set",
+                ValueType::Bool,
+                None,
+                r#"{ "max": [{ "watch": "a" }, { "watch": "b" }] }"#,
+            ),
+        ]);
+        let mut s = Session::attach(Rc::clone(&fake), &p, Config::default());
+        let d = s.poll(Duration::ZERO);
+        assert_eq!(d.get("flags_set"), Some(&Value::U8(2)));
+        assert_eq!(d.get("any_set"), Some(&Value::Bool(true)));
+
+        let yes = Literal::Bool(true);
+        assert_eq!(equals(&Value::Bool(true), &yes), Some(true));
+        assert_eq!(equals(&Value::Bool(false), &yes), Some(false));
+        assert_eq!(
+            equals(&Value::I32(1), &yes),
+            None,
+            "a bool literal only meets a bool"
+        );
+        assert_eq!(equals(&Value::Bool(true), &Literal::Num(1.0)), Some(true));
+        assert_eq!(order(&Value::Bool(true), &yes), None, "bools do not order");
     }
 
     #[test]
@@ -2612,11 +3449,13 @@ mod tests {
     fn modifier_collection(name: &str) -> Watch {
         Watch::Collection {
             name: name.to_string(),
+            emit: true,
             base: Base::Tier1 {
                 module: "fake".to_string(),
                 offsets: vec![0x100],
             },
-            count: vec![0x8],
+            count: Some(vec![0x8]),
+            len: None,
             items: Some(vec![0x0]),
             first: 0x20,
             stride: 8,
@@ -2846,11 +3685,13 @@ mod tests {
         let p = profile(vec![
             Watch::Collection {
                 name: "party".to_string(),
+                emit: true,
                 base: Base::Tier1 {
                     module: "fake".to_string(),
                     offsets: vec![0x100],
                 },
-                count: vec![0x8],
+                count: Some(vec![0x8]),
+                len: None,
                 items: Some(vec![0x0]),
                 first: 0x20,
                 stride: 8,
@@ -2950,9 +3791,11 @@ mod tests {
             label: None,
             contract: None,
             contract_version: None,
+            fname_pool: None,
             match_: ident(),
             watches: vec![Watch::Tier2 {
                 name: "bad".to_string(),
+                emit: true,
                 anchor: "not hex".to_string(),
                 rip: None,
                 offsets: vec![0],

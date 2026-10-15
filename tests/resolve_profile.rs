@@ -26,6 +26,7 @@ fn profile(label: &str, process: &str, version: Option<&str>, probe: &str) -> Pr
         label: Some(label.to_string()),
         contract: None,
         contract_version: None,
+        fname_pool: None,
         match_: Match {
             process: process.to_string(),
             module: process.to_string(),

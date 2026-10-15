@@ -63,13 +63,38 @@ pub fn find_in_process<B: MemoryBackend + ?Sized>(
     backend: &B,
     pattern: &[PatternByte],
 ) -> Result<Option<u64>> {
+    find_in_process_from(backend, pattern, None)
+}
+
+/// [`find_in_process`], but scanning the regions that end above `first` before
+/// the rest — still in address order within each group, and still the whole
+/// process in the end, so the answer is found wherever it is.
+///
+/// What it changes is how long that takes. A signature normally lives in one
+/// module's image, and a 64-bit loader maps executables near the top of the
+/// address space, above every heap: a game with gigabytes allocated would have
+/// all of them read before the scan reached its code. Passing that module's
+/// base puts its image first. The first match in that order is returned, which
+/// is the first match *in the module* when there is one; a signature meant to
+/// be unique has one either way.
+pub fn find_in_process_from<B: MemoryBackend + ?Sized>(
+    backend: &B,
+    pattern: &[PatternByte],
+    first: Option<u64>,
+) -> Result<Option<u64>> {
     if pattern.is_empty() {
         return Err(Error::BadSignature("empty signature".to_string()));
     }
     const CHUNK: usize = 1 << 20; // 1 MiB
     let overlap = (pattern.len() - 1) as u64;
 
-    for region in backend.readable_regions()? {
+    let mut regions = backend.readable_regions()?;
+    if let Some(start) = first {
+        // Stable, so each group keeps its address order.
+        regions.sort_by_key(|r| r.start.saturating_add(r.len) <= start);
+    }
+
+    for region in regions {
         let end = region.start.saturating_add(region.len);
         let mut addr = region.start;
         while addr < end {
@@ -115,6 +140,87 @@ mod tests {
         let hay = [0x00, 0x48, 0x8B, 0x77, 0x90, 0xFF];
         let pat = parse_pattern("48 8B ?? 90").unwrap();
         assert_eq!(find_in_buffer(&hay, &pat), Some(1));
+    }
+
+    /// Two regions, a "heap" low and a "module" high, each holding `sig` once,
+    /// and a record of which region each read touched.
+    struct TwoRegions {
+        low: Vec<u8>,
+        high: Vec<u8>,
+        reads: std::cell::RefCell<Vec<u64>>,
+    }
+
+    const LOW: u64 = 0x1000_0000;
+    const HIGH: u64 = 0x7FF7_0000_0000;
+
+    impl TwoRegions {
+        fn new(sig: &[u8]) -> Self {
+            let mut low = vec![0u8; 4096];
+            let mut high = vec![0u8; 4096];
+            low[100..100 + sig.len()].copy_from_slice(sig);
+            high[200..200 + sig.len()].copy_from_slice(sig);
+            TwoRegions {
+                low,
+                high,
+                reads: Default::default(),
+            }
+        }
+    }
+
+    impl MemoryBackend for TwoRegions {
+        fn read_bytes(&self, addr: u64, buf: &mut [u8]) -> Result<()> {
+            self.reads.borrow_mut().push(addr);
+            let (base, mem) = if addr >= HIGH {
+                (HIGH, &self.high)
+            } else {
+                (LOW, &self.low)
+            };
+            let at = (addr - base) as usize;
+            buf.copy_from_slice(&mem[at..at + buf.len()]);
+            Ok(())
+        }
+        fn module_base(&self, _name: &str) -> Result<u64> {
+            Ok(HIGH)
+        }
+        fn readable_regions(&self) -> Result<Vec<crate::backend::Region>> {
+            Ok(vec![
+                crate::backend::Region {
+                    start: LOW,
+                    len: 4096,
+                },
+                crate::backend::Region {
+                    start: HIGH,
+                    len: 4096,
+                },
+            ])
+        }
+    }
+
+    #[test]
+    fn a_scan_from_a_module_reads_that_module_first() {
+        let fake = TwoRegions::new(&[0xDE, 0xAD, 0xBE, 0xEF]);
+        let pat = parse_pattern("DE AD BE EF").unwrap();
+
+        let hit = find_in_process_from(&fake, &pat, Some(HIGH)).unwrap();
+        assert_eq!(hit, Some(HIGH + 200), "the module's match, found first");
+        assert!(
+            fake.reads.borrow().iter().all(|&a| a >= HIGH),
+            "the heap below was never read"
+        );
+
+        // Without a starting point the scan is what it always was: address order.
+        assert_eq!(find_in_process(&fake, &pat).unwrap(), Some(LOW + 100));
+    }
+
+    /// A module that does not hold the signature still leaves the rest of the
+    /// process to be scanned: the order changes, the answer does not.
+    #[test]
+    fn a_scan_from_a_module_still_finds_a_match_outside_it() {
+        let mut fake = TwoRegions::new(&[0xDE, 0xAD, 0xBE, 0xEF]);
+        fake.high.fill(0);
+        let pat = parse_pattern("DE AD BE EF").unwrap();
+        let hit = find_in_process_from(&fake, &pat, Some(HIGH)).unwrap();
+        assert_eq!(hit, Some(LOW + 100));
     }
 
     #[test]

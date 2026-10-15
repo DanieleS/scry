@@ -79,8 +79,8 @@ how a contract's schema is generated rather than written by hand.
 
 ### Two tiers of watch
 
-Both tiers walk a pointer chain and read a typed value (`i32`, `u32`, `f32`,
-`u64`, or a `string` — whose engine-agnostic layout is data: a named preset like
+Both tiers walk a pointer chain and read a typed value (`i8`, `u8`, `i16`,
+`u16`, `i32`, `u32`, `i64`, `u64`, `f32`, `bool`, or a `string` — whose engine-agnostic layout is data: a named preset like
 `il2cpp` or an explicit `{ encoding, len_at, chars_at, deref }`, length-capped).
 They differ only in how the *anchor* address is found:
 

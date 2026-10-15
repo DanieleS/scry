@@ -38,6 +38,7 @@ fn ident(exe: &str) -> Match {
 fn stat(name: &str, exe: &str, player_offset: i64, field: i64) -> Watch {
     Watch::Tier1 {
         name: name.to_string(),
+        emit: true,
         module: exe.to_string(),
         offsets: vec![player_offset, field],
         ty: ValueType::I32,
@@ -49,6 +50,7 @@ fn stat(name: &str, exe: &str, player_offset: i64, field: i64) -> Watch {
 fn derived(name: &str, ty: ValueType, value: &str) -> Watch {
     Watch::Derived {
         name: name.to_string(),
+        emit: true,
         ty,
         each: None,
         value: serde_json::from_str(value).expect("parse expression"),
@@ -60,11 +62,13 @@ fn derived(name: &str, ty: ValueType, value: &str) -> Watch {
 fn enemy_hp(exe: &str, enemies_offset: i64) -> Watch {
     Watch::Collection {
         name: "enemy_hp".to_string(),
+        emit: true,
         base: Base::Tier1 {
             module: exe.to_string(),
             offsets: vec![enemies_offset, 0],
         },
-        count: vec![0x8],       // List.count
+        count: Some(vec![0x8]), // List.count
+        len: None,
         items: Some(vec![0x0]), // List.items -> backing array
         first: 0x20,            // array header before element 0
         stride: 8,              // pointer array
@@ -96,11 +100,13 @@ fn enemies(exe: &str, enemies_offset: i64) -> Watch {
     );
     Watch::Collection {
         name: "enemies".to_string(),
+        emit: true,
         base: Base::Tier1 {
             module: exe.to_string(),
             offsets: vec![enemies_offset, 0],
         },
-        count: vec![0x8],
+        count: Some(vec![0x8]),
+        len: None,
         items: Some(vec![0x0]),
         first: 0x20,
         stride: 8,
@@ -125,6 +131,7 @@ fn derived_watches_compute_over_a_native_target() {
         label: Some("cavia (derived)".to_string()),
         contract: None,
         contract_version: None,
+        fname_pool: None,
         match_: ident(&ready.exe),
         watches: vec![
             // The memory tier: four plain reads out of a `#[repr(C)]` struct.
@@ -219,6 +226,7 @@ fn a_derived_watch_re_emits_exactly_when_its_input_changes() {
         label: Some("cavia (derived, moving)".to_string()),
         contract: None,
         contract_version: None,
+        fname_pool: None,
         match_: ident(&ready.exe),
         watches: vec![
             stat("frame", &ready.exe, player_offset, 0x8),

@@ -47,14 +47,17 @@ fn collection_reads_an_enemy_hp_list_from_the_cavia() {
         label: Some("cavia (collection)".to_string()),
         contract: None,
         contract_version: None,
+        fname_pool: None,
         match_: ident(&ready.exe),
         watches: vec![Watch::Collection {
             name: "enemy_hp".to_string(),
+            emit: true,
             base: Base::Tier1 {
                 module: ready.exe.clone(),
                 offsets: vec![enemies_offset, 0],
             },
-            count: vec![0x8],       // List.count
+            count: Some(vec![0x8]), // List.count
+            len: None,
             items: Some(vec![0x0]), // List.items -> backing array
             first: 0x20,            // array header before element 0
             stride: 8,              // pointer array
@@ -111,14 +114,17 @@ fn collection_reads_records_per_enemy_from_the_cavia() {
         label: Some("cavia (record collection)".to_string()),
         contract: None,
         contract_version: None,
+        fname_pool: None,
         match_: ident(&ready.exe),
         watches: vec![Watch::Collection {
             name: "enemies".to_string(),
+            emit: true,
             base: Base::Tier1 {
                 module: ready.exe.clone(),
                 offsets: vec![enemies_offset, 0],
             },
-            count: vec![0x8],
+            count: Some(vec![0x8]),
+            len: None,
             items: Some(vec![0x0]),
             first: 0x20,
             stride: 8,
@@ -157,14 +163,17 @@ fn collection_reads_the_ordered_party_roster_as_strings() {
         label: Some("cavia (roster)".to_string()),
         contract: None,
         contract_version: None,
+        fname_pool: None,
         match_: ident(&ready.exe),
         watches: vec![Watch::Collection {
             name: "party".to_string(),
+            emit: true,
             base: Base::Tier1 {
                 module: ready.exe.clone(),
                 offsets: vec![roster_offset, 0],
             },
-            count: vec![0x8],
+            count: Some(vec![0x8]),
+            len: None,
             items: Some(vec![0x0]),
             first: 0x20,
             stride: 8,
@@ -202,9 +211,11 @@ fn scalar_string_watch_reads_a_character_identity() {
         label: Some("cavia (string)".to_string()),
         contract: None,
         contract_version: None,
+        fname_pool: None,
         match_: ident(&ready.exe),
         watches: vec![Watch::Tier1 {
             name: "hero".to_string(),
+            emit: true,
             module: ready.exe.clone(),
             // Resolve to the reference slot; the string type derefs from there.
             offsets: vec![name_offset],

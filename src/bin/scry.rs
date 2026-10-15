@@ -534,7 +534,7 @@ EXIT STATUS:
                 "profile_file": source,
                 "contract": contract,
                 // Deprecated: the major alone, for hosts that read only this
-                // (Vibepollo's parser, today). Remove once hosts read `contract`.
+                // (Scirocco's parser, today). Remove once hosts read `contract`.
                 "contract_version": declared.map(|c| c.version.major),
                 "watches": chosen.watches.len(),
                 "pointer_bits": pointer_bits,
@@ -718,10 +718,16 @@ EXIT STATUS:
 
     fn fmt_value(v: &Value) -> String {
         match v {
+            Value::I8(n) => n.to_string(),
+            Value::U8(n) => n.to_string(),
+            Value::I16(n) => n.to_string(),
+            Value::U16(n) => n.to_string(),
             Value::I32(n) => n.to_string(),
             Value::U32(n) => n.to_string(),
             Value::F32(x) => x.to_string(),
+            Value::I64(n) => n.to_string(),
             Value::U64(n) => n.to_string(),
+            Value::Bool(b) => b.to_string(),
             // Quote strings so an empty or space-bearing value is visible.
             Value::Str(s) => format!("{s:?}"),
             // Render a collection as its elements, comma-separated — each element
