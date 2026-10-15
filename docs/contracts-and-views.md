@@ -1,8 +1,8 @@
 # Contracts, profiles and views
 
 How telemetry gets from a game's memory to something a person looks at, and
-who owns which part. Decided on 2026-09-24 after a review of scry, Vibepollo and
-Ratatoskr kept turning up the same problem from different ends: the thing that
+who owns which part. Decided on 2026-09-24 after a review of scry, Scirocco and
+Zefiro kept turning up the same problem from different ends: the thing that
 says *which values exist* was tangled up with the thing that says *how to read
 them from one build*, and a client's view was keyed on a label scry calls
 informational.
@@ -24,33 +24,33 @@ changes.
 ## Who holds what
 
 ```
-scry-profiles                               ratatoskr-telemetry-views
+scry-profiles                               zefiro-telemetry-views
   contracts/sea-of-stars/2.1.schema.json  ◄── pinned dependency ──  view: contract "sea-of-stars" ^2.0
   profiles/sea-of-stars/steam-1.3.gen.json                          CI → index.json {contract, range, url, sha256}
         │                                                                      │
         ▼ profiles only                                                        ▼ fetched by the client
-  Vibepollo ── SSE snapshot {contract:{id,version}, values} ──►  Ratatoskr ──► view
+  Scirocco ── SSE snapshot {contract:{id,version}, values} ──►  Zefiro ──► view
 ```
 
 - **scry** stays client-agnostic. It reads memory with a profile and says which
   contract the values follow. It knows nothing about hosts, clients or views.
 - **`scry-profiles`** (new repository) holds contracts and profiles. Nothing in
-  it refers to Vibepollo, Ratatoskr or any other consumer. Kept apart from scry
+  it refers to Scirocco, Zefiro or any other consumer. Kept apart from scry
   because profiles move at the pace of game patches, not of the engine, and a
   corrected offset should not need an engine release.
-- **Vibepollo** needs profiles and nothing else. It picks them up from
+- **Scirocco** needs profiles and nothing else. It picks them up from
   `scry-profiles`, lets scry's probes choose the one that fits the running game,
   and forwards the contract identity as it arrives. It never sends, stores or
   knows about views.
-- **`ratatoskr-telemetry-views`** (new repository) holds Ratatoskr's views. It
+- **`zefiro-telemetry-views`** (new repository) holds Zefiro's views. It
   depends on `scry-profiles` for the contract schemas only, at a pinned version,
   and publishes an index of built views.
-- **Ratatoskr** gets its own views. It reads the contract identity from the
+- **Zefiro** gets its own views. It reads the contract identity from the
   snapshot, looks up a view in the index whose range includes that version,
   downloads it, checks its hash and caches it. The local folder on the device
   stays as a development override.
 
-A view is Ratatoskr's business. Another client could reuse one, but nothing
+A view is Zefiro's business. Another client could reuse one, but nothing
 assumes it can, and the host never carries one.
 
 ## The contract identity on the wire
@@ -105,7 +105,7 @@ a profile actually produces.
   removes or retypes a field fails.
 - Captured fixtures (`scry watch` recordings) validate against their schema.
 
-**In `ratatoskr-telemetry-views`:**
+**In `zefiro-telemetry-views`:**
 - TypeScript types are generated from the pinned schema
   (`json-schema-to-typescript`). They replace the hand-written contract types.
 - `vue-tsc` in strict mode: using a field that does not exist, or forgetting it
@@ -124,21 +124,21 @@ from a game mid-transition can be anything, so views keep clamping.
 
 ## Still open
 
-- **How Ratatoskr distributes views**: downloaded on demand from a published
+- **How Zefiro distributes views**: downloaded on demand from a published
   index (GitHub Pages or releases), or bundled in the APK. Downloading decouples
   releases, but makes the view downloaded third-party code, which raises the bar
   for the WebView sandbox.
-- **How Vibepollo obtains profiles**: bundled with a release, fetched from
+- **How Scirocco obtains profiles**: bundled with a release, fetched from
   `scry-profiles`, or dropped in by the user as today.
 
 ## Where this leaves the current code
 
 - scry: `contractVersion: u32` becomes `contract: { id, version }`, and
   `scry schema` is new.
-- Vibepollo: forwards `contract` from `attached` into the snapshot unchanged.
-- Ratatoskr: `TelemetryViewStore` keys on contract id and version instead of the
+- Scirocco: forwards `contract` from `attached` into the snapshot unchanged.
+- Zefiro: `TelemetryViewStore` keys on contract id and version instead of the
   sanitised label, drops the unversioned fallback, and gains an index-backed
   implementation.
-- `telemetry-views/`, currently an untracked folder inside the Ratatoskr
-  checkout, becomes `ratatoskr-telemetry-views`. The Sea of Stars profile that
+- `telemetry-views/`, currently an untracked folder inside the Zefiro
+  checkout, becomes `zefiro-telemetry-views`. The Sea of Stars profile that
   exists only in its fixtures moves to `scry-profiles` with its contract.

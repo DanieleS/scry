@@ -534,7 +534,7 @@ EXIT STATUS:
                 "profile_file": source,
                 "contract": contract,
                 // Deprecated: the major alone, for hosts that read only this
-                // (Vibepollo's parser, today). Remove once hosts read `contract`.
+                // (Scirocco's parser, today). Remove once hosts read `contract`.
                 "contract_version": declared.map(|c| c.version.major),
                 "watches": chosen.watches.len(),
                 "pointer_bits": pointer_bits,

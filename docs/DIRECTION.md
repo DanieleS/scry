@@ -10,7 +10,7 @@ them.
 A profile-driven, **read-only** game-memory telemetry engine. Given a running
 game + a per-game profile, it emits diffed snapshots of live values (HP, gold,
 party, enemies…) for overlays and second screens. The library is host-agnostic;
-the first consumer is **Vibepollo** feeding a second screen.
+the first consumer is **Scirocco** feeding a second screen.
 
 ## The core decision: read-only, not Cheat-Engine-style injection
 
@@ -109,7 +109,7 @@ plain offsets/signatures, engine-agnostic, exactly as today.
    [contracts-and-views.md](contracts-and-views.md): contracts and profiles
    live apart from scry, and clients key their views on the contract.
 6. **[#14] Runtime by-name reflection resolver** — the resilient endgame.
-7. **[#5] Vibepollo integration** — adapter + control-channel `0x3003`.
+7. **[#5] Scirocco integration** — adapter + control-channel `0x3003`.
 
 ## Where to start next session
 
