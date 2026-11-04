@@ -1029,6 +1029,20 @@ pub enum Watch {
         /// nor loop unboundedly. Itself capped at [`MAX_COLLECTION_LEN`] when
         /// the profile is validated, since a cap of `u64::MAX` caps nothing.
         max: usize,
+        /// Filter clauses on a **record** element, all of which must hold: only
+        /// the elements that pass are emitted, in their original order. Named
+        /// `where` on the wire, and the same [`Clause`] a fold takes.
+        ///
+        /// For a container far larger than the part that matters — every
+        /// trigger volume in a level, of which the player stands in a handful —
+        /// emitting the whole list would ship hundreds of records a consumer
+        /// throws away. An element whose test cannot be decided (a field it
+        /// could not read, text against a number) stays in the list as
+        /// [`Unavailable`](crate::engine::Value::Unavailable): dropping it would
+        /// be a silent lie, and sinking the whole list for one unreadable
+        /// element out of hundreds would be a loud one.
+        #[serde(rename = "where", default, skip_serializing_if = "Vec::is_empty")]
+        clauses: Vec<Clause>,
         /// Per-watch sample rate in hertz; see [`Watch::Tier1::rate_hz`].
         #[serde(default, skip_serializing_if = "Option::is_none")]
         rate_hz: Option<f64>,
@@ -1399,7 +1413,7 @@ impl Profile {
                              least one field"
                         )));
                     }
-                    _ => {}
+                    _ => check_collection_clauses(w)?,
                 },
                 Watch::Record { name, fields, .. } if fields.is_empty() => {
                     return Err(Error::BadProfile(format!(
@@ -1699,6 +1713,40 @@ fn check_extremum(
 
 /// A fold's list watch obeys the same declared-earlier rule as any reference,
 /// and its `take` is an expression like any other.
+/// A collection's `where` filters record elements by their fields, so it needs
+/// fields to test, and every clause must name one of them: a misspelt field
+/// would make every element undecidable, and the list a column of
+/// `unavailable`s nobody could explain.
+fn check_collection_clauses(w: &Watch) -> Result<()> {
+    let Watch::Collection {
+        name,
+        fields,
+        clauses,
+        ..
+    } = w
+    else {
+        return Ok(());
+    };
+    if clauses.is_empty() {
+        return Ok(());
+    }
+    let Some(fields) = fields else {
+        return Err(Error::BadProfile(format!(
+            "collection {name:?}: `where` filters record elements by their fields; a scalar \
+             (`type`) element has none to test"
+        )));
+    };
+    for clause in clauses {
+        if !fields.contains_key(&clause.field) {
+            return Err(Error::BadProfile(format!(
+                "collection {name:?}: `where` tests {:?}, which is not one of its fields",
+                clause.field
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn check_fold(owner: &str, fold: &Fold, earlier: &[&Watch], under_each: bool) -> Result<()> {
     check_ref(owner, &fold.watch, earlier)?;
     match &fold.take {
@@ -2112,6 +2160,7 @@ mod tests {
                 ty: Some(ValueType::String(StringSpec::Preset(StringPreset::Il2cpp))),
                 fields: None,
                 max: 16,
+                clauses: Vec::new(),
                 rate_hz: Some(4.0),
             }
         );
@@ -2449,6 +2498,61 @@ mod tests {
             "error should name the watch: {err}"
         );
         assert!(err.contains("`len`"), "error should offer a len: {err}");
+    }
+
+    #[test]
+    fn a_filtered_collection_deserializes_and_round_trips() {
+        let p = sized_collection(r#""len": 9, "where": [{ "field": "hp", "gt": 0 }],"#, 9)
+            .expect("parse");
+        match &p.watches[0] {
+            Watch::Collection { clauses, .. } => {
+                assert_eq!(clauses.len(), 1);
+                assert_eq!(clauses[0].field, "hp");
+                assert_eq!(clauses[0].test, Compare::Gt(Literal::Num(0.0)));
+            }
+            other => panic!("expected a collection, got {other:?}"),
+        }
+        let json = p.to_json().unwrap();
+        assert!(
+            json.contains("\"where\""),
+            "the filter is written as `where`: {json}"
+        );
+        assert_eq!(Profile::from_json(&json).unwrap(), p);
+        // Unfiltered, nothing is written for it.
+        let plain = sized_collection(r#""len": 9,"#, 9)
+            .unwrap()
+            .to_json()
+            .unwrap();
+        assert!(
+            !plain.contains("where"),
+            "an absent filter must not appear: {plain}"
+        );
+    }
+
+    #[test]
+    fn collection_where_must_name_a_field() {
+        let err = sized_collection(r#""len": 9, "where": [{ "field": "mp", "gt": 0 }],"#, 9)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("characters") && err.contains("\"mp\""),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn collection_where_needs_record_elements() {
+        let err = Profile::from_json(
+            r#"{ "match": { "process": "g", "module": "g", "probe": "90" },
+                 "watches": [
+                   { "tier": "collection", "name": "party", "len": 3, "stride": 1, "type": "u8",
+                     "base": { "tier": "tier1", "module": "g", "offsets": ["0x70D4815"] },
+                     "where": [{ "field": "slot", "ne": 16 }], "max": 3 }
+                 ] }"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("party") && err.contains("scalar"), "{err}");
     }
 
     #[test]

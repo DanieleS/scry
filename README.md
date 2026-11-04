@@ -160,6 +160,13 @@ each field is a short relative chain — the "dissect structure" idea from Cheat
 Engine, expressed as data. A field is `type` **xor** `fields`, never both; a
 broken field is `unavailable` in place while the record still forms.
 
+A record collection can also **filter** what it emits with the same flat `where`
+clauses a fold takes (`[{"field": "state", "ne": 0}]`): every element is read,
+and only those that pass go out. That is for a container far larger than the part
+that matters — the hundreds of trigger volumes in a level, of which the player
+stands in a few — and an element whose test can't be decided stays in place as
+`unavailable` rather than vanishing.
+
 Structure stops here — **exactly one level deep**. Deeper trees (member →
 inventory → items → …) stay the consumer's job to compose; recursion is where the
 engine would start modelling game entities, which it deliberately doesn't.

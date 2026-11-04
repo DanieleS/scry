@@ -373,6 +373,39 @@ is `unavailable` in place; the record still forms. A base that won't resolve mak
 the whole record `unavailable`. Structure is **one level deep** — a field is a
 scalar or string, never another record; deeper trees stay the consumer's job.
 
+### Filtering a collection (`where`)
+
+Some containers are much larger than the part that matters. Final Fantasy VII
+Rebirth keeps every location volume of the loaded world in one array — over four
+hundred — and each carries a state byte that is non-zero while the player stands
+inside it. The player is in a handful at a time; shipping all of them every tick
+would make the stream carry hundreds of records the view throws away.
+
+A record collection takes the same flat `where` clauses a fold does
+(`eq`, `ne`, `lt`, `le`, `gt`, `ge`; all must hold), and emits **only the
+elements that pass**, in their original order:
+
+```json
+{ "tier": "collection", "name": "locations",
+  "base": { "tier": "tier1", "module": "ff7rebirth_.exe", "offsets": ["0x91D84C0", 0] },
+  "count": ["0x10"], "items": ["0x8"], "stride": 8, "element": [0, 0],
+  "fields": {
+    "state": { "offsets": ["0x2A0"], "type": "u8" },
+    "kind":  { "offsets": ["0x27C"], "type": "u8" },
+    "id":    { "offsets": ["0x270"], "type": { "string": "fname" } }
+  },
+  "where": [ { "field": "state", "ne": 0 }, { "field": "kind", "eq": 0 } ],
+  "max": 1024 }
+```
+
+Every element is still read: `max` caps the reading, not the output. Each clause
+must name one of the collection's `fields`, and `where` needs record elements —
+a scalar element has no field to test. Both are checked when the profile loads.
+An element whose test cannot be decided (a field it could not read, text tested
+against a number) stays in the list as `unavailable`: dropping it would hide a
+broken read, and failing the whole list over one element out of hundreds would
+throw away everything else.
+
 The IL2CPP converter (`docs/authoring-il2cpp.md`) speaks the same shape with
 `Class::field` names in every chain, so the fragile offsets are derived from a
 dump rather than hand-counted.

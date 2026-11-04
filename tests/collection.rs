@@ -65,6 +65,7 @@ fn collection_reads_an_enemy_hp_list_from_the_cavia() {
             ty: Some(ValueType::I32),
             fields: None,
             max: 64,
+            clauses: Vec::new(),
             rate_hz: None,
         }],
     };
@@ -132,6 +133,7 @@ fn collection_reads_records_per_enemy_from_the_cavia() {
             ty: None,
             fields: Some(fields),
             max: 64,
+            clauses: Vec::new(),
             rate_hz: None,
         }],
     };
@@ -182,6 +184,7 @@ fn collection_reads_the_ordered_party_roster_as_strings() {
             ty: Some(il2cpp_string()),
             fields: None,
             max: 64,
+            clauses: Vec::new(),
             rate_hz: None,
         }],
     };

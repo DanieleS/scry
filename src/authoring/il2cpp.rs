@@ -812,6 +812,7 @@ fn build_watch(
                 ty: *ty,
                 fields,
                 max: *max,
+                clauses: Vec::new(),
                 rate_hz: *rate_hz,
             })
         }

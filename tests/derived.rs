@@ -76,6 +76,7 @@ fn enemy_hp(exe: &str, enemies_offset: i64) -> Watch {
         ty: Some(ValueType::I32),
         fields: None,
         max: 64,
+        clauses: Vec::new(),
         rate_hz: None,
     }
 }
@@ -114,6 +115,7 @@ fn enemies(exe: &str, enemies_offset: i64) -> Watch {
         ty: None,
         fields: Some(fields),
         max: 64,
+        clauses: Vec::new(),
         rate_hz: None,
     }
 }
