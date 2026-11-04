@@ -1385,11 +1385,13 @@ public class Next
                 ty,
                 fields,
                 max,
+                clauses,
                 rate_hz,
             } => {
                 assert_eq!(name, "party_hp");
                 assert!(*emit, "a converted watch is emitted");
                 assert_eq!(*fields, None, "a scalar collection carries no fields");
+                assert!(clauses.is_empty(), "the converter writes no filter");
                 assert_eq!(
                     *base,
                     Base::Tier1 {
