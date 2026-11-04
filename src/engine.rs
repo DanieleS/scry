@@ -293,6 +293,9 @@ enum Reader {
         element: Vec<i64>,
         content: ElementReader,
         max: usize,
+        /// Only elements passing every clause are emitted; see
+        /// [`Watch::Collection::clauses`].
+        clauses: Vec<Clause>,
     },
     /// A [`Watch::Record`]: walk `base` from the anchor to the record's base, then
     /// read each field relative to it into a [`Value::Map`].
@@ -1104,6 +1107,7 @@ fn sample_one<B: MemoryBackend + ?Sized>(
             element,
             content,
             max,
+            clauses,
         } => {
             // Reach the container. A base that no longer resolves makes the whole
             // watch unavailable — there is nothing to iterate.
@@ -1157,6 +1161,17 @@ fn sample_one<B: MemoryBackend + ?Sized>(
                     },
                     Err(_) => Value::Unavailable,
                 };
+                // A filtered list keeps what passes and what cannot be judged:
+                // an element whose test is undecidable stays, as unavailable,
+                // rather than vanishing or sinking the list.
+                if !clauses.is_empty() {
+                    match matches_clauses(&value, clauses) {
+                        Some(true) => out.push(value),
+                        Some(false) => {}
+                        None => out.push(Value::Unavailable),
+                    }
+                    continue;
+                }
                 out.push(value);
             }
             Value::List(out)
@@ -1256,6 +1271,7 @@ impl<B: MemoryBackend> Session<B> {
                     ty,
                     fields,
                     max,
+                    clauses,
                     rate_hz,
                 } => {
                     // A collection's base is anchored exactly like a scalar
@@ -1289,6 +1305,7 @@ impl<B: MemoryBackend> Session<B> {
                             element: element.clone(),
                             content,
                             max: *max,
+                            clauses: clauses.clone(),
                         },
                         *rate_hz,
                         *emit,
@@ -2263,6 +2280,7 @@ mod tests {
             ty: Some(ValueType::I32),
             fields: None,
             max,
+            clauses: Vec::new(),
             rate_hz: None,
         }
     }
@@ -2365,6 +2383,7 @@ mod tests {
             ty: None,
             fields: Some(fields),
             max,
+            clauses: Vec::new(),
             rate_hz: None,
         }
     }
@@ -2637,6 +2656,7 @@ mod tests {
                     ("mp", vec![4], ValueType::I32),
                 ])),
                 max: 8,
+                clauses: Vec::new(),
                 rate_hz: None,
             }],
         };
@@ -2648,6 +2668,94 @@ mod tests {
                 map(&[("hp", Value::I32(80)), ("mp", Value::I32(55))]),
             ])),
             "a record collection must emit an ordered list of coherent maps"
+        );
+    }
+
+    /// A pointer array of three "volumes" (state byte at +0, kind at +1, size
+    /// at +4) behind `items`, the third behind a dangling pointer when `broken`.
+    fn volumes(broken: bool) -> (Rc<Fake>, Profile) {
+        let fake = Rc::new(Fake::new(0x400));
+        let base = fake.base;
+        fake.write_u64(0x100, base + 0x200); // items -> backing array
+        fake.write_i32(0x108, 3); // count
+        for (i, (state, kind, size)) in [(1u8, 0u8, 50), (0, 0, 10), (1, 0, 900)].iter().enumerate()
+        {
+            let at = 0x300 + 0x20 * i;
+            fake.write_u64(0x220 + 8 * i, base + at as u64);
+            fake.write_bytes(at, &[*state, *kind]);
+            fake.write_i32(at + 4, *size);
+        }
+        if broken {
+            fake.write_u64(0x230, 0xdead_0000);
+        }
+        let profile = Profile {
+            label: None,
+            contract: None,
+            contract_version: None,
+            fname_pool: None,
+            match_: ident(),
+            watches: vec![Watch::Collection {
+                name: "active".to_string(),
+                emit: true,
+                base: Base::Tier1 {
+                    module: "fake".to_string(),
+                    offsets: vec![0x100],
+                },
+                count: Some(vec![0x8]),
+                len: None,
+                items: Some(vec![0x0]),
+                first: 0x20,
+                stride: 8,
+                element: vec![0, 0],
+                ty: None,
+                fields: Some(fields(&[
+                    ("state", vec![0], ValueType::U8),
+                    ("kind", vec![1], ValueType::U8),
+                    ("size", vec![4], ValueType::I32),
+                ])),
+                max: 8,
+                clauses: serde_json::from_str(
+                    r#"[{ "field": "state", "ne": 0 }, { "field": "kind", "eq": 0 }]"#,
+                )
+                .unwrap(),
+                rate_hz: None,
+            }],
+        };
+        (fake, profile)
+    }
+
+    #[test]
+    fn collection_where_emits_only_the_elements_that_pass() {
+        let (fake, profile) = volumes(false);
+        let mut s = Session::attach(Rc::clone(&fake), &profile, Config::default());
+        let rec = |size| {
+            map(&[
+                ("state", Value::U8(1)),
+                ("kind", Value::U8(0)),
+                ("size", Value::I32(size)),
+            ])
+        };
+        assert_eq!(
+            s.poll(Duration::ZERO).get("active"),
+            Some(&Value::List(vec![rec(50), rec(900)])),
+            "the inactive volume is dropped and the others keep their order"
+        );
+    }
+
+    #[test]
+    fn collection_where_keeps_an_undecidable_element_as_unavailable() {
+        // The third element cannot be read, so whether it passes is unknown: it
+        // stays in place as unavailable rather than vanishing from the list.
+        let (fake, profile) = volumes(true);
+        let mut s = Session::attach(Rc::clone(&fake), &profile, Config::default());
+        let rec = map(&[
+            ("state", Value::U8(1)),
+            ("kind", Value::U8(0)),
+            ("size", Value::I32(50)),
+        ]);
+        assert_eq!(
+            s.poll(Duration::ZERO).get("active"),
+            Some(&Value::List(vec![rec, Value::Unavailable]))
         );
     }
 
@@ -3467,6 +3575,7 @@ mod tests {
                 ("amount", vec![12], ValueType::I32),
             ])),
             max: 16,
+            clauses: Vec::new(),
             rate_hz: None,
         }
     }
@@ -3702,6 +3811,7 @@ mod tests {
                     ("mp", vec![4], ValueType::I32),
                 ])),
                 max: 8,
+                clauses: Vec::new(),
                 rate_hz: None,
             },
             derived(
